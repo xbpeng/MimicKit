@@ -1,5 +1,6 @@
 import yaml
 import envs.sim_env as sim_env
+import os
 
 from util.logger import Logger
 
@@ -47,4 +48,17 @@ def build_env(env_file, num_envs, device, visualize):
 def load_env_file(file):
     with open(file, "r") as stream:
         env_config = yaml.safe_load(stream)
+
+    if "env" in env_config and "import_random_force_config" in env_config["env"]:
+        force_config_file = env_config["env"]["import_random_force_config"]
+
+        env_dir = os.path.dirname(file)
+        force_config_path = os.path.join(env_dir, force_config_file)
+
+        with open(force_config_path, "r") as force_stream:
+            force_config = yaml.safe_load(force_stream)
+            env_config["env"].update(force_config)
+
+        del env_config["env"]["import_random_force_config"]
+
     return env_config

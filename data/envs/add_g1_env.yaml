@@ -41,12 +41,7 @@ env:
     reward_root_vel_scale: 1.0
     reward_key_pos_scale: 10.0
 
-    # Random force perturbation settings
-    enable_random_force: True
-    random_force_scale: [50.0, 50.0, 30.0]  # Force magnitude in Newtons [x, y, z] - increased for visibility
-    random_force_bodies: ["torso_link", "head_link"]  # Bodies to apply random forces to
-    random_force_probability: 0.2  # Probability of applying force at each step (0-1) - increased frequency
-    random_force_decay: 0.95  # Force decay factor per step - faster decay
+    import_random_force_config: "random_force_config.yaml"
 
 
 engine:

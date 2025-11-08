@@ -47,6 +47,7 @@ class DeepMimicEnv(char_env.CharEnv):
         self._random_force_bodies = env_config.get("random_force_bodies", [])
         self._random_force_probability = env_config.get("random_force_probability", 0.0)
         self._random_force_decay = env_config.get("random_force_decay", 1.0)
+        self._visualize_forces = env_config.get("visualize_forces", False) and visualize
         
         super().__init__(config=config, num_envs=num_envs, device=device,
                          visualize=visualize)
@@ -143,6 +144,9 @@ class DeepMimicEnv(char_env.CharEnv):
         # Apply only where mask is True
         self._current_forces[apply_force_mask] = new_forces[apply_force_mask]
 
+        # Store which env has newly applied force for visualization
+        self._active_force_mask = apply_force_mask
+
         # Debug logging (prints every 100 steps)
         if hasattr(self, '_force_debug_counter'):
             self._force_debug_counter += 1
@@ -158,6 +162,56 @@ class DeepMimicEnv(char_env.CharEnv):
         # Apply forces to each target body
         for body_id in self._random_force_body_ids:
             self._engine.set_body_forces(None, char_id, body_id, self._current_forces)
+
+        # Visualize forces if enabled
+        if self._visualize_forces and self._visualize:
+            self._draw_force_arrows()
+
+        return
+
+    def _draw_force_arrows(self):
+        """Draw arrows showing actively applied forces for visualization."""
+        char_id = self._get_char_id()
+        body_pos = self._engine.get_body_pos(char_id)
+
+        # Only visualize the first environment to avoid clutter
+        env_id = 0
+
+        # Only draw if force was actively applied this step (not decaying)
+        if self._active_force_mask[env_id]:
+            force = self._current_forces[env_id].cpu().numpy()
+            force_magnitude = np.linalg.norm(force)
+
+            if force_magnitude > 1.0:
+                for body_id in self._random_force_body_ids:
+                    body_position = body_pos[env_id, body_id].cpu().numpy()
+
+                    # Make arrow much bigger and more visible (divide by 20 instead of 50)
+                    arrow_length = force_magnitude / 20.0
+                    force_direction = force / force_magnitude if force_magnitude > 0 else force
+                    arrow_end = body_position + force_direction * arrow_length
+
+                    # Create main arrow shaft (thicker by drawing multiple parallel lines)
+                    offset = 0.01  # Small offset for thickness
+                    verts_list = []
+
+                    # Main center line
+                    verts_list.append([body_position[0], body_position[1], body_position[2],
+                                      arrow_end[0], arrow_end[1], arrow_end[2]])
+
+                    # Additional parallel lines for thickness
+                    for dx, dy in [(offset, 0), (-offset, 0), (0, offset), (0, -offset)]:
+                        verts_list.append([
+                            body_position[0] + dx, body_position[1] + dy, body_position[2],
+                            arrow_end[0] + dx, arrow_end[1] + dy, arrow_end[2]
+                        ])
+
+                    verts = np.array(verts_list, dtype=np.float32)
+
+                    # Bright red color for all lines
+                    colors = np.array([[1.0, 0.0, 0.0]] * len(verts_list), dtype=np.float32)
+
+                    self._engine.draw_lines(env_id, verts, colors)
 
         return
     
