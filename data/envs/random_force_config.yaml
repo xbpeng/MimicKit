@@ -3,8 +3,9 @@
 # Edit this file to change force settings for all training methods
 
 enable_random_force: True
-random_force_scale: [50.0, 50.0, 30.0]  # Force magnitude in Newtons [x, y, z]
-random_force_bodies: ["torso_link", "head_link"]  # Bodies to apply forces to
+random_force_scale: [0.0, 0.0, -10.0]  # Force magnitude in Newtons [x, y, z]
+# random_force_bodies: ["torso_link", "head_link"]  # Bodies to apply forces to
+random_force_bodies: ["right_wrist_yaw_link", "right_wrist_yaw_link"]
 random_force_probability: 0.2  # Probability per step (0-1)
 random_force_decay: 0.95  # Force decay factor per step
 visualize_forces: True  # Draw red arrows showing force direction (only when visualize=True)
