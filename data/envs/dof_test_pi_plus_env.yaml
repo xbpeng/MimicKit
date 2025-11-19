@@ -1,0 +1,23 @@
+env_name: "char_dof_test"
+
+env:
+    char_file: "data/assets/hightorque/pi_plus/pi_22dof.xml"
+    camera_mode: "still"
+
+    episode_length: 20.0 # seconds
+    global_obs: False
+    root_height_obs: True
+
+    init_pose: [0, 0, 0.4, 0, 0, 0, -0.25, 0, 0, 0.65, -0.4, 0, 0, 0, 0, 0, 0, -0.25, 0, 0, 0.65, -0.4, 0, 0, 0, 0, 0, 0] # 6+22=28
+  
+    
+engine:
+    engine_name: "isaac_gym"
+    
+    control_mode: "pos"
+    sim_freq: 60
+    control_freq: 30
+    env_spacing: 5
+    sim_substeps: 2 # 120 Hz
+
+

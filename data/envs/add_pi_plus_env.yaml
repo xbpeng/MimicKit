@@ -1,0 +1,53 @@
+env_name: "add"
+
+env:
+    char_file: "data/assets/hightorque/pi_plus/pi_22dof.xml"
+    camera_mode: "track"
+
+    episode_length: 10.0 # seconds
+    global_obs: True
+    root_height_obs: True
+    pose_termination: True
+    pose_termination_dist: 0.7 # m
+    enable_phase_obs: False
+    enable_tar_obs: True
+    num_phase_encoding: 4
+    tar_obs_steps: [1, 2, 3]
+    num_disc_obs_steps: 1
+    rand_reset: True
+    zero_center_action: True
+    log_tracking_error: True
+
+    ref_char_offset: [2.0, 0.0, 0.0] # m
+    init_pose: [0, 0, 0.351, 0, 0, 0, -0.25, 0, 0, 0.65, -0.4, 0, 0, 0, 0, 0, 0, -0.25, 0, 0, 0.65, -0.4, 0, 0, 0, 0, 0, 0] # 6+22=28
+
+    enable_early_termination: True
+    termination_height: 0.2
+    key_bodies: ["l_ankle_roll_link", "r_ankle_roll_link", "r_wrist_link", "l_wrist_link"] # try without head
+    contact_bodies: ["l_ankle_roll_link", "r_ankle_roll_link", "l_ankle_pitch_link", "r_ankle_pitch_link", "l_calf_link", "r_calf_link"] # walk
+    
+    motion_file: "data/motions/hightorque/pi_plus/mimickit/pi_plus_walk.pkl"
+    
+    reward_pose_w: 0.5
+    reward_vel_w: 0.1
+    reward_root_pose_w: 0.15
+    reward_root_vel_w: 0.1
+    reward_key_pos_w: 0.15
+
+    reward_pose_scale: 0.25
+    reward_vel_scale: 0.01
+    reward_root_pose_scale: 5.0
+    reward_root_vel_scale: 1.0
+    reward_key_pos_scale: 10.0
+
+
+engine:
+    engine_name: "isaac_gym"
+    
+    control_mode: "pos"
+    sim_freq: 60
+    control_freq: 30
+    env_spacing: 5
+    sim_substeps: 2 # 120 Hz
+
+

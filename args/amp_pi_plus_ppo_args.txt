@@ -1,0 +1,9 @@
+--num_envs 4096
+
+--env_config data/envs/amp_pi_plus_env.yaml
+--agent_config data/agents/amp_pi_plus_agent.yaml
+
+--log_file output/log.txt
+--out_model_file output/model.pt
+
+--max_samples 120_000_000
