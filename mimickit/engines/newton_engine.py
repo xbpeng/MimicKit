@@ -952,7 +952,7 @@ class NewtonEngine(engine.Engine):
         return
 
     def _build_ground_contact_sensor(self):
-        self._ground_contact_sensor = newton.sensors.ContactSensor(self._sim_model,
+        self._ground_contact_sensor = newton.sensors.SensorContact(self._sim_model,
                                                                    sensing_obj_bodies="*",
                                                                    counterpart_shapes="ground*",
                                                                    include_total=True,
