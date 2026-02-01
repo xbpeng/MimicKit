@@ -33,11 +33,11 @@ from scipy.spatial.transform import Rotation as R
 
 sys.path.append(".")
 
-from tools.smpl_to_mimickit.poselib.poselib.skeleton.skeleton3d import SkeletonTree, SkeletonState
-
 from mimickit.anim.motion import Motion, LoopMode
 from mimickit.util.torch_util import quat_to_exp_map
 from tools.smpl_to_mimickit.smpl_names import SMPL_BONE_ORDER_NAMES, SMPL_MUJOCO_NAMES
+from tools.smpl_to_mimickit.smpl_constants import PARENT_INDICES, LOCAL_TRANSLATION
+from tools.smpl_to_mimickit.rotation_tools import compute_global_rotations, compute_local_rotations, compute_global_translations
 
 ZUP_TO_YUP = R.from_quat([0.5, 0.5, 0.5, 0.5])
 YUP_TO_ZUP = ZUP_TO_YUP.inv()
@@ -123,35 +123,36 @@ def convert_smpl_to_mimickit(input_file: str,
     smpl_2_mujoco = [SMPL_BONE_ORDER_NAMES.index(q) for q in SMPL_MUJOCO_NAMES if q in SMPL_BONE_ORDER_NAMES]
     pose_aa_mj = pose_aa.reshape(N, 24, 3)[:, smpl_2_mujoco]
     pose_quat = R.from_rotvec(pose_aa_mj.reshape(-1, 3)).as_quat().reshape(N, 24, 4)
-
-    # Due to the Y-up to Z-up conversion, a rotation must be applied to the global rotation of the joints.
-    # To compute global rotation from local rotation, we use the SkeletonTree and SkeletonState utilities from poselib.
-    skeleton_tree = SkeletonTree.from_mjcf(f"data/assets/smpl/smpl.xml")
-
-    trans_offset = torch.from_numpy(trans) + skeleton_tree.local_translation[0]
-
-    new_sk_state = SkeletonState.from_rotation_and_root_translation(
-                    skeleton_tree,
-                    torch.from_numpy(pose_quat),
-                    trans_offset,
-                    is_local=True)
     
-    pose_quat_global = (R.from_quat(new_sk_state.global_rotation.reshape(-1, 4).numpy()) * YUP_TO_ZUP).as_quat().reshape(N, -1, 4)
-    new_sk_state = SkeletonState.from_rotation_and_root_translation(skeleton_tree, torch.from_numpy(pose_quat_global), trans_offset, is_local=False)
-    pose_quat = new_sk_state.local_rotation.numpy()
+    # Due to the Y-up to Z-up conversion, a rotation must be applied to the global rotation of the joints.
+    scipy_global_rot = compute_global_rotations(
+        pose_quat,
+        PARENT_INDICES
+    )
+    rotated_global_rot = (R.from_quat(scipy_global_rot.reshape(-1, 4)) * YUP_TO_ZUP).as_quat().reshape(N, -1, 4)
+    rotated_local_rot = compute_local_rotations(
+        rotated_global_rot,
+        PARENT_INDICES
+    )
 
-    dof_pos = quat_to_exp_map(torch.tensor(pose_quat[:, 1:, :])).numpy().reshape(N, -1)
+    global_translation = compute_global_translations(
+        rotated_global_rot,
+        LOCAL_TRANSLATION,
+        PARENT_INDICES
+    )
+
+    global_translation += trans[:, None, :]
+
+    dof_pos = quat_to_exp_map(torch.tensor(rotated_local_rot[:, 1:, :])).numpy().reshape(N, -1)
 
     rotated_root_rot_quat = (R.from_quat(root_rot) * YUP_TO_ZUP).as_quat()
     root_rot = quat_to_exp_map(torch.tensor(rotated_root_rot_quat)).numpy()
 
     # Z-correction
     if z_correction == "full":
-        global_translation = new_sk_state.global_translation.numpy()
         min_height = np.min(global_translation[:, :, 2])
         trans[:, 2] -= min_height - 0.025   # Adjust for foot mesh height
     elif z_correction == "calibrate":
-        global_translation = new_sk_state.global_translation.numpy()
         min_height = np.min(global_translation[:30, :, 2])
         trans[:, 2] -= min_height - 0.025   # Adjust for foot mesh height
 
