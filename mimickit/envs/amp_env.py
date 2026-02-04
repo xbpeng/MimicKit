@@ -174,7 +174,13 @@ class AMPEnv(deepmimic_env.DeepMimicEnv):
         self._disc_hist_root_ang_vel.push(root_ang_vel)
         self._disc_hist_dof_vel.push(dof_vel)
         self._disc_hist_body_pos.push(body_pos)
-        
+
+        # Validate dof_pos before passing to dof_to_rot
+        if not isinstance(dof_pos, torch.Tensor):
+            raise TypeError(
+                f"_update_disc_hist: dof_pos expected torch.Tensor, got {type(dof_pos).__name__}"
+            )
+
         joint_rot = self._kin_char_model.dof_to_rot(dof_pos)
         self._disc_hist_joint_rot.push(joint_rot)
         return

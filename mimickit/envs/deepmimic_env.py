@@ -336,7 +336,14 @@ class DeepMimicEnv(char_env.CharEnv):
             body_pos = body_pos[env_ids]
 
             motion_ids = motion_ids[env_ids]
-            
+
+        # Validate dof_pos before passing to dof_to_rot
+        if not isinstance(dof_pos, torch.Tensor):
+            raise TypeError(
+                f"_compute_obs: dof_pos expected torch.Tensor, got {type(dof_pos).__name__}. "
+                f"char_id={char_id}, env_ids={env_ids}"
+            )
+
         joint_rot = self._kin_char_model.dof_to_rot(dof_pos)
         
         if (self._enable_phase_obs):
@@ -400,7 +407,13 @@ class DeepMimicEnv(char_env.CharEnv):
         dof_pos = self._engine.get_dof_pos(char_id)
         dof_vel = self._engine.get_dof_vel(char_id)
         body_pos = self._engine.get_body_pos(char_id)
-        
+
+        # Validate dof_pos before passing to dof_to_rot
+        if not isinstance(dof_pos, torch.Tensor):
+            raise TypeError(
+                f"_update_reward: dof_pos expected torch.Tensor, got {type(dof_pos).__name__}"
+            )
+
         joint_rot = self._kin_char_model.dof_to_rot(dof_pos)
         if (self._has_key_bodies()):
             key_pos = body_pos[..., self._key_body_ids, :]
