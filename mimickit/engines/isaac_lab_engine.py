@@ -147,7 +147,9 @@ class IsaacLabEngine(engine.Engine):
     
     def step(self):
         self._update_reset_objs()
-        self.get_video_recorder().capture_frame()
+        video_recorder = self.get_video_recorder()
+        if video_recorder is not None:
+            video_recorder.capture_frame()
         
         for i in range(self._sim_steps):
             self._pre_sim_step()
