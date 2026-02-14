@@ -32,14 +32,6 @@ class SimEnv(base_env.BaseEnv):
         self._build_sim_tensors(env_config)
         self._build_data_buffers()
 
-        self._record_video = record_video
-
-        # Create video recorder after environment is fully initialized
-        # so it can query environment for camera config if needed
-        if self._record_video:
-            camera_config = self.get_video_camera_config()
-            self._engine.create_video_recorder(camera_config=camera_config)
-
         if self._visualize:
             self._build_camera(env_config)
             self._play_mode = PlayMode.PLAY
@@ -59,6 +51,17 @@ class SimEnv(base_env.BaseEnv):
         )
         return obs_space
     
+    def set_mode(self, mode):
+        super().set_mode(mode)
+
+        if (self._engine.enabled_record_video()):
+            if (mode == base_env.EnvMode.TEST):
+                self._engine.start_video_recording()
+            else:
+                self._engine.stop_video_recording()
+
+        return
+
     def reset(self, env_ids=None):
         if (env_ids is None):
             reset_env_ids = self._env_ids
@@ -95,6 +98,13 @@ class SimEnv(base_env.BaseEnv):
         else:
             env_time = self._time_buf[env_ids]
         return env_time
+    
+    def record_diagnostics(self):
+        if (self._engine.enabled_record_video()):
+            self._diagnostics["sim_recording"] = self._engine.get_video_recording()
+
+        diag = super().record_diagnostics()
+        return diag
     
     def _pre_physics_step(self, actions):
         self._apply_action(actions)

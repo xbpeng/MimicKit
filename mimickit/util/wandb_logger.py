@@ -1,7 +1,10 @@
 import os
+import tempfile
 import wandb
 
 import util.logger as logger
+import util.video as video
+
 
 class WandbLogger(logger.Logger):
     MISC_TAG = "Misc"
@@ -49,20 +52,25 @@ class WandbLogger(logger.Logger):
             if (row_count == 0):
                 self._key_tags = self._build_key_tags()
             
-            step_val = row_count
-            if (self._step_key is not None):
-                step_val = self.log_current_row.get(self._step_key, "").val
-            
-
             out_dict = dict()
+            out_videos = dict()
+
             for i, key in enumerate(self.log_headers):
                 if (key != self._step_key):
                     entry = self.log_current_row.get(key, "")
                     val = entry.val
                     tag = self._key_tags[i]
-                    out_dict[tag] = val
+                    
+                    if (isinstance(val, video.Video)):
+                        out_videos[tag] = val
+                    else:
+                        out_dict[tag] = val
 
+            step_val = self._get_step_val()
             wandb.log(out_dict, step=int(step_val))
+
+            if (len(out_videos) > 0):
+                self._write_videos(out_videos)
         return
     
     def _add_collection(self, name, key):
@@ -83,16 +91,24 @@ class WandbLogger(logger.Logger):
             tags.append(curr_tags)
 
         return tags
-
-    def get_current_step(self) -> int:
-        """Get the current step value that would be used for wandb.log().
-
-        Returns the step value based on the step_key if set, otherwise returns row_count.
-        This matches the logic used in write_log().
-        """
+    
+    def _get_step_val(self):
         step_val = self._row_count
         if (self._step_key is not None):
-            entry = self.log_current_row.get(self._step_key, "")
-            if entry != "":
-                step_val = entry.val
-        return int(step_val)
+            step_val = self.log_current_row.get(self._step_key, "").val
+        return step_val
+
+    def _write_videos(self, video_dict):
+        step_val = self._get_step_val()
+        for key, video in video_dict.items():
+            self._write_video(step_val, key, video)
+        return
+
+    def _write_video(self, step_val, key, video):
+        num_frames = video.get_num_frames()
+        if (num_frames > 0):
+            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=True) as tmp:
+                video.save(tmp.name)
+                vid_name = os.path.basename(key)
+                wandb.log({vid_name: wandb.Video(tmp.name, format="mp4")}, step=step_val)
+        return

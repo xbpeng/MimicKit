@@ -34,13 +34,8 @@ def build_env(args, num_envs, device, visualize):
     env_file = args.parse_string("env_config")
     engine_file = args.parse_string("engine_config")
     record_video = args.parse_bool("video", False)
-
-    # Video recording is only supported on Isaac Lab engine
-    if record_video and env_builder.get_engine_name(engine_file) != "isaac_lab":
-        Logger.print("Warning: video recording only supported for isaac_lab engine, disabling")
-        record_video = False
-
-    env = env_builder.build_env(env_file, engine_file, num_envs, device, visualize, record_video=record_video)
+    
+    env = env_builder.build_env(env_file, engine_file, num_envs, device, visualize=visualize, record_video=record_video)
     return env
 
 def build_agent(args, env, device):

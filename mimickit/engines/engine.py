@@ -190,7 +190,7 @@ class Engine:
         return
 
     @abc.abstractmethod
-    def create_video_recorder(self, camera_config=None):
+    def create_video_recorder(self):
         return
     
     def draw_lines(self, env_id, start_verts, end_verts, cols, line_width):
@@ -198,12 +198,15 @@ class Engine:
     
     def register_keyboard_callback(self, key_str, callback_func):
         return
-
-    def get_video_recorder(self):
+    
+    def enabled_record_video(self):
+        return False
+    
+    def get_video_recording(self):
         return None
-
-    def pre_rollout_test(self):
+    
+    def start_video_recording(self):
         return
     
-    def post_rollout_test(self):
+    def stop_video_recording(self):
         return

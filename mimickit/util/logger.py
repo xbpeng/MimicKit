@@ -1,6 +1,7 @@
 import os
 import time
 import atexit
+import numbers
 import torch
 
 import util.mp_util as mp_util
@@ -82,10 +83,7 @@ class Logger:
         self.log_current_row[key] = Logger.Entry(val, quiet)
         self._need_update = True
         return
-
-    def get_num_keys(self):
-        return len(self.log_headers)
-
+    
     def print_log(self):
         """
         Print all of the diagnostics from the current iteration
@@ -101,7 +99,8 @@ class Logger:
             Logger.print("-" * (22 + key_spacing))
             for key in self.log_headers:
                 entry = self.log_current_row.get(key, "")
-                if not (entry.quiet):
+
+                if (isinstance(entry.val, numbers.Number)):
                     val = entry.val
 
                     if isinstance(val, float):
@@ -130,9 +129,11 @@ class Logger:
 
             vals = []
             for key in self.log_headers:
-                entry = self.log_current_row.get(key, "")
+                entry = self.log_current_row[key]
                 val = entry.val
-                vals.append(val)
+
+                if (isinstance(entry.val, numbers.Number)):
+                    vals.append(val)
             
             if self.output_file is not None:
                 if (self._row_count == 0):
@@ -157,8 +158,11 @@ class Logger:
         return val
 
     def _build_str_template(self):
-        num_keys = self.get_num_keys()
-        template = "{:<25}" * num_keys
+        template = ""
+        for key in self.log_headers:
+            entry = self.log_current_row[key]
+            if (isinstance(entry.val, numbers.Number)):
+                template += "{:<25}"
         return template
 
     def _mp_aggregate(self):

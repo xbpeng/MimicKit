@@ -1,5 +1,4 @@
 from isaaclab.app import AppLauncher
-from util.video_recorder import VideoRecorder
 
 import carb
 
@@ -9,6 +8,7 @@ import torch
 import time
 
 import engines.engine as engine
+import engines.isaac_lab_recorder as isaac_lab_recorder
 from util.logger import Logger
 import util.torch_util as torch_util
 
@@ -63,7 +63,6 @@ class IsaacLabEngine(engine.Engine):
     def __init__(self, config, num_envs, device, visualize, record_video=False):
         super().__init__()
 
-        self.video_recorder = None
         self._device = device
         sim_freq = config.get("sim_freq", 60)
         control_freq = config.get("control_freq", 10)
@@ -73,6 +72,9 @@ class IsaacLabEngine(engine.Engine):
         self._timestep = 1.0 / control_freq
         self._sim_steps = int(sim_freq / control_freq)
         sim_timestep = 1.0 / sim_freq
+
+        if (visualize):
+            record_video = False
 
         self._create_simulator(sim_timestep, visualize, record_video)
 
@@ -87,36 +89,22 @@ class IsaacLabEngine(engine.Engine):
 
         self._build_ground()
         self._env_offsets = self._compute_env_offsets(num_envs)
-
+        
         if (visualize or record_video):
-            self._build_camera()
             self._build_lights()
-
-        # Video recorder will be created after environment is initialized
-        # so it can query environment for camera config if needed
-        self._record_video = record_video
+            self._build_camera()
 
         if (visualize):
             self._prev_frame_time = 0.0
             self._build_draw_interface()
             self._setup_keyboard()
 
-        return
-
-    def create_video_recorder(self, camera_config={}):
-        """Create the video recorder with optional camera configuration.
+        if (record_video):
+            self._recording = False
+            self._build_video_recorder()
         
-        Args:
-            camera_config: Optional camera config dict. If None, uses defaults.
-        """
-        self.video_recorder = VideoRecorder(self, camera_config)
-        
-        Logger.print("Video recording enabled")
         return
     
-    def get_video_recorder(self):
-        return self.video_recorder
-
     def get_name(self):
         return "isaac_lab"
     
@@ -147,9 +135,9 @@ class IsaacLabEngine(engine.Engine):
     
     def step(self):
         self._update_reset_objs()
-        video_recorder = self.get_video_recorder()
-        if video_recorder is not None:
-            video_recorder.capture_frame()
+
+        if (self.enabled_record_video() and self._recording):
+            self._video_recorder.capture_frame()
         
         for i in range(self._sim_steps):
             self._pre_sim_step()
@@ -238,16 +226,19 @@ class IsaacLabEngine(engine.Engine):
     
     def render(self):
         self._sim.render()
-        self._draw_interface.clear_lines()
 
-        now = time.time()
-        delta = now - self._prev_frame_time
-        time_step = self.get_timestep()
+        visualize = hasattr(self, "_draw_interface")
+        if (visualize):
+            self._draw_interface.clear_lines()
 
-        if (delta < time_step):
-            time.sleep(time_step - delta)
+            now = time.time()
+            delta = now - self._prev_frame_time
+            time_step = self.get_timestep()
 
-        self._prev_frame_time = time.time()
+            if (delta < time_step):
+                time.sleep(time_step - delta)
+
+            self._prev_frame_time = time.time()
         return
     
     def get_timestep(self):
@@ -591,7 +582,24 @@ class IsaacLabEngine(engine.Engine):
         assert(key_code not in self._keyboard_callbacks)
         self._keyboard_callbacks[key_code] = callback_func
         return
+    
+    def enabled_record_video(self):
+        return hasattr(self, "_video_recorder")
 
+    def get_video_recording(self):
+        return self._video_recorder.get_video()
+
+    def start_video_recording(self):
+        if self.enabled_record_video():
+            self._video_recorder.clear()
+            self._recording = True
+        return
+    
+    def stop_video_recording(self):
+        if self.enabled_record_video():
+            self._recording = False
+        return
+    
     def _build_ground(self):
         import isaaclab.sim as sim_utils
         from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
@@ -677,18 +685,13 @@ class IsaacLabEngine(engine.Engine):
         self._keyboard_callbacks = dict()
         return
     
-    def _create_simulator(self, sim_timestep, visualize, record_video=False):
-        # Headless rendering (record_video without a display) requires a virtual display
-        if record_video and not visualize:
-            from util.display import ensure_virtual_display
-            ensure_virtual_display()
-
+    def _create_simulator(self, sim_timestep, visualize, record_video):
         self._app_launcher = AppLauncher({
             "headless": not visualize,
             "device": self._device,
             "enable_cameras": record_video or visualize,
         })
-
+        
         import isaaclab.sim as sim_utils
         from isaacsim.core.utils.stage import get_current_stage
         
@@ -1193,12 +1196,15 @@ class IsaacLabEngine(engine.Engine):
                 callback()
         return
 
-    def pre_rollout_test(self):
-        if self._record_video:
-            self.video_recorder.start_recording()
-        return
-    
-    def post_rollout_test(self):
-        if self._record_video:
-            self.video_recorder.stop_recording()
+    def _build_video_recorder(self):
+        """Create the video recorder with optional camera configuration.
+        
+        Args:
+            camera_config: Optional camera config dict. If None, uses defaults.
+        """
+        timestep = self.get_timestep()
+        fps = int(np.round(1.0 / timestep))
+        self._video_recorder = isaac_lab_recorder.IsaacLabVideoRecorder(self, fps=fps)
+        
+        Logger.print("Video recording enabled")
         return

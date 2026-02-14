@@ -1,3 +1,4 @@
+import numbers
 import os
 import tensorboardX
 
@@ -56,7 +57,9 @@ class TBLogger(logger.Logger):
                     entry = self.log_current_row.get(key, "")
                     val = entry.val
                     tag = self._key_tags[i]
-                    self._writer.add_scalar(tag, val, step_val)
+
+                    if (isinstance(entry.val, numbers.Number)):
+                        self._writer.add_scalar(tag, val, step_val)
         return
     
     def _add_collection(self, name, key):

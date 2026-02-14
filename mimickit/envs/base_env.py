@@ -67,13 +67,3 @@ class BaseEnv(abc.ABC):
     
     def record_diagnostics(self):
         return self._diagnostics
-    
-    def get_video_camera_config(self) -> dict:
-        """Optional method for environments to provide camera config for video recording.
-        
-        Returns:
-            dict with optional keys:
-                - cam_pos: np.ndarray, camera position [x, y, z]
-                - cam_target: np.ndarray, camera target [x, y, z]
-        """
-        return {}

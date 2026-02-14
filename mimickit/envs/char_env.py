@@ -343,22 +343,7 @@ class CharEnv(sim_env.SimEnv):
     
     def _has_key_bodies(self):
         return len(self._key_body_ids) > 0
-
-    def get_video_camera_config(self) -> dict:
-        """Provide camera config for video recording."""
-        env_id = 0
-        char_id = self._get_char_id()
-        char_root_pos = self._engine.get_root_pos(char_id)
-        char_pos = char_root_pos[env_id].cpu().numpy()
-        
-        cam_pos = np.array([char_pos[0], char_pos[1] - 5.0, 3.0])
-        cam_target = np.array([char_pos[0], char_pos[1], 1.0])
-        
-        return {
-            "cam_pos": cam_pos,
-            "cam_target": cam_target,
-        }
-
+    
     def _build_camera(self, env_config):
         env_id = 0
         char_id = self._get_char_id()
