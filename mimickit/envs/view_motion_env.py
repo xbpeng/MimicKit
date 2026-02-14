@@ -8,12 +8,12 @@ import numpy as np
 import torch
 
 class ViewMotionEnv(char_env.CharEnv):
-    def __init__(self, env_config, engine_config, num_envs, device, visualize, record_video=False):
+    def __init__(self, env_config, engine_config, num_envs, device, visualize):
         self._time_scale = 1.0
         engine_config["sim_freq"] = engine_config["control_freq"]
 
         super().__init__(env_config=env_config, engine_config=engine_config,
-                         num_envs=num_envs, device=device, visualize=visualize, record_video=record_video)
+                         num_envs=num_envs, device=device, visualize=visualize)
         return
 
     def _build_envs(self, env_config, num_envs):

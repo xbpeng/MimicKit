@@ -21,7 +21,8 @@ class CharEnv(sim_env.SimEnv):
         self._zero_center_action = env_config.get("zero_center_action", False)
         
         super().__init__(env_config=env_config, engine_config=engine_config,
-                         num_envs=num_envs, device=device, visualize=visualize, record_video=record_video)
+                         num_envs=num_envs, device=device, visualize=visualize, 
+                         record_video=record_video)
         
         char_id = self._get_char_id()
         self._print_char_prop(0, char_id)

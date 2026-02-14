@@ -11,7 +11,6 @@ def build_env(env_file, engine_file, num_envs, device, visualize, record_video=F
     env_name = env_config["env_name"]
     Logger.print("Building {} env".format(env_name))
     
-    # Build environment based on env_name
     if (env_name == "char"):
         import envs.char_env as char_env
         env = char_env.CharEnv(env_config=env_config, engine_config=engine_config, num_envs=num_envs, device=device, visualize=visualize, record_video=record_video)
@@ -29,10 +28,10 @@ def build_env(env_file, engine_file, num_envs, device, visualize, record_video=F
         env = add_env.ADDEnv(env_config=env_config, engine_config=engine_config, num_envs=num_envs, device=device, visualize=visualize, record_video=record_video)
     elif (env_name == "char_dof_test"):
         import envs.char_dof_test_env as char_dof_test_env
-        env = char_dof_test_env.CharDofTestEnv(env_config=env_config, engine_config=engine_config, num_envs=num_envs, device=device, visualize=visualize, record_video=record_video)
+        env = char_dof_test_env.CharDofTestEnv(env_config=env_config, engine_config=engine_config, num_envs=num_envs, device=device, visualize=visualize)
     elif (env_name == "view_motion"):
         import envs.view_motion_env as view_motion_env
-        env = view_motion_env.ViewMotionEnv(env_config=env_config, engine_config=engine_config, num_envs=num_envs, device=device, visualize=visualize, record_video=record_video)
+        env = view_motion_env.ViewMotionEnv(env_config=env_config, engine_config=engine_config, num_envs=num_envs, device=device, visualize=visualize)
     elif (env_name == "task_location"):
         import envs.task_location_env as task_location_env
         env = task_location_env.TaskLocationEnv(env_config=env_config, engine_config=engine_config, num_envs=num_envs, device=device, visualize=visualize, record_video=record_video)
@@ -46,12 +45,6 @@ def build_env(env_file, engine_file, num_envs, device, visualize, record_video=F
         assert(False), "Unsupported env: {}".format(env_name)
 
     return env
-
-def get_engine_name(engine_file):
-    engine_config = load_config(engine_file)
-    if engine_config is not None:
-        return engine_config.get("engine_name", "")
-    return ""
 
 def load_config(file):
     if (file is not None and file != ""):

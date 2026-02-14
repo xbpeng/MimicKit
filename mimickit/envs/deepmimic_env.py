@@ -40,11 +40,12 @@ class DeepMimicEnv(char_env.CharEnv):
         self._visualize_ref_char = env_config.get("visualize_ref_char", True)
         
         super().__init__(env_config=env_config, engine_config=engine_config,
-                         num_envs=num_envs, device=device, visualize=visualize, record_video=record_video)
+                         num_envs=num_envs, device=device, visualize=visualize,
+                         record_video=record_video)
         return
     
     def get_reward_succ(self):
-        # setting the done flag flat to fail at the end of the motion avoids the
+        # setting the success reward to 0 at the end of the motion avoids the
         # local minimal of a character just standing still until the end of the motion
         return 0.0
     
@@ -495,9 +496,8 @@ class DeepMimicEnv(char_env.CharEnv):
     def _update_info(self, env_ids=None):
         super()._update_info(env_ids)
         
-        if (self._mode == base_env.EnvMode.TEST):
-            if (self._log_tracking_error):
-                self._record_tracking_error(env_ids)
+        if (self._log_tracking_error and self._mode == base_env.EnvMode.TEST):
+            self._record_tracking_error(env_ids)
         return
     
     def _record_tracking_error(self, env_ids=None):

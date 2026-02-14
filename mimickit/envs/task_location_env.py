@@ -13,7 +13,8 @@ class TaskLocationEnv(amp_env.AMPEnv):
         self._tar_dist_max = env_config["tar_dist_max"]
 
         super().__init__(env_config=env_config, engine_config=engine_config,
-                         num_envs=num_envs, device=device, visualize=visualize, record_video=record_video)
+                         num_envs=num_envs, device=device, visualize=visualize,
+                         record_video=record_video)
         return
     
     def _build_envs(self, config, num_envs):

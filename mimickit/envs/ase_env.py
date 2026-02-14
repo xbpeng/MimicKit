@@ -8,7 +8,8 @@ class ASEEnv(amp_env.AMPEnv):
         self._default_reset_prob = env_config["default_reset_prob"]
 
         super().__init__(env_config=env_config, engine_config=engine_config, 
-                         num_envs=num_envs, device=device, visualize=visualize, record_video=record_video)
+                         num_envs=num_envs, device=device, visualize=visualize,
+                         record_video=record_video)
         return
     
     def _reset_char(self, env_ids):

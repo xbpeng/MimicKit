@@ -21,7 +21,8 @@ class TaskSteeringEnv(amp_env.AMPEnv):
         self._reward_steering_vel_scale = float(env_config["reward_steering_vel_scale"])
 
         super().__init__(env_config=env_config, engine_config=engine_config,
-                         num_envs=num_envs, device=device, visualize=visualize, record_video=record_video)
+                         num_envs=num_envs, device=device, visualize=visualize,
+                         record_video=record_video)
         return
     
     def _build_envs(self, config, num_envs):

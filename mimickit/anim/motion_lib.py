@@ -5,6 +5,7 @@ import yaml
 
 import anim.motion as motion
 from util.logger import Logger
+import util.mp_util as mp_util
 import util.torch_util as torch_util
 
 def extract_pose_data(frame):
@@ -21,7 +22,7 @@ class MotionLib():
         return
 
     def get_num_motions(self):
-        return self._motion_lengths.shape[0]
+        return self._motion_num_frames.shape[0]
 
     def get_total_length(self):
         return torch.sum(self._motion_lengths).item()
@@ -40,6 +41,9 @@ class MotionLib():
 
         motion_time = phase * motion_len
         return motion_time
+    
+    def get_motion_file(self, motion_id):
+        return self._motion_files[motion_id]
 
     def get_motion_length(self, motion_ids):
         return self._motion_lengths[motion_ids]
@@ -140,29 +144,96 @@ class MotionLib():
     def _load_motions(self, motion_file):
         self._load_motion_pkl(motion_file)
         
+        self._process_data()
+
         num_motions = self.get_num_motions()
         total_len = self.get_total_length()
         Logger.print("Loaded motion file: {}".format(motion_file))
         Logger.print("Loaded {:d} motions with a total length of {:.3f}s.".format(num_motions, total_len))
         return
+    
+    def _process_data(self):
+        num_motions = self.get_num_motions()
+        self._motion_ids = torch.arange(num_motions, dtype=torch.long, device=self._device)
+        self._motion_weights /= self._motion_weights.sum()
+        self._motion_lengths = 1.0 / self._motion_fps * (self._motion_num_frames - 1)
+        
+        lengths_shifted = self._motion_num_frames.roll(1)
+        lengths_shifted[0] = 0
+        self._motion_start_idx = lengths_shifted.cumsum(0)
+        motion_end_idx = self._motion_num_frames.cumsum(0) - 1
+
+        frame_fps = [torch.stack([self._motion_fps[i]] * self._motion_num_frames[i].item()) for i in range(num_motions)]
+        frame_fps = torch.cat(frame_fps)
+        frame_fps = frame_fps.unsqueeze(-1)
+        
+        self._frame_root_vel = torch.zeros_like(self._frame_root_pos)
+        self._frame_root_vel[..., :-1, :] = frame_fps[:-1] * (self._frame_root_pos[..., 1:, :] - self._frame_root_pos[..., :-1, :])
+        self._frame_root_vel[..., motion_end_idx, :] = self._frame_root_vel[..., motion_end_idx - 1, :]
+                
+        self._frame_root_ang_vel = torch.zeros_like(self._frame_root_pos)
+        root_drot = torch_util.quat_diff(self._frame_root_rot[..., :-1, :], self._frame_root_rot[..., 1:, :])
+        self._frame_root_ang_vel[..., :-1, :] = frame_fps[:-1] * torch_util.quat_to_exp_map(root_drot)
+        self._frame_root_ang_vel[..., motion_end_idx, :] = self._frame_root_ang_vel[..., motion_end_idx - 1, :]
+
+        frame_dt = 1.0 / frame_fps
+        self._frame_dof_vel = self._kin_char_model.compute_frame_dof_vel(self._frame_joint_rot, frame_dt[:-1])
+        self._frame_dof_vel[..., motion_end_idx, :] = self._frame_dof_vel[..., motion_end_idx - 1, :]
+
+        root_pos_beg = self._frame_root_pos[self._motion_start_idx, :]
+        root_pos_end = self._frame_root_pos[motion_end_idx, :]
+        self._motion_wrap_delta = root_pos_end - root_pos_beg
+        self._motion_wrap_delta[..., -1] = 0.0
+
+        nonwrap_motions = self._motion_loop_modes != motion.LoopMode.WRAP.value
+        self._motion_wrap_delta[nonwrap_motions] = 0.0
+        return
+
+    def _fetch_motion_files(self, motion_file):
+        ext = os.path.splitext(motion_file)[1]
+        if (ext == ".yaml"):
+            motion_files = []
+            motion_weights = []
+
+            with open(motion_file, "r") as f:
+                motion_config = yaml.load(f, Loader=yaml.SafeLoader)
+
+            motion_list = motion_config["motions"]
+            for motion_entry in motion_list:
+                curr_file = motion_entry["file"]
+                curr_weight = motion_entry["weight"]
+                assert(curr_weight >= 0)
+
+                motion_weights.append(curr_weight)
+                motion_files.append(curr_file)
+        else:
+            motion_files = [motion_file]
+            motion_weights = [1.0]
+
+        # distribute different subset of motions to each worker
+        if (mp_util.enable_mp()):
+            num_workers = mp_util.get_num_procs()
+            num_motions = len(motion_files)
+
+            if(num_motions >= num_workers):
+                rank = mp_util.get_proc_rank()
+                beg_idx = int(np.round(rank * float(num_motions) / num_workers))
+                end_idx = int(np.round((rank + 1) * float(num_motions) / num_workers))
+                motion_files = motion_files[beg_idx:end_idx]
+                motion_weights = motion_weights[beg_idx:end_idx]
+
+        return motion_files, motion_weights
 
     def _load_motion_pkl(self, motion_file):
+        self._motion_files = []
         self._motion_weights = []
         self._motion_fps = []
-        self._motion_dt = []
         self._motion_num_frames = []
-        self._motion_lengths = []
         self._motion_loop_modes = []
-        self._motion_wrap_delta = []
-        self._motion_files = []
         
-        self._motion_frames = []
         self._frame_root_pos = []
         self._frame_root_rot = []
-        self._frame_root_vel = []
-        self._frame_root_ang_vel = []
         self._frame_joint_rot = []
-        self._frame_dof_vel = []
 
         motion_files, motion_weights = self._fetch_motion_files(motion_file)
         num_motion_files = len(motion_files)
@@ -172,101 +243,30 @@ class MotionLib():
             Logger.print("Loading {:d}/{:d} motion files: {:s}".format(f + 1, num_motion_files, curr_file))
             
             curr_motion = motion.load_motion(curr_file)
-            fps = curr_motion.fps
-            loop_mode = curr_motion.loop_mode
-            frames = curr_motion.frames
             curr_weight = motion_weights[f]
-
-            loop_mode = loop_mode.value
-            dt = 1.0 / fps
-
+            fps = curr_motion.fps
+            loop_mode = curr_motion.loop_mode.value
+            frames = curr_motion.frames
             num_frames = frames.shape[0]
-            curr_len = 1.0 / fps * (num_frames - 1)
 
             root_pos, root_rot, joint_rot = self._extract_frame_data(frames)
 
-            if (loop_mode == motion.LoopMode.WRAP.value):
-                wrap_delta = root_pos[-1] - root_pos[0]
-                wrap_delta[..., -1] = 0.0
-            else:
-                wrap_delta = torch.zeros_like(root_pos[0])
-
-            root_vel = torch.zeros_like(root_pos)
-            root_vel[..., :-1, :] = fps * (root_pos[..., 1:, :] - root_pos[..., :-1, :])
-            root_vel[..., -1, :] = root_vel[..., -2, :]
-                
-            root_ang_vel = torch.zeros_like(root_pos)
-            root_drot = torch_util.quat_diff(root_rot[..., :-1, :], root_rot[..., 1:, :])
-            root_ang_vel[..., :-1, :] = fps * torch_util.quat_to_exp_map(root_drot)
-            root_ang_vel[..., -1, :] = root_ang_vel[..., -2, :]
-
-            dof_vel = self._kin_char_model.compute_frame_dof_vel(joint_rot, dt)
-
+            self._motion_files.append(curr_file)
             self._motion_weights.append(curr_weight)
             self._motion_fps.append(fps)
-            self._motion_dt.append(dt)
             self._motion_num_frames.append(num_frames)
-            self._motion_lengths.append(curr_len)
             self._motion_loop_modes.append(loop_mode)
-            self._motion_wrap_delta.append(wrap_delta)
-            self._motion_files.append(curr_file)
-                
-            self._motion_frames.append(frames)
+            
             self._frame_root_pos.append(root_pos)
             self._frame_root_rot.append(root_rot)
-            self._frame_root_vel.append(root_vel)
-            self._frame_root_ang_vel.append(root_ang_vel)
             self._frame_joint_rot.append(joint_rot)
-            self._frame_dof_vel.append(dof_vel)
 
         self._motion_weights = torch.tensor(self._motion_weights, dtype=torch.float32, device=self._device)
-        self._motion_weights /= self._motion_weights.sum()
-
         self._motion_fps = torch.tensor(self._motion_fps, dtype=torch.float32, device=self._device)
-        self._motion_dt = torch.tensor(self._motion_dt, dtype=torch.float32, device=self._device)
         self._motion_num_frames = torch.tensor(self._motion_num_frames, dtype=torch.long, device=self._device)
-        self._motion_lengths = torch.tensor(self._motion_lengths, dtype=torch.float32, device=self._device)
         self._motion_loop_modes = torch.tensor(self._motion_loop_modes, dtype=torch.int, device=self._device)
-        
-        self._motion_wrap_delta = torch.stack(self._motion_wrap_delta, dim=0)
-        
-        self._motion_frames = np.concatenate(self._motion_frames, axis=0)
-        self._motion_frames = torch.tensor(self._motion_frames, dtype=torch.float32, device=self._device)
         
         self._frame_root_pos = torch.cat(self._frame_root_pos, dim=0)
         self._frame_root_rot = torch.cat(self._frame_root_rot, dim=0)
-        self._frame_root_vel = torch.cat(self._frame_root_vel, dim=0)
-        self._frame_root_ang_vel = torch.cat(self._frame_root_ang_vel, dim=0)
         self._frame_joint_rot = torch.cat(self._frame_joint_rot, dim=0)
-        self._frame_dof_vel = torch.cat(self._frame_dof_vel, dim=0)
-        
-        num_motions = self.get_num_motions()
-        self._motion_ids = torch.arange(num_motions, dtype=torch.long, device=self._device)
-        
-        lengths_shifted = self._motion_num_frames.roll(1)
-        lengths_shifted[0] = 0
-        self._motion_start_idx = lengths_shifted.cumsum(0)
         return
-
-    def _fetch_motion_files(self, motion_file):
-        ext = os.path.splitext(motion_file)[1]
-        if (ext == ".yaml"):
-            motion_files = []
-            motion_weights = []
-
-            with open(motion_file, 'r') as f:
-                motion_config = yaml.load(f, Loader=yaml.SafeLoader)
-
-            motion_list = motion_config['motions']
-            for motion_entry in motion_list:
-                curr_file = motion_entry['file']
-                curr_weight = motion_entry['weight']
-                assert(curr_weight >= 0)
-
-                motion_weights.append(curr_weight)
-                motion_files.append(curr_file)
-        else:
-            motion_files = [motion_file]
-            motion_weights = [1.0]
-
-        return motion_files, motion_weights

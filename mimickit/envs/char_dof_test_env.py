@@ -6,11 +6,11 @@ import torch
 import engines.engine as engine
 
 class CharDofTestEnv(char_env.CharEnv):
-    def __init__(self, env_config, engine_config, num_envs, device, visualize, record_video=False):
+    def __init__(self, env_config, engine_config, num_envs, device, visualize):
         self._time_per_dof = 4.0
 
         super().__init__(env_config=env_config, engine_config=engine_config,
-                         num_envs=num_envs, device=device, visualize=visualize, record_video=record_video)
+                         num_envs=num_envs, device=device, visualize=visualize)
 
         self._episode_length = self._time_per_dof * self._pd_low.shape[0]
         return

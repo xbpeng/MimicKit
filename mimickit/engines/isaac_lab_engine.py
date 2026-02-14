@@ -764,7 +764,7 @@ class IsaacLabEngine(engine.Engine):
 
     def _clear_forces(self):
         for obj in self._objs:
-            if (getattr(obj, 'has_external_wrentch', False)):
+            if (getattr(obj, "has_external_wrentch", False)):
                 forces = torch.zeros([1, 3], dtype=torch.float, device=self._device)
                 torques = torch.zeros([1, 3], dtype=torch.float, device=self._device)
                 obj.set_external_force_and_torque(forces=forces, torques=torques,

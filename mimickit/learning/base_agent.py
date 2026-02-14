@@ -90,8 +90,6 @@ class BaseAgent(torch.nn.Module):
         return
 
     def test_model(self, num_episodes):
-        Logger.print("[BaseAgent] Testing model for {} episodes".format(num_episodes))
-        
         self.eval()
         self.set_mode(AgentMode.TEST)
         

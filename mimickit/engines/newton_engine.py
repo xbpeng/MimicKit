@@ -4,6 +4,7 @@ wp.config.enable_backward = False
 import newton
 import numpy as np
 import os
+import time
 import torch
 import pyglet
 
@@ -339,6 +340,7 @@ class NewtonEngine(engine.Engine):
         if (visualize):
             self._build_viewer()
             self._obj_colors = []
+            self._prev_frame_time = 0.0
             self._keyboard_callbacks = dict()
         else:
             self._viewer = None
@@ -477,6 +479,15 @@ class NewtonEngine(engine.Engine):
         self._viewer.log_state(self._sim_state.raw_state)
 
         self._draw_line_count = 0
+        
+        now = time.time()
+        delta = now - self._prev_frame_time
+        time_step = self.get_timestep()
+
+        if (delta < time_step):
+            time.sleep(time_step - delta)
+
+        self._prev_frame_time = time.time()
         return
     
     def get_timestep(self):
@@ -1074,9 +1085,6 @@ class NewtonEngine(engine.Engine):
             callback = self._keyboard_callbacks[symbol]
             callback()
         return
-
-    def create_video_recorder(self):
-        raise NotImplementedError("Video recording not supported for Newton engine")
 
 
 @wp.kernel

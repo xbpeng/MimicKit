@@ -188,25 +188,21 @@ class Engine:
     @abc.abstractmethod
     def get_control_mode(self):
         return
-
-    @abc.abstractmethod
-    def create_video_recorder(self):
-        return
     
     def draw_lines(self, env_id, start_verts, end_verts, cols, line_width):
         return
     
     def register_keyboard_callback(self, key_str, callback_func):
         return
-    
+
     def enabled_record_video(self):
         return False
-    
+  
     def get_video_recording(self):
         return None
-    
+ 
     def start_video_recording(self):
         return
-    
+
     def stop_video_recording(self):
         return

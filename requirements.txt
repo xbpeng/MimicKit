@@ -1,4 +1,5 @@
 gymnasium
+moviepy
 matplotlib
 numpy
 pyyaml

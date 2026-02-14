@@ -7,7 +7,8 @@ import util.torch_util as torch_util
 class ADDEnv(amp_env.AMPEnv):
     def __init__(self, env_config, engine_config, num_envs, device, visualize, record_video=False):
         super().__init__(env_config=env_config, engine_config=engine_config, 
-                         num_envs=num_envs, device=device, visualize=visualize, record_video=record_video)
+                         num_envs=num_envs, device=device, visualize=visualize,
+                         record_video=record_video)
         return
     
     def _build_disc_obs_buffers(self):
