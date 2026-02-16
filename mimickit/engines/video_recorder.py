@@ -3,8 +3,10 @@ import abc
 import util.video as video
 
 class VideoRecorder:
-    def __init__(self, fps, resolution):
+    def __init__(self, fps, resolution, cam_pos, cam_target):
         self._resolution = resolution
+        self._cam_pos = cam_pos
+        self._cam_target = cam_target
         self._video = video.Video(fps)
         return
     

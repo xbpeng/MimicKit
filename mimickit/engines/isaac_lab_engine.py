@@ -1188,8 +1188,6 @@ class IsaacLabEngine(engine.Engine):
         return
 
     def _build_video_recorder(self):
-        timestep = self.get_timestep()
-        fps = int(np.round(1.0 / timestep))
-        self._video_recorder = isaac_lab_recorder.IsaacLabVideoRecorder(self, fps=fps)
+        self._video_recorder = isaac_lab_recorder.IsaacLabVideoRecorder(self)
         Logger.print("Video recording enabled")
         return

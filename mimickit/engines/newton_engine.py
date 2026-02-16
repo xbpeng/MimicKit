@@ -4,7 +4,6 @@ wp.config.enable_backward = False
 import newton
 import numpy as np
 import os
-import time
 import torch
 import pyglet
 
@@ -330,6 +329,7 @@ class NewtonEngine(engine.Engine):
         self._obj_builders = []
         self._obj_start_pos = []
         self._obj_start_rot = []
+        self._obj_colors = []
         
         if ("control_mode" in config):
             self._control_mode = engine.ControlMode[config["control_mode"]]
@@ -340,7 +340,6 @@ class NewtonEngine(engine.Engine):
 
         if (visualize):
             self._build_viewer()
-            self._obj_colors = []
             self._keyboard_callbacks = dict()
         else:
             self._viewer = None
@@ -364,9 +363,7 @@ class NewtonEngine(engine.Engine):
         self._obj_types.append([])
         self._obj_start_pos.append([])
         self._obj_start_rot.append([])
-
-        if (self._visualize()):
-            self._obj_colors.append([])
+        self._obj_colors.append([])
 
         return env_id
     
@@ -392,7 +389,8 @@ class NewtonEngine(engine.Engine):
         self._build_dof_force_tensors()
 
         if (self._visualize()):
-            self._init_rendering()
+            self.init_viewer(self._viewer)
+            self._camera_offsets = self._viewer.world_offsets.numpy()
         
         if self._record_video:
             self._video_recorder = self._build_video_recorder()
@@ -429,10 +427,8 @@ class NewtonEngine(engine.Engine):
         self._obj_builders[env_id].append(obj_builder)
         self._obj_start_pos[env_id].append(start_pos)
         self._obj_start_rot[env_id].append(start_rot)
+        self._obj_colors[env_id].append(color)
 
-        if (self._visualize()):
-            self._obj_colors[env_id].append(color)
-        
         return obj_id
     
     def set_cmd(self, obj_id, cmd):
@@ -483,8 +479,7 @@ class NewtonEngine(engine.Engine):
         return cam_dir
     
     def render(self):
-        time_step = self.get_timestep()
-        sim_time = time_step * self._sim_step_count
+        sim_time = self.get_sim_time()
 
         self._viewer.end_frame()
         self._viewer.begin_frame(sim_time)
@@ -500,6 +495,10 @@ class NewtonEngine(engine.Engine):
     
     def get_sim_timestep(self):
         return self._sim_timestep
+    
+    def get_sim_time(self):
+        time_step = self.get_timestep()
+        return time_step * self._sim_step_count
     
     def get_num_envs(self):
         return self._num_envs
@@ -718,7 +717,16 @@ class NewtonEngine(engine.Engine):
     def get_control_mode(self):
         return self._control_mode
     
-    def set_body_color(self, env_id, obj_id, body_id, color):
+    def get_sim_model(self):
+        return self._sim_model
+    
+    def get_sim_state(self):
+        return self._sim_state
+    
+    def set_body_color(self, env_id, obj_id, body_id, color, viewer=None):
+        if (viewer is None):
+            viewer = self._viewer
+        
         objs_per_env = self.get_objs_per_env()
         articulation_start = self._sim_model.articulation_start.numpy()
 
@@ -728,9 +736,16 @@ class NewtonEngine(engine.Engine):
 
         body_shape_idx = self._sim_model.body_shapes[body_idx]
         col_dict = dict([(i, color) for i in body_shape_idx])
-        self._viewer.update_shape_colors(col_dict)
+        viewer.update_shape_colors(col_dict)
         return
     
+    def init_viewer(self, viewer):
+        env_spacing = self._get_env_spacing()
+        viewer.set_model(self._sim_model)
+        viewer.set_world_offsets([env_spacing, env_spacing, 0.0])
+        self._apply_obj_colors(viewer)
+        return
+
     def draw_lines(self, env_id, start_verts, end_verts, cols, line_width):
         cam_offset = self._camera_offsets[env_id]
         start_pts = start_verts.copy()
@@ -994,15 +1009,6 @@ class NewtonEngine(engine.Engine):
             offset_idx += num_bodies
         return
     
-    def _init_rendering(self):
-        env_spacing = self._get_env_spacing()
-        self._viewer.set_model(self._sim_model)
-        self._viewer.set_world_offsets([env_spacing, env_spacing, 0.0])
-        self._camera_offsets = self._viewer.world_offsets.numpy()
-
-        self._apply_obj_colors()
-        return
-    
     def _get_env_spacing(self):
         return self._env_spacing
     
@@ -1057,7 +1063,7 @@ class NewtonEngine(engine.Engine):
     def _visualize(self):
         return self._viewer is not None
     
-    def _apply_obj_colors(self):
+    def _apply_obj_colors(self, viewer):
         num_envs = self.get_num_envs()
         objs_per_env = self.get_objs_per_env()
 
@@ -1068,7 +1074,7 @@ class NewtonEngine(engine.Engine):
                 if (obj_col is not None):
                     num_bodies = self.get_obj_num_bodies(obj_id)
                     for body_id in range(num_bodies):
-                        self.set_body_color(env_id, obj_id, body_id, obj_col)
+                        self.set_body_color(env_id, obj_id, body_id, obj_col, viewer)
         return
     
     def _apply_pd_explicit_torque(self, sim_state, control):
@@ -1109,10 +1115,8 @@ class NewtonEngine(engine.Engine):
         return
 
     def _build_video_recorder(self) -> newton_recorder.NewtonVideoRecorder:
-        timestep = self.get_timestep()
-        fps = int(np.round(1.0 / timestep))
         Logger.print("Video recording enabled")
-        return newton_recorder.NewtonVideoRecorder(self, fps=fps)
+        return newton_recorder.NewtonVideoRecorder(self)
 
 
 @wp.kernel

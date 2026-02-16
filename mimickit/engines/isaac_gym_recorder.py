@@ -10,20 +10,18 @@ import engines.isaac_gym_engine as isaac_gym_engine
 class IsaacGymVideoRecorder(video_recorder.VideoRecorder):
     def __init__(self, 
                  engine: isaac_gym_engine.IsaacGymEngine, 
-                 fps: int, 
+                 resolution: tuple[int, int] = (854, 480), 
                  cam_pos: np.array = np.array([-3.5, -3.5, 2.0]),
-                 cam_target: np.array = np.array([0.0, 0.0, 1.0]),
-                 resolution: tuple[int, int] = (854, 480)):
+                 cam_target: np.array = np.array([0.0, 0.0, 1.0])):
         
-        super().__init__(fps, resolution)
-
         self._engine: isaac_gym_engine.IsaacGymEngine = engine
-
         self._env_id = 0
         self._obj_id = 0
-        self._cam_pos = cam_pos
-        self._cam_target = cam_target
         self._camera_ptr = None
+
+        timestep = self._engine.get_timestep()
+        fps = int(np.round(1.0 / timestep))
+        super().__init__(fps, resolution, cam_pos, cam_target)
         return
     
     def _build_camera(self):
