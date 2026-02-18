@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from util import display
 import newton
 import numpy as np
 import pyglet
@@ -10,7 +11,6 @@ from util.logger import Logger
 
 if TYPE_CHECKING:
     import engines.newton_engine as newton_engine
-
 
 class NewtonVideoRecorder(video_recorder.VideoRecorder):
     def __init__(self,
@@ -26,6 +26,7 @@ class NewtonVideoRecorder(video_recorder.VideoRecorder):
         timestep = self._engine.get_timestep()
         fps = int(np.round(1.0 / timestep))
         super().__init__(fps, resolution, cam_pos, cam_target)
+        display.ensure_virtual_display()
 
         self._build_viewer()
         self._cam_offset = self._viewer.world_offsets.numpy()[self._env_id]
