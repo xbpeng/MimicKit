@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import numpy as np
-import os
-import subprocess
-import time
 from typing import TYPE_CHECKING, Any
 
 import engines.video_recorder as video_recorder
+from util import display
 from util.logger import Logger
 
 if TYPE_CHECKING:
@@ -30,7 +28,7 @@ class IsaacLabVideoRecorder(video_recorder.VideoRecorder):
         fps = int(np.round(1.0 / timestep))
         super().__init__(fps, resolution, cam_pos, cam_target)
         
-        self._ensure_virtual_display()
+        display.ensure_virtual_display()
         return
     
     def _record_frame(self):
@@ -67,19 +65,4 @@ class IsaacLabVideoRecorder(video_recorder.VideoRecorder):
             self._annotator = rep.AnnotatorRegistry.get_annotator("rgb", device="cpu")
             self._annotator.attach([self._render_product])
             Logger.print("[VideoRecorder] Created RGB annotator for {}".format(video_cam_path))
-        return
-
-    def _ensure_virtual_display(self, display=":99"):
-        if "DISPLAY" not in os.environ:
-            try:
-                process: subprocess.Popen[bytes] = subprocess.Popen(
-                    ["Xvfb", display, "-screen", "0", "1024x768x24"],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-                )
-                time.sleep(1)
-                os.environ["DISPLAY"] = display
-                Logger.print("Started virtual display on {}".format(display))
-            except FileNotFoundError:
-                Logger.print("WARNING: Xvfb not found. Install with: apt-get install xvfb")
-                Logger.print("Headless camera rendering may not work without a virtual display.")
         return
