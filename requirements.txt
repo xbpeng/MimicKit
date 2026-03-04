@@ -1,9 +1,0 @@
-gymnasium
-moviepy
-matplotlib
-numpy
-pyyaml
-pyglet
-tensorboardX
-torch>=1.9.1
-wandb>=0.17.4
