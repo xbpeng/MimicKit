@@ -452,6 +452,9 @@ function buildArticulation() {
             joint.setJointType(E_REVOLUTE);
         }
 
+        // Match Isaac Lab: joint friction = 0 (PhysX default is 0.05)
+        joint.setFrictionCoefficient(0);
+
         // Joint frame poses - localPos0 and localRot are Z-up, use directly
         const lp = jdata.localPos0;
         const lr = jdata.localRot; // [w, x, y, z]
