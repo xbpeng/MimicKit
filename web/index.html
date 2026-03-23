@@ -714,59 +714,207 @@ function updateMeshes() {
 }
 
 // ---------------------------------------------------------------------------
-// Build observation vector (simplified)
-// NOTE: This is a simplified observation that approximates the training env's
-// observation. A full implementation would exactly replicate ASE env's
-// _build_obs() including proper local body positions/rotations for all key
-// bodies, correctly computed angular velocities, etc.
+// Quaternion / vector math utilities for observation building.
+// Quaternion convention matches MimicKit's torch_util: [x, y, z, w].
+// All observation math is done in Z-up frame (MimicKit training convention).
+// PhysX Y-up values are converted to Z-up before use: (x,y,z)_yup -> (x,z,y)_zup.
+// ---------------------------------------------------------------------------
+
+// Convert Y-up position to Z-up: (x,y,z) -> (x,z,y)
+function yupToZup3(x, y, z) { return [x, z, y]; }
+
+// Convert Y-up quaternion (PhysX xyzw) to Z-up quaternion (xyzw).
+// The Y-up to Z-up coordinate change swaps Y and Z axes: (x,y,z) -> (x,z,y).
+// This is an improper transformation P with det(P) = -1.
+// For quaternion [x,y,z,w], the transformed quaternion is [-x, -z, -y, w]:
+//   - swap y,z components (matching the axis swap)
+//   - negate xyz (because det(P) = -1 reverses rotation handedness)
+function quatYupToZup(qx, qy, qz, qw) {
+    return [-qx, -qz, -qy, qw];
+}
+
+// Rotate vector v by quaternion q, both in [x,y,z] / [x,y,z,w] format.
+// Matches torch_util.quat_rotate: v + 2*w*(qv x v) + 2*(qv x (qv x v))
+function quatRotateVec(q, v) {
+    const [qx, qy, qz, qw] = q;
+    const [vx, vy, vz] = v;
+    // t = 2 * cross(q_xyz, v)
+    const tx = 2 * (qy*vz - qz*vy);
+    const ty = 2 * (qz*vx - qx*vz);
+    const tz = 2 * (qx*vy - qy*vx);
+    return [
+        vx + qw*tx + (qy*tz - qz*ty),
+        vy + qw*ty + (qz*tx - qx*tz),
+        vz + qw*tz + (qx*ty - qy*tx)
+    ];
+}
+
+// Quaternion multiply a * b, both [x,y,z,w]
+function quatMul(a, b) {
+    const [ax,ay,az,aw] = a, [bx,by,bz,bw] = b;
+    return [
+        aw*bx + ax*bw + ay*bz - az*by,
+        aw*by - ax*bz + ay*bw + az*bx,
+        aw*bz + ax*by - ay*bx + az*bw,
+        aw*bw - ax*bx - ay*by - az*bz
+    ];
+}
+
+// Normalize quaternion
+function quatNorm(q) {
+    const [x,y,z,w] = q;
+    const len = Math.sqrt(x*x + y*y + z*z + w*w) || 1;
+    return [x/len, y/len, z/len, w/len];
+}
+
+// Axis-angle to quaternion [x,y,z,w] (matches torch_util.axis_angle_to_quat)
+function axisAngleToQuat(axis, angle) {
+    const ha = angle * 0.5;
+    const s = Math.sin(ha), c = Math.cos(ha);
+    const len = Math.sqrt(axis[0]*axis[0] + axis[1]*axis[1] + axis[2]*axis[2]) || 1;
+    return quatNorm([axis[0]/len*s, axis[1]/len*s, axis[2]/len*s, c]);
+}
+
+// Exponential map (3D) to quaternion [x,y,z,w] (matches torch_util.exp_map_to_quat)
+function expMapToQuat(ex, ey, ez) {
+    const angle = Math.sqrt(ex*ex + ey*ey + ez*ez);
+    if (angle < 1e-5) return [0, 0, 0, 1];
+    return axisAngleToQuat([ex/angle, ey/angle, ez/angle], angle);
+}
+
+// Compute heading angle from quaternion (rotation of X-axis projected to XY plane in Z-up)
+// Matches torch_util.calc_heading
+function calcHeading(q) {
+    const rotDir = quatRotateVec(q, [1, 0, 0]);
+    return Math.atan2(rotDir[1], rotDir[0]);
+}
+
+// Compute inverse heading quaternion (rotation around Z axis by -heading)
+// Matches torch_util.calc_heading_quat_inv
+function calcHeadingQuatInv(q) {
+    const heading = calcHeading(q);
+    return axisAngleToQuat([0, 0, 1], -heading);
+}
+
+// Convert quaternion to 6D tan_norm representation.
+// tan = quat_rotate(q, [1,0,0])  (rotated X axis)
+// norm = quat_rotate(q, [0,0,1]) (rotated Z axis)
+// result = [tan(3), norm(3)] = 6 values
+// Matches torch_util.quat_to_tan_norm
+function quatToTanNorm(q) {
+    const tan = quatRotateVec(q, [1, 0, 0]);
+    const norm = quatRotateVec(q, [0, 0, 1]);
+    return [tan[0], tan[1], tan[2], norm[0], norm[1], norm[2]];
+}
+
+// ---------------------------------------------------------------------------
+// Build observation vector - matches Python compute_char_obs exactly.
+//
+// Format (158 dims total):
+//   root_height              (1)   - root Z in Z-up frame
+//   root_rot_tan_norm        (6)   - local root rotation as tan_norm (heading removed)
+//   root_vel                 (3)   - root linear velocity in heading frame
+//   root_ang_vel             (3)   - root angular velocity in heading frame
+//   joint_rot_tan_norm       (96)  - 16 joints * 6 (quaternion -> tan_norm)
+//   dof_vel                  (31)  - joint velocities
+//   key_body_local_pos       (18)  - 6 key bodies * 3 (relative to root, in heading frame)
+//
+// IMPORTANT: The ONNX model already contains the observation normalizer,
+// so this function returns RAW (un-normalized) observations.
 // ---------------------------------------------------------------------------
 function buildObservation() {
     const obs = new Float32Array(humanoidData.obs_dim);
-
-    // Get root (pelvis) link pose
-    const rootPose = links[0].link.getGlobalPose();
-    const rp = rootPose.get_p();
-    const rq = rootPose.get_q();
-
-    let idx = 0;
-
-    // Root height (1)
-    obs[idx++] = rp.get_y();  // Y is up
-
-    // Root rotation as quaternion (4) - wxyz
-    obs[idx++] = rq.get_w();
-    obs[idx++] = rq.get_x();
-    obs[idx++] = rq.get_y();
-    obs[idx++] = rq.get_z();
-
-    // Root linear velocity (3)
-    const rv = links[0].link.getLinearVelocity();
-    obs[idx++] = rv.get_x();
-    obs[idx++] = rv.get_y();
-    obs[idx++] = rv.get_z();
-
-    // Root angular velocity (3)
-    const raw = links[0].link.getAngularVelocity();
-    obs[idx++] = raw.get_x();
-    obs[idx++] = raw.get_y();
-    obs[idx++] = raw.get_z();
-
-    // DOF positions (31) - read per-joint
     const axisEnums = [E_TWIST, E_SWING1, E_SWING2];
+
+    // Build body link map
     const bodyLinkMap = {};
     for (const l of links) bodyLinkMap[l.name] = l.link;
 
-    for (const dof of humanoidData.dofInfo) {
-        try {
-            const childLink = bodyLinkMap[dof.child_body];
+    // --- Get root state from PhysX (Y-up) and convert to Z-up ---
+    const rootPose = links[0].link.getGlobalPose();
+    const rpx = rootPose.get_p();
+    const rqx = rootPose.get_q();
+
+    // Root position in Z-up
+    const rootPos = yupToZup3(rpx.get_x(), rpx.get_y(), rpx.get_z());
+    // Root quaternion in Z-up [x,y,z,w]
+    const rootRot = quatYupToZup(rqx.get_x(), rqx.get_y(), rqx.get_z(), rqx.get_w());
+
+    // Root velocity in Z-up
+    const rv = links[0].link.getLinearVelocity();
+    const rootVel = yupToZup3(rv.get_x(), rv.get_y(), rv.get_z());
+    // Root angular velocity in Z-up
+    const raw = links[0].link.getAngularVelocity();
+    const rootAngVel = yupToZup3(raw.get_x(), raw.get_y(), raw.get_z());
+
+    // Compute heading inverse quaternion for local-frame transform
+    const headingInv = calcHeadingQuatInv(rootRot);
+
+    let idx = 0;
+
+    // [0] Root height (Z coordinate in Z-up frame)
+    obs[idx++] = rootPos[2];
+
+    // [1..6] Root rotation in local heading frame as tan_norm (6)
+    const localRootRot = quatMul(headingInv, rootRot);
+    const rootTanNorm = quatToTanNorm(localRootRot);
+    for (let i = 0; i < 6; i++) obs[idx++] = rootTanNorm[i];
+
+    // [7..9] Root linear velocity in heading frame (3)
+    const localVel = quatRotateVec(headingInv, rootVel);
+    obs[idx++] = localVel[0];
+    obs[idx++] = localVel[1];
+    obs[idx++] = localVel[2];
+
+    // [10..12] Root angular velocity in heading frame (3)
+    const localAngVel = quatRotateVec(headingInv, rootAngVel);
+    obs[idx++] = localAngVel[0];
+    obs[idx++] = localAngVel[1];
+    obs[idx++] = localAngVel[2];
+
+    // [13..108] Joint rotations as tan_norm (16 non-root joints * 6 = 96)
+    // Must follow body traversal order (excluding root pelvis):
+    //   torso, head, right_upper_arm, right_lower_arm, right_hand, sword,
+    //   left_upper_arm, left_lower_arm, shield, left_hand, right_thigh,
+    //   right_shin, right_foot, left_thigh, left_shin, left_foot
+    // Build lookup map for actuated joints (fixed joints use identity quaternion)
+    const jointInfoMap = {};
+    for (const jinfo of humanoidData.joints) jointInfoMap[jinfo.child_body] = jinfo;
+
+    // Iterate in body order (skip root at index 0)
+    for (let bi = 1; bi < humanoidData.bodies.length; bi++) {
+        const bodyName = humanoidData.bodies[bi].name;
+        let jQuat = [0, 0, 0, 1]; // identity (used for fixed joints)
+
+        if (jointInfoMap[bodyName]) {
+            const jinfo = jointInfoMap[bodyName];
+            const childLink = bodyLinkMap[bodyName];
             if (childLink) {
                 const joint = childLink.getInboundJoint();
-                obs[idx++] = joint.getJointPosition(axisEnums[dof.physx_axis]);
-            } else { obs[idx++] = 0; }
-        } catch(e) { obs[idx++] = 0; }
+                if (jinfo.jointType === 'spherical') {
+                    // Read twist, swing1, swing2 positions from PhysX
+                    const twist  = joint.getJointPosition(E_TWIST);
+                    const swing1 = joint.getJointPosition(E_SWING1);
+                    const swing2 = joint.getJointPosition(E_SWING2);
+                    // Compose rotation from individual axis rotations.
+                    // PhysX decomposition: twist around X, swing1 around Y, swing2 around Z.
+                    const qTwist  = axisAngleToQuat([1,0,0], twist);
+                    const qSwing1 = axisAngleToQuat([0,1,0], swing1);
+                    const qSwing2 = axisAngleToQuat([0,0,1], swing2);
+                    jQuat = quatMul(quatMul(qSwing2, qSwing1), qTwist);
+                } else if (jinfo.jointType === 'revolute') {
+                    const angle = joint.getJointPosition(E_TWIST);
+                    jQuat = axisAngleToQuat([1, 0, 0], angle);
+                }
+            }
+        }
+        // Fixed joints keep identity quaternion
+
+        const tn = quatToTanNorm(jQuat);
+        for (let i = 0; i < 6; i++) obs[idx++] = tn[i];
     }
 
-    // DOF velocities (31)
+    // [109..139] DOF velocities (31)
     for (const dof of humanoidData.dofInfo) {
         try {
             const childLink = bodyLinkMap[dof.child_body];
@@ -777,29 +925,28 @@ function buildObservation() {
         } catch(e) { obs[idx++] = 0; }
     }
 
-    // Key body local positions relative to root (5 bodies x 3 = 15)
-    const keyBodies = ['head', 'right_hand', 'left_hand', 'right_foot', 'left_foot'];
+    // [140..157] Key body positions relative to root, in heading frame (6 bodies * 3 = 18)
+    const keyBodies = ['head', 'right_hand', 'left_hand', 'right_foot', 'left_foot', 'sword'];
     for (const bname of keyBodies) {
         const entry = links.find(l => l.name === bname);
         if (entry) {
             const pose = entry.link.getGlobalPose();
             const bp = pose.get_p();
-            obs[idx++] = bp.get_x() - rp.get_x();
-            obs[idx++] = bp.get_y() - rp.get_y();
-            obs[idx++] = bp.get_z() - rp.get_z();
+            // Convert to Z-up
+            const bodyPos = yupToZup3(bp.get_x(), bp.get_y(), bp.get_z());
+            // Relative to root
+            const rel = [bodyPos[0] - rootPos[0], bodyPos[1] - rootPos[1], bodyPos[2] - rootPos[2]];
+            // Rotate to heading frame
+            const localRel = quatRotateVec(headingInv, rel);
+            obs[idx++] = localRel[0];
+            obs[idx++] = localRel[1];
+            obs[idx++] = localRel[2];
         } else {
             idx += 3;
         }
     }
 
-    // Remaining dims zero-padded (up to 158)
-
-    // Normalize
-    for (let i = 0; i < humanoidData.obs_dim; i++) {
-        const std = Math.max(humanoidData.obs_std[i], 0.01);
-        obs[i] = Math.max(-5, Math.min(5, (obs[i] - humanoidData.obs_mean[i]) / std));
-    }
-
+    // No normalization here - the ONNX model handles it internally
     return obs;
 }
 
@@ -931,9 +1078,14 @@ async function mainLoop(timestamp) {
         try {
             const obs = buildObservation();
             currentAction = await runPolicy(obs);
-            // Clamp actions to prevent extreme joint targets
+            // Clamp actions to per-DOF action bounds from training.
+            // The ONNX model outputs unnormalized actions (already scaled by a_std + a_mean).
+            // The Python code clamps to _action_bound_low/high which are derived from joint limits.
+            // We use a_mean +/- 3*a_std as a reasonable safety bound.
             for (let i = 0; i < currentAction.length; i++) {
-                currentAction[i] = Math.max(-1.5, Math.min(1.5, currentAction[i]));
+                const lo = humanoidData.a_mean[i] - 3.0 * humanoidData.a_std[i];
+                const hi = humanoidData.a_mean[i] + 3.0 * humanoidData.a_std[i];
+                currentAction[i] = Math.max(lo, Math.min(hi, currentAction[i]));
             }
             applyActions(currentAction);
         } catch (e) {
