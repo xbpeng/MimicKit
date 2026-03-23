@@ -28,6 +28,7 @@ parser.add_argument('--compare', action='store_true')
 parser.add_argument('--num_envs', type=int, default=1)
 parser.add_argument('--steps', type=int, default=300)
 parser.add_argument('--no_vis', action='store_true')
+parser.add_argument('--cpu', action='store_true', help='Run PhysX on CPU instead of GPU')
 script_args = parser.parse_args()
 
 # Build mimickit args
@@ -43,19 +44,23 @@ args._table['rand_reset'] = ['false']
 
 import util.util as util
 import util.mp_util as mp_util
-mp_util.init(0, 1, 'cuda:0', None)
+device = 'cpu' if script_args.cpu else 'cuda:0'
+mp_util.init(0, 1, device, None)
 util.set_rand_seed(42)
 
 # Build env and agent using run.py's helpers
 import run
-env = run.build_env(args, script_args.num_envs, 'cuda:0', not script_args.no_vis)
-agent = run.build_agent(args, env, 'cuda:0')
+env = run.build_env(args, script_args.num_envs, device, not script_args.no_vis)
+agent = run.build_agent(args, env, device)
 agent.load('data/models/ase_humanoid_sword_shield_model.pt')
 agent.eval()
 
 # Load ONNX
 onnx_file = 'web/ase_humanoid_sword_shield_actor.onnx'
-providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+if script_args.cpu:
+    providers = ['CPUExecutionProvider']
+else:
+    providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
 onnx_sess = ort.InferenceSession(onnx_file, providers=providers)
 print(f"ONNX model loaded: {onnx_file}, provider: {onnx_sess.get_providers()[0]}")
 
