@@ -730,7 +730,9 @@ function yupToZup3(x, y, z) { return [x, z, y]; }
 //   - swap y,z components (matching the axis swap)
 //   - negate xyz (because det(P) = -1 reverses rotation handedness)
 function quatYupToZup(qx, qy, qz, qw) {
-    return [-qx, -qz, -qy, qw];
+    // Swap Y↔Z components of the quaternion vector part.
+    // Y-up (x,y,z) → Z-up (x,z,y), same for quaternion imaginary components.
+    return [qx, qz, qy, qw];
 }
 
 // Rotate vector v by quaternion q, both in [x,y,z] / [x,y,z,w] format.
@@ -958,12 +960,36 @@ function applyActions(action) {
     const bodyLinkMap = {};
     for (const l of links) bodyLinkMap[l.name] = l.link;
 
+    let appliedCount = 0;
     for (let i = 0; i < humanoidData.dofInfo.length; i++) {
         const dof = humanoidData.dofInfo[i];
         const childLink = bodyLinkMap[dof.child_body];
-        if (!childLink) continue;
-        const joint = childLink.getInboundJoint();
-        joint.setDriveTarget(axisEnums[dof.physx_axis], action[i]);
+        if (!childLink) { continue; }
+        try {
+            const joint = childLink.getInboundJoint();
+            if (!joint) continue;
+            joint.setDriveTarget(axisEnums[dof.physx_axis], action[i]);
+            appliedCount++;
+        } catch(e) {
+            if (!window._applyWarnLogged) {
+                console.warn('setDriveTarget failed for', dof.axis_name, ':', e.message);
+                window._applyWarnLogged = true;
+            }
+        }
+    }
+    if (!window._applyLogged) {
+        window._applyLogged = true;
+        console.log('applyActions: applied', appliedCount, '/', humanoidData.dofInfo.length, 'targets');
+        console.log('  dofInfo[0]:', JSON.stringify(humanoidData.dofInfo[0]));
+        console.log('  action[0:5]:', Array.from(action).slice(0,5).map(v=>v.toFixed(3)));
+        // Read back the first target to verify
+        try {
+            const firstDof = humanoidData.dofInfo[0];
+            const firstLink = bodyLinkMap[firstDof.child_body];
+            const firstJoint = firstLink.getInboundJoint();
+            const readBack = firstJoint.getDriveTarget(axisEnums[firstDof.physx_axis]);
+            console.log('  readback target[0]:', readBack);
+        } catch(e) { console.log('  readback failed:', e.message); }
     }
 }
 
@@ -1068,6 +1094,18 @@ async function mainLoop(timestamp) {
         try {
             const obs = buildObservation();
             currentAction = await runPolicy(obs);
+            // One-time diagnostic log
+            if (!window._policyLogCount) window._policyLogCount = 0;
+            window._policyLogCount++;
+            if (window._policyLogCount <= 3 || window._policyLogCount % 60 === 0) {
+                const obsArr = Array.from(obs);
+                console.log('OBS[0:13]:', obsArr.slice(0, 13).map(v => v.toFixed(3)).join(', '));
+                console.log('OBS[13:19] (first joint rot):', obsArr.slice(13, 19).map(v => v.toFixed(3)).join(', '));
+                console.log('OBS non-zero count:', obsArr.filter(v => Math.abs(v) > 0.001).length, '/ 158');
+                console.log('ACTION[0:8]:', Array.from(currentAction).slice(0, 8).map(v => v.toFixed(3)).join(', '));
+                console.log('ACTION range:', Math.min(...currentAction).toFixed(3), Math.max(...currentAction).toFixed(3));
+                console.log('LATENT[0:4]:', Array.from(latentVec).slice(0, 4).map(v => v.toFixed(3)).join(', '));
+            }
             // Clamp actions to per-DOF action bounds from training.
             // The ONNX model outputs unnormalized actions (already scaled by a_std + a_mean).
             // The Python code clamps to _action_bound_low/high which are derived from joint limits.
@@ -1079,7 +1117,9 @@ async function mainLoop(timestamp) {
             }
             applyActions(currentAction);
         } catch (e) {
-            console.warn('Policy error:', e.message);
+            if (!window._policyErrCount) window._policyErrCount = 0;
+            window._policyErrCount++;
+            if (window._policyErrCount <= 5) console.error('Policy error #' + window._policyErrCount + ':', e.message, e.stack);
             if (!currentAction) currentAction = new Float32Array(humanoidData.act_dim);
         }
     } else {
