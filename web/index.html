@@ -77,6 +77,7 @@ canvas { display: block; }
     <button id="btnTestPose">Test Pose (raise right arm)</button>
     <button id="btnDiag">Run Diagnostic</button>
     <button id="btnReplay">Replay Newton Trace</button>
+    <button id="btnAudit">Audit Obs vs Isaac Lab</button>
     <span style="margin-left: 12px;">Orbit: drag | Zoom: scroll | Pan: right-drag</span>
 </div>
 
@@ -1670,6 +1671,167 @@ async function init() {
             }
             
             console.log('=== REPLAY COMPLETE ===');
+            running = true;
+            requestAnimationFrame(mainLoop);
+        });
+
+        document.getElementById('btnAudit').addEventListener('click', async () => {
+            running = false;
+            await new Promise(r => setTimeout(r, 200));
+
+            // Load the full trace from Isaac Lab CPU
+            console.log('=== AUDIT: Loading full trace from Isaac Lab CPU ===');
+            const traceResp = await fetch('./full_trace.json?' + Date.now());
+            const traceData = await traceResp.json();
+            const refStep = traceData.steps[0];
+            console.log('Reference state: root_z=' + refStep.root_pos[2].toFixed(4));
+
+            // 1. Set the EXACT physical state from the trace
+            resetHumanoid();
+            const axisEnums = [E_TWIST, E_SWING1, E_SWING2];
+            const bodyLinkMap = {};
+            for (const l of links) bodyLinkMap[l.name] = l.link;
+
+            // Set root pose
+            articulation.setRootGlobalPose(new PhysX.PxTransform(
+                new PhysX.PxVec3(refStep.root_pos[0], refStep.root_pos[1], refStep.root_pos[2]),
+                new PhysX.PxQuat(refStep.root_rot[0], refStep.root_rot[1], refStep.root_rot[2], refStep.root_rot[3])
+            ), true);
+            articulation.setRootLinearVelocity(new PhysX.PxVec3(refStep.root_vel[0], refStep.root_vel[1], refStep.root_vel[2]));
+            articulation.setRootAngularVelocity(new PhysX.PxVec3(refStep.root_ang_vel[0], refStep.root_ang_vel[1], refStep.root_ang_vel[2]));
+
+            // Set DOF positions and velocities
+            for (let i = 0; i < humanoidData.dofInfo.length; i++) {
+                const dof = humanoidData.dofInfo[i];
+                const cl = bodyLinkMap[dof.child_body];
+                if (!cl) continue;
+                try {
+                    const joint = cl.getInboundJoint();
+                    joint.setJointPosition(axisEnums[dof.physx_axis], refStep.dof_pos[i]);
+                    joint.setJointVelocity(axisEnums[dof.physx_axis], refStep.dof_vel[i]);
+                } catch(e) {}
+            }
+
+            // Propagate FK
+            const flags = new PhysX.PxArticulationCacheFlags(PhysX.PxArticulationCacheFlagEnum.eALL);
+            const cache = articulation.createCache();
+            articulation.copyInternalStateToCache(cache, flags);
+            articulation.applyCache(cache, flags, true);
+
+            // 2. Verify state was set correctly
+            const rp = links[0].link.getGlobalPose();
+            console.log('Set root_z=' + rp.get_p().get_z().toFixed(4) + ' (expected ' + refStep.root_pos[2].toFixed(4) + ')');
+
+            // Verify DOF positions
+            let maxDofErr = 0;
+            for (let i = 0; i < humanoidData.dofInfo.length; i++) {
+                const dof = humanoidData.dofInfo[i];
+                const cl = bodyLinkMap[dof.child_body];
+                if (!cl) continue;
+                const joint = cl.getInboundJoint();
+                const webVal = joint.getJointPosition(axisEnums[dof.physx_axis]);
+                const refVal = refStep.dof_pos[i];
+                const err = Math.abs(webVal - refVal);
+                if (err > maxDofErr) maxDofErr = err;
+                if (err > 0.01) {
+                    console.log('  DOF ' + i + ' ' + dof.child_body + '/' + dof.axis_name + ': web=' + webVal.toFixed(4) + ' ref=' + refVal.toFixed(4) + ' err=' + err.toFixed(4));
+                }
+            }
+            console.log('Max DOF position error after set: ' + maxDofErr.toFixed(6));
+
+            // 3. Build observation in JS
+            const webObs = buildObservation();
+            const refObs = refStep.obs;
+
+            // 4. Compare every observation dimension
+            console.log('\n=== OBSERVATION COMPARISON (158 dims) ===');
+            const obsLabels = ['root_h'];
+            for (let i = 0; i < 6; i++) obsLabels.push('root_rot_tn[' + i + ']');
+            for (let i = 0; i < 3; i++) obsLabels.push('root_vel[' + i + ']');
+            for (let i = 0; i < 3; i++) obsLabels.push('root_angvel[' + i + ']');
+            for (let j = 0; j < 16; j++) {
+                for (let k = 0; k < 6; k++) {
+                    obsLabels.push('jrot' + j + '_tn[' + k + ']');
+                }
+            }
+            for (let i = 0; i < 31; i++) obsLabels.push('dof_vel[' + i + ']');
+            for (let i = 0; i < 18; i++) obsLabels.push('key_pos[' + i + ']');
+
+            let maxObsErr = 0, maxObsIdx = -1;
+            const obsErrors = [];
+            for (let i = 0; i < Math.min(webObs.length, refObs.length); i++) {
+                const err = Math.abs(webObs[i] - refObs[i]);
+                if (err > maxObsErr) { maxObsErr = err; maxObsIdx = i; }
+                if (err > 0.01) {
+                    const label = i < obsLabels.length ? obsLabels[i] : 'obs[' + i + ']';
+                    obsErrors.push({ idx: i, label: label, web: webObs[i], ref: refObs[i], err: err });
+                }
+            }
+
+            // Group errors by category
+            const categories = {
+                'root_height (0)': [0, 1],
+                'root_rot_tan_norm (1-6)': [1, 7],
+                'root_vel (7-9)': [7, 10],
+                'root_ang_vel (10-12)': [10, 13],
+                'joint_rot_tan_norm (13-108)': [13, 109],
+                'dof_vel (109-139)': [109, 140],
+                'key_body_pos (140-157)': [140, 158]
+            };
+
+            for (const [cat, [lo, hi]] of Object.entries(categories)) {
+                let catMaxErr = 0, catWorstIdx = -1;
+                for (let i = lo; i < hi; i++) {
+                    const err = Math.abs(webObs[i] - refObs[i]);
+                    if (err > catMaxErr) { catMaxErr = err; catWorstIdx = i; }
+                }
+                const label = catWorstIdx >= 0 && catWorstIdx < obsLabels.length ? obsLabels[catWorstIdx] : '';
+                console.log(cat + ': max_err=' + catMaxErr.toFixed(4) + ' at idx=' + catWorstIdx + ' ' + label +
+                    ' (web=' + (catWorstIdx >= 0 ? webObs[catWorstIdx].toFixed(4) : '?') +
+                    ' ref=' + (catWorstIdx >= 0 ? refObs[catWorstIdx].toFixed(4) : '?') + ')');
+            }
+
+            console.log('\nTop 10 worst obs dims:');
+            obsErrors.sort((a, b) => b.err - a.err);
+            for (const e of obsErrors.slice(0, 10)) {
+                console.log('  [' + e.idx + '] ' + e.label + ': web=' + e.web.toFixed(4) + ' ref=' + e.ref.toFixed(4) + ' err=' + e.err.toFixed(4));
+            }
+
+            console.log('\nOverall max obs error: ' + maxObsErr.toFixed(4) + ' at idx=' + maxObsIdx +
+                ' (' + (maxObsIdx < obsLabels.length ? obsLabels[maxObsIdx] : '?') + ')');
+
+            // 5. Run ONNX on both observations and compare actions
+            if (refStep.action) {
+                const refLatent = new Float32Array(refStep.latent);
+                const webObsTensor = new ort.Tensor('float32', webObs, [1, humanoidData.obs_dim]);
+                const refObsTensor = new ort.Tensor('float32', new Float32Array(refObs), [1, humanoidData.obs_dim]);
+                const latentTensor = new ort.Tensor('float32', refLatent, [1, humanoidData.latent_dim]);
+
+                const webResult = await onnxSession.run({ obs: webObsTensor, latent: latentTensor });
+                const refResult = await onnxSession.run({ obs: refObsTensor, latent: latentTensor });
+
+                const webAction = webResult.action.data;
+                const refAction = refResult.action.data;
+                const isaacAction = refStep.action;
+
+                let maxActionDiff = 0;
+                console.log('\n=== ACTION COMPARISON ===');
+                console.log('ONNX(web_obs) vs ONNX(isaac_obs) vs Isaac_action:');
+                for (let i = 0; i < Math.min(webAction.length, isaacAction.length); i++) {
+                    const d1 = Math.abs(webAction[i] - refAction[i]);  // obs-caused diff
+                    const d2 = Math.abs(refAction[i] - isaacAction[i]);  // ONNX vs PT diff
+                    if (d1 > maxActionDiff) maxActionDiff = d1;
+                    if (d1 > 0.05 || d2 > 0.05) {
+                        console.log('  action[' + i + ']: onnx_web=' + webAction[i].toFixed(4) +
+                            ' onnx_ref=' + refAction[i].toFixed(4) +
+                            ' isaac_pt=' + isaacAction[i].toFixed(4) +
+                            ' | obs_diff=' + d1.toFixed(4) + ' model_diff=' + d2.toFixed(4));
+                    }
+                }
+                console.log('Max action diff from obs mismatch: ' + maxActionDiff.toFixed(4));
+            }
+
+            console.log('\n=== AUDIT COMPLETE ===');
             running = true;
             requestAnimationFrame(mainLoop);
         });
