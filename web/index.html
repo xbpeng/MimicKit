@@ -276,12 +276,22 @@ async function initPhysX() {
     sceneDesc.set_cpuDispatcher(cpuDispatcher);
     sceneDesc.set_filterShader(tlf.DefaultFilterShader());
     sceneDesc.set_bounceThresholdVelocity(0.2);  // Match Isaac Lab
-    // Use TGS solver to match Isaac Lab GPU PhysX (default is PGS)
+    // Use TGS solver to match Isaac Lab (default is PGS)
     if (PhysX.PxSolverTypeEnum && PhysX.PxSolverTypeEnum.eTGS !== undefined) {
         sceneDesc.set_solverType(PhysX.PxSolverTypeEnum.eTGS);
         console.log('Using TGS solver (matching Isaac Lab)');
     } else {
         console.log('TGS solver not available, using default PGS');
+    }
+    // Match Isaac Lab scene-level friction settings
+    if (typeof sceneDesc.set_frictionType === 'function') {
+        sceneDesc.set_frictionType(PhysX.PxFrictionTypeEnum.ePATCH);  // patch friction
+    }
+    if (typeof sceneDesc.set_frictionCorrelationDistance === 'function') {
+        sceneDesc.set_frictionCorrelationDistance(0.025);
+    }
+    if (typeof sceneDesc.set_frictionOffsetThreshold === 'function') {
+        sceneDesc.set_frictionOffsetThreshold(0.04);
     }
     pxScene = physics.createScene(sceneDesc);
 
@@ -316,8 +326,15 @@ function buildArticulation() {
     const rbext = PhysX.PxRigidBodyExt.prototype;
 
     articulation = physics.createArticulationReducedCoordinate();
-    // Higher solver iterations for CPU PhysX - 4,1 is not enough to converge drives
+    // Match Isaac Lab: articulation solver iterations = 32 position, 1 velocity
     articulation.setSolverIterationCounts(32, 1);
+    // Match Isaac Lab: sleep threshold and stabilization threshold
+    if (typeof articulation.setSleepThreshold === 'function') {
+        articulation.setSleepThreshold(5e-5);
+    }
+    if (typeof articulation.setStabilizationThreshold === 'function') {
+        articulation.setStabilizationThreshold(1e-5);
+    }
     // Disable self-collision between adjacent articulation links
     articulation.setArticulationFlag(
         PhysX.PxArticulationFlagEnum.eDISABLE_SELF_COLLISION, true
@@ -427,12 +444,32 @@ function buildArticulation() {
             rbext.updateMassAndInertia(link, 1000);
         }
 
-        // Match Isaac Lab rigid body properties
+        // Match Isaac Lab rigid body properties (from USD inspection)
         link.setAngularDamping(0.01);
         link.setLinearDamping(0.0);
         link.setMaxDepenetrationVelocity(10.0);
         link.setMaxLinearVelocity(1000.0);
         link.setMaxAngularVelocity(1000.0);
+        // Per-body solver iterations (Isaac Lab: 16 pos, 1 vel)
+        if (typeof link.setSolverIterationCounts === 'function') {
+            link.setSolverIterationCounts(16, 1);
+        }
+        // Sleep threshold (Isaac Lab: 5e-5)
+        if (typeof link.setSleepThreshold === 'function') {
+            link.setSleepThreshold(5e-5);
+        }
+        // Stabilization threshold (Isaac Lab: 1e-5)
+        if (typeof link.setStabilizationThreshold === 'function') {
+            link.setStabilizationThreshold(1e-5);
+        }
+        // CFM scale (Isaac Lab: 0.025) - adds compliance to constraints
+        if (typeof link.setCfmScale === 'function') {
+            link.setCfmScale(0.025);
+        }
+        // Enable gyroscopic forces (Isaac Lab: true)
+        if (typeof link.setRigidBodyFlag === 'function') {
+            try { link.setRigidBodyFlag(PhysX.PxRigidBodyFlagEnum.eENABLE_GYROSCOPIC_FORCES, true); } catch(e) {}
+        }
 
         bodyLinkMap[body.name] = link;
         links.push({ name: body.name, link: link, meshGroup: null });
@@ -454,6 +491,10 @@ function buildArticulation() {
 
         // Match Isaac Lab: joint friction = 0 (PhysX default is 0.05)
         joint.setFrictionCoefficient(0);
+        // Match Isaac Lab: max joint velocity = 1000000
+        if (typeof joint.setMaxJointVelocity === 'function') {
+            joint.setMaxJointVelocity(1000000);
+        }
 
         // Joint frame poses - localPos0 and localRot are Z-up, use directly
         const lp = jdata.localPos0;
