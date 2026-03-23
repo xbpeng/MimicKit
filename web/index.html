@@ -302,7 +302,9 @@ function buildArticulation() {
     const rbext = PhysX.PxRigidBodyExt.prototype;
 
     articulation = physics.createArticulationReducedCoordinate();
-    articulation.setSolverIterationCounts(32, 1);
+    // Match Isaac Lab: max_position_iteration_count=4, max_velocity_iteration_count=0
+    // (was 32,1 which made drives 8x stiffer than training)
+    articulation.setSolverIterationCounts(4, 0);
     // Disable self-collision between adjacent articulation links
     articulation.setArticulationFlag(
         PhysX.PxArticulationFlagEnum.eDISABLE_SELF_COLLISION, true
