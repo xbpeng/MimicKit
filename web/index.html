@@ -38,6 +38,23 @@ canvas { display: block; }
     font-size: 12px;
 }
 #controls button:hover { background: #4a4a7e; }
+#debugPanel {
+    position: absolute; top: 12px; right: 16px;
+    background: rgba(20,20,40,0.85); color: #b0b0d0;
+    padding: 12px 16px; border-radius: 8px; z-index: 5;
+    font-size: 12px; width: 200px; line-height: 2;
+    border: 1px solid rgba(100,100,160,0.3);
+}
+#debugPanel .panel-title {
+    font-weight: 600; color: #d0d0ff; margin-bottom: 8px;
+    font-size: 13px;
+}
+#debugPanel label { display: block; cursor: pointer; }
+#debugPanel input[type="range"] { width: 100%; }
+#debugPanel .separator {
+    border-top: 1px solid rgba(100,100,160,0.3);
+    margin: 8px 0;
+}
 </style>
 </head>
 <body>
@@ -58,6 +75,42 @@ canvas { display: block; }
     <button id="btnReset">Reset</button>
     <button id="btnNewLatent">New Skill (Random Latent)</button>
     <span style="margin-left: 12px;">Orbit: drag | Zoom: scroll | Pan: right-drag</span>
+</div>
+
+<div id="debugPanel">
+    <div class="panel-title">Debug Controls</div>
+
+    <label><input type="checkbox" id="chkDrives" checked> Active Drives (muscles)</label>
+    <label><input type="checkbox" id="chkPolicy" checked> NN Policy</label>
+    <label><input type="checkbox" id="chkSelfCollision"> Self-Collision</label>
+    <label><input type="checkbox" id="chkGravity" checked> Gravity</label>
+
+    <div class="separator"></div>
+
+    <div>Drive Stiffness Scale</div>
+    <input type="range" id="sliderStiffness" min="0" max="3" step="0.1" value="1">
+    <span id="stiffnessVal">1.0x</span>
+
+    <div>Drive Damping Scale</div>
+    <input type="range" id="sliderDamping" min="0" max="5" step="0.1" value="1">
+    <span id="dampingVal">1.0x</span>
+
+    <div>Sim Substeps</div>
+    <input type="range" id="sliderSubsteps" min="1" max="16" step="1" value="4">
+    <span id="substepsVal">4</span>
+
+    <div>Time Scale</div>
+    <input type="range" id="sliderTimeScale" min="0" max="2" step="0.1" value="1">
+    <span id="timeScaleVal">1.0x</span>
+
+    <div class="separator"></div>
+
+    <div id="debugInfo" style="font-size: 10px; line-height: 1.4; opacity: 0.7;">
+        root_z: --<br>
+        root_speed: --<br>
+        max_dof_vel: --<br>
+        tracking_err: --
+    </div>
 </div>
 
 <!-- ONNX Runtime (loaded globally) -->
@@ -97,8 +150,18 @@ let E_FORCE;
 let E_CACHE_ALL;
 let SHAPE_FLAGS_VAL;
 
-const SUBSTEPS = 4;
+let numSubsteps = 4;
 const DT = 1 / 120;
+
+// Debug state
+const origDrives = [];  // [{joint, axisEnum, stiffness, damping, maxForce}]
+let drivesEnabled = true;
+let policyEnabled = true;
+let selfCollisionEnabled = false;
+let gravityEnabled = true;
+let stiffnessScale = 1.0;
+let dampingScale = 1.0;
+let timeScale = 1.0;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -228,8 +291,8 @@ async function initPhysX() {
     const groundShapeFlags = new PhysX.PxShapeFlags(SHAPE_FLAGS_VAL);
     const groundGeom = new PhysX.PxBoxGeometry(50, 0.5, 50);
     const groundShape = physics.createShape(groundGeom, material, true, groundShapeFlags);
-    // Set filter data so default filter shader generates contacts
-    const groundFilterData = new PhysX.PxFilterData(1, 1, 0, 0);
+    // Ground: group 1, collides with group 1 and 2
+    const groundFilterData = new PhysX.PxFilterData(1, 3, 0, 0);
     groundShape.setSimulationFilterData(groundFilterData);
     const groundPose = new PhysX.PxTransform(
         new PhysX.PxVec3(0, -0.5, 0),  // top surface at y=0
@@ -253,6 +316,10 @@ function buildArticulation() {
 
     articulation = physics.createArticulationReducedCoordinate();
     articulation.setSolverIterationCounts(32, 1);
+    // Disable self-collision between adjacent articulation links
+    articulation.setArticulationFlag(
+        PhysX.PxArticulationFlagEnum.eDISABLE_SELF_COLLISION, true
+    );
 
     const bodyLinkMap = {};  // name -> PxArticulationLink
     links = [];
@@ -338,8 +405,8 @@ function buildArticulation() {
                 }
             }
             if (shape) {
-                // Set filter data for collision with ground
-                shape.setSimulationFilterData(new PhysX.PxFilterData(1, 1, 0, 0));
+                // Articulation shapes: group 2, collide with group 1 (ground) only
+                shape.setSimulationFilterData(new PhysX.PxFilterData(2, 1, 0, 0));
                 link.attachShape(shape);
             }
         }
@@ -352,6 +419,7 @@ function buildArticulation() {
 
     // Configure joints
     const axisEnums = [E_TWIST, E_SWING1, E_SWING2];
+    origDrives.length = 0;
 
     for (const jdata of humanoidData.joints) {
         const childLink = bodyLinkMap[jdata.child_body];
@@ -391,6 +459,7 @@ function buildArticulation() {
                     ax.stiffness, ax.damping, ax.maxForce, E_FORCE
                 );
                 joint.setDriveParams(axE, drive);
+                origDrives.push({joint, axisEnum: axE, stiffness: ax.stiffness, damping: ax.damping, maxForce: ax.maxForce});
             }
             // Lock unused axes
             for (let i = jdata.axes.length; i < 3; i++) {
@@ -401,9 +470,11 @@ function buildArticulation() {
             joint.setMotion(E_TWIST, E_LIMITED);
             const ax = jdata.axes[0];
             joint.setLimitParams(E_TWIST, new PhysX.PxArticulationLimit(ax.range[0], ax.range[1]));
-            joint.setDriveParams(E_TWIST, new PhysX.PxArticulationDrive(
+            const revDrive = new PhysX.PxArticulationDrive(
                 ax.stiffness, ax.damping, ax.maxForce, E_FORCE
-            ));
+            );
+            joint.setDriveParams(E_TWIST, revDrive);
+            origDrives.push({joint, axisEnum: E_TWIST, stiffness: ax.stiffness, damping: ax.damping, maxForce: ax.maxForce});
             joint.setMotion(E_SWING1, E_LOCKED);
             joint.setMotion(E_SWING2, E_LOCKED);
         }
@@ -427,6 +498,78 @@ function buildArticulation() {
 
     pxScene.addArticulation(articulation);
     console.log('Articulation built with', links.length, 'links,', articulation.getDofs(), 'DOFs');
+}
+
+// ---------------------------------------------------------------------------
+// Debug helpers
+// ---------------------------------------------------------------------------
+function applyDriveParams() {
+    for (const d of origDrives) {
+        const drive = new PhysX.PxArticulationDrive(
+            drivesEnabled ? d.stiffness * stiffnessScale : 0,
+            drivesEnabled ? d.damping * dampingScale : 0,
+            drivesEnabled ? d.maxForce : 0,
+            E_FORCE
+        );
+        d.joint.setDriveParams(d.axisEnum, drive);
+    }
+}
+
+function setSelfCollision(enabled) {
+    selfCollisionEnabled = enabled;
+    // Update articulation flag
+    articulation.setArticulationFlag(
+        PhysX.PxArticulationFlagEnum.eDISABLE_SELF_COLLISION, !enabled
+    );
+    // Also update filter data on all articulation link shapes
+    for (const entry of links) {
+        const nbShapes = entry.link.getNbShapes();
+        for (let si = 0; si < nbShapes; si++) {
+            const shape = entry.link.getShape(si);
+            if (enabled) {
+                // group 2, collide with group 1 and 2
+                shape.setSimulationFilterData(new PhysX.PxFilterData(2, 3, 0, 0));
+            } else {
+                // group 2, collide with group 1 only (ground only)
+                shape.setSimulationFilterData(new PhysX.PxFilterData(2, 1, 0, 0));
+            }
+        }
+    }
+}
+
+function setGravity(enabled) {
+    gravityEnabled = enabled;
+    if (enabled) {
+        pxScene.setGravity(new PhysX.PxVec3(0, -9.81, 0));
+    } else {
+        pxScene.setGravity(new PhysX.PxVec3(0, 0, 0));
+    }
+}
+
+function updateDebugInfo() {
+    try {
+        const rootLink = links[0].link;
+        const pose = rootLink.getGlobalPose();
+        const vel = rootLink.getLinearVelocity();
+        const rootZ = pose.get_p().get_y();
+        const speed = Math.sqrt(vel.get_x()**2 + vel.get_y()**2 + vel.get_z()**2);
+
+        let maxDofVel = 0;
+        try {
+            for (const d of origDrives) {
+                const v = Math.abs(d.joint.getJointVelocity(d.axisEnum));
+                if (v > maxDofVel) maxDofVel = v;
+            }
+        } catch(e) { /* some joints may not support velocity query */ }
+
+        document.getElementById('debugInfo').innerHTML =
+            `root_z: ${rootZ.toFixed(3)}<br>` +
+            `root_speed: ${speed.toFixed(3)}<br>` +
+            `max_dof_vel: ${maxDofVel.toFixed(1)}<br>` +
+            `links: ${links.length} / DOFs: ${articulation.getDofs()}`;
+    } catch(e) {
+        // Silently skip if articulation not ready
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -614,24 +757,24 @@ function buildObservation() {
     for (const l of links) bodyLinkMap[l.name] = l.link;
 
     for (const dof of humanoidData.dofInfo) {
-        const childLink = bodyLinkMap[dof.child_body];
-        if (childLink) {
-            const joint = childLink.getInboundJoint();
-            obs[idx++] = joint.getJointPosition(axisEnums[dof.physx_axis]);
-        } else {
-            obs[idx++] = 0;
-        }
+        try {
+            const childLink = bodyLinkMap[dof.child_body];
+            if (childLink) {
+                const joint = childLink.getInboundJoint();
+                obs[idx++] = joint.getJointPosition(axisEnums[dof.physx_axis]);
+            } else { obs[idx++] = 0; }
+        } catch(e) { obs[idx++] = 0; }
     }
 
     // DOF velocities (31)
     for (const dof of humanoidData.dofInfo) {
-        const childLink = bodyLinkMap[dof.child_body];
-        if (childLink) {
-            const joint = childLink.getInboundJoint();
-            obs[idx++] = joint.getJointVelocity(axisEnums[dof.physx_axis]);
-        } else {
-            obs[idx++] = 0;
-        }
+        try {
+            const childLink = bodyLinkMap[dof.child_body];
+            if (childLink) {
+                const joint = childLink.getInboundJoint();
+                obs[idx++] = joint.getJointVelocity(axisEnums[dof.physx_axis]);
+            } else { obs[idx++] = 0; }
+        } catch(e) { obs[idx++] = 0; }
     }
 
     // Key body local positions relative to root (5 bodies x 3 = 15)
@@ -783,28 +926,37 @@ async function mainLoop(timestamp) {
         lastFpsTime = timestamp;
     }
 
-    // Run policy
-    try {
-        const obs = buildObservation();
-        currentAction = await runPolicy(obs);
-        // Clamp actions to prevent extreme joint targets
-        for (let i = 0; i < currentAction.length; i++) {
-            currentAction[i] = Math.max(-1.5, Math.min(1.5, currentAction[i]));
+    // Run policy (or rest pose if policy disabled)
+    if (policyEnabled) {
+        try {
+            const obs = buildObservation();
+            currentAction = await runPolicy(obs);
+            // Clamp actions to prevent extreme joint targets
+            for (let i = 0; i < currentAction.length; i++) {
+                currentAction[i] = Math.max(-1.5, Math.min(1.5, currentAction[i]));
+            }
+            applyActions(currentAction);
+        } catch (e) {
+            console.warn('Policy error:', e.message);
+            if (!currentAction) currentAction = new Float32Array(humanoidData.act_dim);
         }
-        applyActions(currentAction);
-    } catch (e) {
-        console.warn('Policy error:', e.message);
-        if (!currentAction) currentAction = new Float32Array(humanoidData.act_dim);
+    } else {
+        // Rest pose: all targets to 0
+        const restAction = new Float32Array(humanoidData.act_dim);
+        applyActions(restAction);
     }
 
     // Step physics
-    for (let i = 0; i < SUBSTEPS; i++) {
-        pxScene.simulate(DT);
-        pxScene.fetchResults(true);
+    const scaledDT = DT * timeScale;
+    if (scaledDT > 0) {
+        for (let i = 0; i < numSubsteps; i++) {
+            pxScene.simulate(scaledDT);
+            pxScene.fetchResults(true);
+        }
     }
 
     // Auto-reset if physics explodes (NaN or extreme)
-    {
+    try {
         const rootPose = links[0].link.getGlobalPose();
         const ry = rootPose.get_p().get_y();
         if (resetGraceFrames > 0) {
@@ -813,7 +965,7 @@ async function mainLoop(timestamp) {
             resetHumanoid();
             resetGraceFrames = RESET_GRACE;
         }
-    }
+    } catch(e) { /* skip if not ready */ }
 
     // Smoothly track camera to character root position
     {
@@ -824,6 +976,7 @@ async function mainLoop(timestamp) {
     }
 
     updateMeshes();
+    updateDebugInfo();
     controls.update();
     renderer.render(scene3d, camera);
     requestAnimationFrame(mainLoop);
@@ -846,6 +999,39 @@ async function init() {
         document.getElementById('overlay').style.display = 'none';
         document.getElementById('btnReset').addEventListener('click', resetHumanoid);
         document.getElementById('btnNewLatent').addEventListener('click', randomLatent);
+
+        // Debug panel event listeners
+        document.getElementById('chkDrives').addEventListener('change', (e) => {
+            drivesEnabled = e.target.checked;
+            applyDriveParams();
+        });
+        document.getElementById('chkPolicy').addEventListener('change', (e) => {
+            policyEnabled = e.target.checked;
+        });
+        document.getElementById('chkSelfCollision').addEventListener('change', (e) => {
+            setSelfCollision(e.target.checked);
+        });
+        document.getElementById('chkGravity').addEventListener('change', (e) => {
+            setGravity(e.target.checked);
+        });
+        document.getElementById('sliderStiffness').addEventListener('input', (e) => {
+            stiffnessScale = parseFloat(e.target.value);
+            document.getElementById('stiffnessVal').textContent = stiffnessScale.toFixed(1) + 'x';
+            applyDriveParams();
+        });
+        document.getElementById('sliderDamping').addEventListener('input', (e) => {
+            dampingScale = parseFloat(e.target.value);
+            document.getElementById('dampingVal').textContent = dampingScale.toFixed(1) + 'x';
+            applyDriveParams();
+        });
+        document.getElementById('sliderSubsteps').addEventListener('input', (e) => {
+            numSubsteps = parseInt(e.target.value);
+            document.getElementById('substepsVal').textContent = numSubsteps;
+        });
+        document.getElementById('sliderTimeScale').addEventListener('input', (e) => {
+            timeScale = parseFloat(e.target.value);
+            document.getElementById('timeScaleVal').textContent = timeScale.toFixed(1) + 'x';
+        });
 
         running = true;
         lastFpsTime = performance.now();
