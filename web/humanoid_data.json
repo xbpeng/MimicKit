@@ -42,7 +42,8 @@
           "radius": 0.07,
           "density": 2226.0
         }
-      ]
+      ],
+      "mass": 9.9956
     },
     {
       "name": "torso",
@@ -116,7 +117,8 @@
           ],
           "density": 1623.0
         }
-      ]
+      ],
+      "mass": 12.0135
     },
     {
       "name": "head",
@@ -146,7 +148,8 @@
           "radius": 0.095,
           "density": 1081.0
         }
-      ]
+      ],
+      "mass": 3.8823
     },
     {
       "name": "right_upper_arm",
@@ -184,7 +187,8 @@
           ],
           "density": 982.0
         }
-      ]
+      ],
+      "mass": 1.6243
     },
     {
       "name": "right_lower_arm",
@@ -222,7 +226,8 @@
           ],
           "density": 1056.0
         }
-      ]
+      ],
+      "mass": 1.0926
     },
     {
       "name": "right_hand",
@@ -252,7 +257,8 @@
           "radius": 0.04,
           "density": 1865.0
         }
-      ]
+      ],
+      "mass": 0.5
     },
     {
       "name": "sword",
@@ -310,7 +316,8 @@
           ],
           "density": 600.0
         }
-      ]
+      ],
+      "mass": 0.8311
     },
     {
       "name": "left_upper_arm",
@@ -348,7 +355,8 @@
           ],
           "density": 982.0
         }
-      ]
+      ],
+      "mass": 1.6243
     },
     {
       "name": "left_lower_arm",
@@ -386,7 +394,8 @@
           ],
           "density": 1056.0
         }
-      ]
+      ],
+      "mass": 1.0926
     },
     {
       "name": "shield",
@@ -425,7 +434,8 @@
           ],
           "density": 250.0
         }
-      ]
+      ],
+      "mass": 2.1206
     },
     {
       "name": "left_hand",
@@ -455,7 +465,8 @@
           "radius": 0.04,
           "density": 1865.0
         }
-      ]
+      ],
+      "mass": 0.5
     },
     {
       "name": "right_thigh",
@@ -493,7 +504,8 @@
           ],
           "density": 1269.0
         }
-      ]
+      ],
+      "mass": 4.7435
     },
     {
       "name": "right_shin",
@@ -531,7 +543,8 @@
           ],
           "density": 1014.0
         }
-      ]
+      ],
+      "mass": 3.1192
     },
     {
       "name": "right_foot",
@@ -567,7 +580,8 @@
           ],
           "density": 1141.0
         }
-      ]
+      ],
+      "mass": 0.9997
     },
     {
       "name": "left_thigh",
@@ -605,7 +619,8 @@
           ],
           "density": 1269.0
         }
-      ]
+      ],
+      "mass": 4.7435
     },
     {
       "name": "left_shin",
@@ -643,7 +658,8 @@
           ],
           "density": 1014.0
         }
-      ]
+      ],
+      "mass": 3.1192
     },
     {
       "name": "left_foot",
@@ -679,7 +695,8 @@
           ],
           "density": 1141.0
         }
-      ]
+      ],
+      "mass": 0.9997
     }
   ],
   "joints": [
