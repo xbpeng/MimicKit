@@ -316,8 +316,8 @@ function buildArticulation() {
     const rbext = PhysX.PxRigidBodyExt.prototype;
 
     articulation = physics.createArticulationReducedCoordinate();
-    // Match Isaac Lab default articulation solver iterations
-    articulation.setSolverIterationCounts(4, 1);
+    // Higher solver iterations for CPU PhysX - 4,1 is not enough to converge drives
+    articulation.setSolverIterationCounts(32, 1);
     // Disable self-collision between adjacent articulation links
     articulation.setArticulationFlag(
         PhysX.PxArticulationFlagEnum.eDISABLE_SELF_COLLISION, true
@@ -1071,6 +1071,7 @@ function applyActions(action) {
             clippedMin = Math.min(clippedMin, a);
             clippedMax = Math.max(clippedMax, a);
             joint.setDriveTarget(axisEnums[dof.physx_axis], a);
+            joint.setDriveVelocity(axisEnums[dof.physx_axis], 0);
             appliedCount++;
         } catch(e) {
             if (!window._applyWarnLogged) {
@@ -1120,6 +1121,7 @@ function randomLatent() {
 // Reset
 // ---------------------------------------------------------------------------
 function resetHumanoid() {
+    prevAction = null;  // Reset action smoothing
     pxScene.removeArticulation(articulation);
     // Rebuild mesh groups
     for (const entry of links) {
@@ -1236,7 +1238,7 @@ async function mainLoop(timestamp) {
             // Smooth actions with exponential moving average to reduce oscillation
             // from CPU/GPU PhysX dynamics mismatch
             if (currentAction) {
-                const alpha = 0.5;  // smoothing factor (1.0 = no smoothing, 0.0 = full smoothing)
+                const alpha = 0.8;  // smoothing factor (1.0 = no smoothing, 0.0 = full smoothing)
                 if (prevAction) {
                     for (let i = 0; i < currentAction.length; i++) {
                         currentAction[i] = alpha * currentAction[i] + (1 - alpha) * prevAction[i];
