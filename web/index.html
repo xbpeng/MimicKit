@@ -76,6 +76,7 @@ canvas { display: block; }
     <button id="btnNewLatent">New Skill (Random Latent)</button>
     <button id="btnTestPose">Test Pose (raise right arm)</button>
     <button id="btnDiag">Run Diagnostic</button>
+    <button id="btnReplay">Replay Newton Trace</button>
     <span style="margin-left: 12px;">Orbit: drag | Zoom: scroll | Pan: right-drag</span>
 </div>
 
@@ -144,6 +145,9 @@ let onnxSession;
 let renderer, camera, scene3d, controls, worldGroup;
 let latentVec;
 let running = false;
+// Newton reference trace for comparison
+const NEWTON_TRACE = [{"step": 0, "root_pos": [0.052939, 0.015156, 0.707041], "root_rot": [-0.016116, 0.040802, -0.415195, 0.908674], "root_vel": [0.018519, -0.001174, -0.008855], "root_ang_vel": [0.017198, 0.007907, 0.084499], "dof_pos": [-0.033202, 0.718771, -0.048631, -0.270677, -0.486667, 0.791957, 0.835786, -0.400949, 0.678139, 1.091643, -0.208518, 0.194817, 0.023909, -0.496757, -0.20135, -0.332241, -1.727237, -0.436123, -0.573471, -0.191739, 1.085169, 0.460177, -0.460338, 0.028366, 0.569631, -0.905964, 0.413506, 1.057106, -0.291354, -0.110575, -0.037465], "dof_vel": [-0.001663, 0.028827, -0.067252, -0.029401, -0.073448, -0.007939, -0.014162, 0.016285, 0.065242, -0.015659, -0.022677, -0.038349, -0.043653, 0.059248, -0.064452, 0.020059, -0.060012, -0.063128, 0.040224, -0.081663, 0.00631, 0.025005, -0.010437, 0.02719, -0.053802, -0.064516, -0.009362, 0.052319, 0.024143, -0.022751, -0.027962], "action": [0.01069, 0.631808, -0.063142, -0.220172, -0.519761, 0.609198, 0.623437, -0.143646, 0.77478, 1.127699, -0.204984, 0.648253, 0.182248, -0.457392, -0.260647, -0.466039, -1.739672, -0.262788, -0.613464, -0.226603, 0.968319, 0.626932, -0.597105, -0.043712, 0.327547, -0.55719, 0.483004, 0.98824, -0.321161, 0.153732, -0.123543], "obs_0_13": [0.707041, 0.998152, -0.0, -0.060769, 0.060647, 0.063288, 0.996151, 0.012984, 0.013257, -0.008855, 0.005244, 0.018188, 0.084499]}, {"step": 1, "root_pos": [0.0545, 0.018746, 0.705029], "root_rot": [-0.006711, 0.040423, -0.414439, 0.909154], "root_vel": [-0.074434, 0.026393, -0.040839], "root_ang_vel": [0.688561, -0.409007, 0.413156], "dof_pos": [-0.036133, 0.706682, -0.055647, -0.256969, -0.483134, 0.742208, 0.756825, -0.35313, 0.716245, 1.094796, -0.205553, 0.282651, 0.028851, -0.494777, -0.220359, -0.35757, -1.720204, -0.425686, -0.579622, -0.183146, 1.053693, 0.511501, -0.494475, 0.008981, 0.528061, -0.885099, 0.41286, 1.02861, -0.29608, 0.023919, -0.074547], "dof_vel": [-0.04273, -0.202139, -0.385339, 0.091621, 0.096502, -1.469638, -1.233677, 1.738315, 0.63342, 0.115942, 0.421472, 1.741084, 0.021656, 0.292187, -0.114151, -1.046015, 0.087492, 0.689535, -0.153337, 0.249291, -0.813943, 1.016928, -0.939048, -0.481325, -1.009211, 0.279474, 0.395364, -0.32148, -0.126418, -1.784736, -0.403721], "action": [-0.064395, 0.639843, -0.122749, -0.308695, -0.482658, 0.718954, 0.510309, 0.059902, 0.828659, 1.074749, -0.228877, 1.054192, 0.115644, -0.393805, -0.312403, -0.59435, -1.852423, -0.586522, -0.513687, -0.129086, 0.944172, 0.117802, 0.307897, -0.053658, 0.836963, -1.024443, 0.442598, 0.86941, -0.132606, -0.646738, 0.039897], "obs_0_13": [0.705029, 0.997689, -0.0, -0.067939, 0.067868, 0.045814, 0.996642, -0.068683, -0.038982, -0.040839, 0.759973, 0.252673, 0.413156]}, {"step": 2, "root_pos": [0.052406, 0.019261, 0.702303], "root_rot": [-0.007613, 0.042574, -0.411464, 0.910399], "root_vel": [0.033606, 0.048956, -0.048281], "root_ang_vel": [-0.163961, 0.300615, 0.192324], "dof_pos": [-0.038884, 0.702962, -0.06437, -0.243234, -0.491558, 0.737087, 0.666084, -0.301412, 0.763522, 1.07541, -0.206402, 0.167883, -0.01567, -0.476841, -0.245469, -0.390298, -1.742177, -0.430326, -0.591655, -0.184271, 1.063974, 0.397503, -0.340671, 0.009281, 0.559939, -0.888704, 0.45295, 0.996569, -0.257761, -0.237325, -0.010717], "dof_vel": [0.035809, -0.1682, -0.451411, 0.203835, -0.27823, -0.174904, -1.366042, 2.482444, 0.652097, -0.530555, 0.063566, -3.559463, -1.405903, 0.43866, -0.322627, -1.375955, -0.739513, -0.649433, -0.301001, 0.120239, -0.372002, -2.83959, 23.606321, -0.344387, 1.842263, -0.46509, 0.263336, -1.162109, 1.293585, -4.257403, 0.54209], "action": [0.019097, 0.653814, 0.003159, -0.126164, -0.49153, 0.675556, 0.654408, -0.000952, 0.700302, 1.08037, -0.244245, 0.517872, 0.116537, -0.433581, -0.351175, -0.395012, -1.706246, -0.28883, -0.610846, -0.224087, 1.15675, 0.452533, -0.176448, 0.176456, 0.167443, -0.787692, 0.289402, 1.04174, -0.325185, 0.61221, -0.616554], "obs_0_13": [0.702303, 0.997458, 0.0, -0.071254, 0.071168, 0.049022, 0.996259, -0.014642, 0.057547, -0.048281, -0.334111, 0.074981, 0.192324]}, {"step": 3, "root_pos": [0.053947, 0.024244, 0.69945], "root_rot": [-0.008093, 0.05125, -0.404922, 0.912878], "root_vel": [0.1313, 0.165813, -0.105913], "root_ang_vel": [0.097486, 0.568951, 0.155207], "dof_pos": [-0.021754, 0.688975, -0.068671, -0.222718, -0.486737, 0.723176, 0.64108, -0.254404, 0.761092, 1.071481, -0.211608, 0.107139, -0.033595, -0.47994, -0.264847, -0.400313, -1.737908, -0.462804, -0.611509, -0.173735, 1.089668, 0.560796, -0.402983, 0.062993, 0.555191, -0.884417, 0.36898, 0.990886, -0.247334, -0.082303, -0.309867], "dof_vel": [0.529263, -0.208304, 0.463351, 0.815609, -0.083849, -0.494854, 0.169696, 1.351301, -0.645523, -0.187951, -0.061219, -1.043595, -0.537802, 0.048245, -0.552092, 0.183493, 0.367493, -0.09089, -0.85863, 0.057436, 0.655177, -18.220743, 7.412237, 1.250799, -2.237616, 0.337581, -1.431404, 0.372771, -0.930202, -8.709778, 7.186283], "action": [0.002361, 0.628742, -0.130919, -0.25302, -0.603895, 0.939676, 0.769646, -0.306317, 0.675669, 1.074231, -0.181772, 0.31406, 0.071606, -0.444712, -0.28531, -0.401199, -1.707043, -0.367596, -0.664695, -0.196144, 0.990898, 0.320229, -0.0403, -0.101241, 0.421822, -0.676044, 0.463185, 1.182596, -0.52263, 0.678633, 0.582761], "obs_0_13": [0.69945, 0.996207, 0.0, -0.087017, 0.086878, 0.056495, 0.994616, -0.035301, 0.208536, -0.105913, -0.357441, 0.45326, 0.155207]}, {"step": 4, "root_pos": [0.056702, 0.027418, 0.694164], "root_rot": [-0.005934, 0.052317, -0.405489, 0.912582], "root_vel": [0.007203, 0.030936, -0.134782], "root_ang_vel": [0.241707, -0.414863, 0.059136], "dof_pos": [-0.029555, 0.686531, -0.076233, -0.227472, -0.49622, 0.783751, 0.693676, -0.250678, 0.742957, 1.067934, -0.200397, 0.140102, -0.029506, -0.473077, -0.270603, -0.385723, -1.720869, -0.460203, -0.61798, -0.16836, 1.065215, 0.526957, -0.392493, -0.067312, 0.51901, -0.907744, 0.374874, 1.032171, -0.341663, -0.114971, -0.051446], "dof_vel": [-0.383235, 0.141212, -0.566422, -0.379502, -0.402026, 1.653812, 1.193034, -0.648958, -0.619733, -0.108158, 0.277283, 1.00879, 0.340847, 0.170534, -0.098425, 0.084898, 0.56132, 0.232923, -0.174284, -0.171495, -0.770124, -19.248831, 3.705603, -0.363562, -0.315029, -0.998041, 0.736467, 1.791431, -1.368951, 2.968346, 6.58822], "action": [-0.062229, 0.648123, -0.079869, -0.302552, -0.531682, 0.839577, 0.814693, -0.419278, 0.776529, 1.135788, -0.172882, 0.331791, 0.174583, -0.422486, -0.247582, -0.425227, -1.667913, -0.279828, -0.534694, -0.142338, 1.03927, 0.450352, -0.211106, 0.339412, 0.33176, -0.817196, 0.448182, 1.100393, -0.380678, 0.386285, 0.250967], "obs_0_13": [0.694164, 0.995881, 0.0, -0.090675, 0.090545, 0.053479, 0.994455, -0.018194, 0.026036, -0.134782, 0.470128, -0.097536, 0.059136]}, {"step": 5, "root_pos": [0.054432, 0.028357, 0.696524], "root_vel": [-0.144679, -0.003226, 0.257737], "dof_pos": [-0.044505, 0.701852, -0.083729, -0.253341, -0.506548, 0.796365, 0.753532, -0.284008, 0.726881, 1.069154, -0.188415, 0.182938, -0.004665, -0.464494, -0.262974, -0.401456, -1.698362, -0.456797, -0.621141, -0.136524, 1.07102, 0.417946, -0.399279, 0.051448, 0.507438, -0.949293, 0.365277, 1.070989, -0.341601, -0.009937, -0.025283]}];
+
 let frameCount = 0, lastFpsTime = 0;
 
 // PhysX enums (set after PhysX loads)
@@ -401,9 +405,15 @@ function buildArticulation() {
             }
         }
 
-        // Use exact reference mass from Newton/MuJoCo (stored in JSON)
-        // Then let PhysX compute inertia from the collision shapes + this mass
-        if (body.mass) {
+        // Set exact mass, inertia tensor, and COM from Newton/MuJoCo reference
+        if (body.mass && body.inertia && body.com) {
+            link.setMass(body.mass);
+            link.setMassSpaceInertiaTensor(new PhysX.PxVec3(body.inertia[0], body.inertia[1], body.inertia[2]));
+            link.setCMassLocalPose(new PhysX.PxTransform(
+                new PhysX.PxVec3(body.com[0], body.com[1], body.com[2]),
+                new PhysX.PxQuat(0, 0, 0, 1)
+            ));
+        } else if (body.mass) {
             rbext.setMassAndUpdateInertia(link, body.mass);
         } else {
             rbext.updateMassAndInertia(link, 1000);
@@ -1326,6 +1336,19 @@ async function init() {
             }
             console.log('Max DOF diff from init_pose:', maxDofDiff.toFixed(6));
             
+            // Read back drive params to verify they're set correctly
+            console.log('=== Drive Parameters (first 5 joints) ===');
+            for (let i = 0; i < Math.min(5, origDrives.length); i++) {
+                const d = origDrives[i];
+                console.log('Drive ' + i + ': stiffness=' + d.stiffness + ' damping=' + d.damping + ' maxForce=' + d.maxForce);
+            }
+            // Read actual drive target for first DOF
+            const firstDof = humanoidData.dofInfo[0];
+            const firstLink = bodyLinkMap[firstDof.child_body];
+            const firstJoint = firstLink.getInboundJoint();
+            const target0 = firstJoint.getDriveTarget(axisEnums[firstDof.physx_axis]);
+            console.log('First DOF drive target readback:', target0, '(expected init_dof[0]=' + humanoidData.init_dof_pos[0] + ')');
+            
             // 4. Build observation
             const obs = buildObservation();
             console.log('Observation[0:13]:', Array.from(obs).slice(0,13).map(v => v.toFixed(4)).join(', '));
@@ -1376,6 +1399,76 @@ async function init() {
             running = true;
             requestAnimationFrame(mainLoop);
             console.log('=== DIAGNOSTIC COMPLETE ===');
+        });
+
+        
+        document.getElementById('btnReplay').addEventListener('click', async () => {
+            running = false;
+            await new Promise(r => setTimeout(r, 200));
+            resetHumanoid();
+            
+            const axisEnums = [E_TWIST, E_SWING1, E_SWING2];
+            const bodyLinkMap = {};
+            for (const l of links) bodyLinkMap[l.name] = l.link;
+            
+            console.log('=== REPLAY: Applying Newton actions to web PhysX ===');
+            
+            for (let step = 0; step < 5; step++) {
+                const nf = NEWTON_TRACE[step];
+                
+                // Read current web PhysX state
+                const rp = links[0].link.getGlobalPose();
+                const rv = links[0].link.getLinearVelocity();
+                const webRootZ = rp.get_p().get_z();
+                const webRootVelZ = rv.get_z();
+                
+                // Read web DOF positions
+                const webDof = [];
+                for (let i = 0; i < humanoidData.dofInfo.length; i++) {
+                    const dof = humanoidData.dofInfo[i];
+                    const cl = bodyLinkMap[dof.child_body];
+                    try { webDof.push(cl.getInboundJoint().getJointPosition(axisEnums[dof.physx_axis])); }
+                    catch(e) { webDof.push(0); }
+                }
+                
+                // Compare with Newton
+                const nRootZ = nf.root_pos[2];
+                const nRootVelZ = nf.root_vel[2];
+                const rootZDiff = Math.abs(webRootZ - nRootZ);
+                const velZDiff = Math.abs(webRootVelZ - nRootVelZ);
+                
+                let maxDofDiff = 0;
+                for (let i = 0; i < Math.min(webDof.length, nf.dof_pos.length); i++) {
+                    maxDofDiff = Math.max(maxDofDiff, Math.abs(webDof[i] - nf.dof_pos[i]));
+                }
+                
+                console.log('Step ' + step + ': ' +
+                    'rootZ: web=' + webRootZ.toFixed(4) + ' newton=' + nRootZ.toFixed(4) + ' diff=' + rootZDiff.toFixed(4) +
+                    ' | velZ: web=' + webRootVelZ.toFixed(4) + ' newton=' + nRootVelZ.toFixed(4) + ' diff=' + velZDiff.toFixed(4) +
+                    ' | maxDofDiff=' + maxDofDiff.toFixed(4));
+                
+                // Apply Newton action
+                const action = new Float32Array(nf.action);
+                applyActions(action);
+                
+                // Step physics (4 substeps = 1 control step)
+                for (let i = 0; i < 4; i++) {
+                    pxScene.simulate(1/120);
+                    pxScene.fetchResults(true);
+                }
+            }
+            
+            // Final state comparison
+            const rpF = links[0].link.getGlobalPose();
+            const rvF = links[0].link.getLinearVelocity();
+            const nfF = NEWTON_TRACE[5];
+            console.log('Step 5 (final): rootZ: web=' + rpF.get_p().get_z().toFixed(4) + 
+                ' newton=' + nfF.root_pos[2].toFixed(4) +
+                ' diff=' + Math.abs(rpF.get_p().get_z() - nfF.root_pos[2]).toFixed(4));
+            
+            console.log('=== REPLAY COMPLETE ===');
+            running = true;
+            requestAnimationFrame(mainLoop);
         });
 
         document.getElementById('chkDrives').addEventListener('change', (e) => {
