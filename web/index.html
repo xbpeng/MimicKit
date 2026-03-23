@@ -75,6 +75,7 @@ canvas { display: block; }
     <button id="btnReset">Reset</button>
     <button id="btnNewLatent">New Skill (Random Latent)</button>
     <button id="btnTestPose">Test Pose (raise right arm)</button>
+    <button id="btnDiag">Run Diagnostic</button>
     <span style="margin-left: 12px;">Orbit: drag | Zoom: scroll | Pan: right-drag</span>
 </div>
 
@@ -1281,6 +1282,102 @@ async function init() {
         });
 
         // Debug panel event listeners
+        
+        document.getElementById('btnDiag').addEventListener('click', async () => {
+            // === PRINCIPLED DIAGNOSTIC ===
+            // 1. Pause simulation
+            running = false;
+            await new Promise(r => setTimeout(r, 100));
+            
+            // 2. Reset to init_pose
+            resetHumanoid();
+            
+            // 3. Read frame 0 state directly from PhysX
+            const axisEnums = [E_TWIST, E_SWING1, E_SWING2];
+            const bodyLinkMap = {};
+            for (const l of links) bodyLinkMap[l.name] = l.link;
+            
+            console.log('=== DIAGNOSTIC: Frame 0 (after init_pose) ===');
+            
+            // Root state
+            const rp0 = links[0].link.getGlobalPose();
+            console.log('Root pos:', rp0.get_p().get_x(), rp0.get_p().get_y(), rp0.get_p().get_z());
+            console.log('Root rot:', rp0.get_q().get_x(), rp0.get_q().get_y(), rp0.get_q().get_z(), rp0.get_q().get_w());
+            
+            // Joint positions (raw PhysX values)
+            const dofPos = [];
+            for (let i = 0; i < humanoidData.dofInfo.length; i++) {
+                const dof = humanoidData.dofInfo[i];
+                const cl = bodyLinkMap[dof.child_body];
+                try {
+                    const j = cl.getInboundJoint();
+                    const v = j.getJointPosition(axisEnums[dof.physx_axis]);
+                    dofPos.push(v);
+                } catch(e) { dofPos.push(0); }
+            }
+            console.log('DOF positions (31):', dofPos.map(v => v.toFixed(4)).join(', '));
+            console.log('Expected init_dof:', humanoidData.init_dof_pos.map(v => v.toFixed(4)).join(', '));
+            
+            // Compare DOFs
+            let maxDofDiff = 0;
+            for (let i = 0; i < 31; i++) {
+                const d = Math.abs(dofPos[i] - humanoidData.init_dof_pos[i]);
+                if (d > maxDofDiff) maxDofDiff = d;
+            }
+            console.log('Max DOF diff from init_pose:', maxDofDiff.toFixed(6));
+            
+            // 4. Build observation
+            const obs = buildObservation();
+            console.log('Observation[0:13]:', Array.from(obs).slice(0,13).map(v => v.toFixed(4)).join(', '));
+            console.log('Observation[140:158] (key bodies):', Array.from(obs).slice(140,158).map(v => v.toFixed(4)).join(', '));
+            
+            // 5. Run ONNX with zero latent
+            const zeroLatent = new Float32Array(humanoidData.latent_dim);
+            const feed = {
+                obs: new ort.Tensor('float32', obs, [1, humanoidData.obs_dim]),
+                latent: new ort.Tensor('float32', zeroLatent, [1, humanoidData.latent_dim])
+            };
+            const result = await onnxSession.run(feed);
+            const action = result.action.data;
+            console.log('Action[0:8]:', Array.from(action).slice(0,8).map(v => v.toFixed(4)).join(', '));
+            console.log('Action range:', Math.min(...action).toFixed(3), Math.max(...action).toFixed(3));
+            
+            // 6. Apply action
+            applyActions(action);
+            
+            // 7. Step physics ONCE (1/120s)
+            pxScene.simulate(1/120);
+            pxScene.fetchResults(true);
+            
+            // 8. Read frame 1 state
+            console.log('=== DIAGNOSTIC: Frame 1 (after 1 substep) ===');
+            const rp1 = links[0].link.getGlobalPose();
+            console.log('Root pos:', rp1.get_p().get_x().toFixed(6), rp1.get_p().get_y().toFixed(6), rp1.get_p().get_z().toFixed(6));
+            const rv1 = links[0].link.getLinearVelocity();
+            console.log('Root vel:', rv1.get_x().toFixed(4), rv1.get_y().toFixed(4), rv1.get_z().toFixed(4));
+            
+            const dofPos1 = [];
+            for (let i = 0; i < humanoidData.dofInfo.length; i++) {
+                const dof = humanoidData.dofInfo[i];
+                const cl = bodyLinkMap[dof.child_body];
+                try {
+                    const j = cl.getInboundJoint();
+                    dofPos1.push(j.getJointPosition(axisEnums[dof.physx_axis]));
+                } catch(e) { dofPos1.push(0); }
+            }
+            console.log('DOF positions after step:', dofPos1.map(v => v.toFixed(4)).join(', '));
+            
+            // DOF deltas (how much each joint moved)
+            const deltas = dofPos1.map((v, i) => v - dofPos[i]);
+            console.log('DOF deltas:', deltas.map(v => v.toFixed(6)).join(', '));
+            console.log('Max DOF delta:', Math.max(...deltas.map(Math.abs)).toFixed(6));
+            
+            // Resume
+            running = true;
+            requestAnimationFrame(mainLoop);
+            console.log('=== DIAGNOSTIC COMPLETE ===');
+        });
+
         document.getElementById('chkDrives').addEventListener('change', (e) => {
             drivesEnabled = e.target.checked;
             applyDriveParams();
