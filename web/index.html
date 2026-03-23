@@ -1,0 +1,863 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MimicKit - ASE Humanoid Sword &amp; Shield</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #1a1a2e; overflow: hidden; font-family: 'Segoe UI', sans-serif; }
+canvas { display: block; }
+#overlay {
+    position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(26,26,46,0.95); z-index: 10;
+    flex-direction: column; color: #e0e0ff;
+}
+#overlay h1 { font-size: 2em; margin-bottom: 0.5em; }
+#overlay .status { font-size: 1.1em; opacity: 0.8; margin-top: 0.5em; }
+#overlay .spinner {
+    width: 40px; height: 40px; border: 4px solid rgba(255,255,255,0.15);
+    border-top-color: #7c83ff; border-radius: 50%; animation: spin 0.8s linear infinite;
+    margin: 1em;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+#hud {
+    position: absolute; top: 12px; left: 16px; color: #b0b0d0;
+    font-size: 13px; line-height: 1.6; pointer-events: none; z-index: 5;
+}
+#hud .title { font-size: 15px; font-weight: 600; color: #d0d0ff; }
+#controls {
+    position: absolute; bottom: 16px; left: 50%; transform: translateX(-50%);
+    color: #b0b0d0; font-size: 12px; z-index: 5; text-align: center;
+    background: rgba(26,26,46,0.7); padding: 8px 16px; border-radius: 8px;
+}
+#controls button {
+    background: #3a3a5e; color: #d0d0ff; border: 1px solid #5a5a8e;
+    padding: 6px 14px; border-radius: 4px; cursor: pointer; margin: 0 4px;
+    font-size: 12px;
+}
+#controls button:hover { background: #4a4a7e; }
+</style>
+</head>
+<body>
+
+<div id="overlay">
+    <h1>MimicKit Web Demo</h1>
+    <div class="spinner"></div>
+    <div class="status" id="loadStatus">Initializing...</div>
+</div>
+
+<div id="hud">
+    <div class="title">ASE Humanoid - Sword &amp; Shield</div>
+    <div id="fpsDisplay">FPS: --</div>
+    <div id="physInfo">PhysX WASM + ONNX Runtime</div>
+</div>
+
+<div id="controls">
+    <button id="btnReset">Reset</button>
+    <button id="btnNewLatent">New Skill (Random Latent)</button>
+    <span style="margin-left: 12px;">Orbit: drag | Zoom: scroll | Pan: right-drag</span>
+</div>
+
+<!-- ONNX Runtime (loaded globally) -->
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.21.0/dist/ort.min.js"></script>
+
+<!-- Import map for three.js -->
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ---------------------------------------------------------------------------
+// Globals
+// ---------------------------------------------------------------------------
+let PhysX, physics, pxScene, foundation, material;
+let articulation, links = [];  // { name, link, meshGroup }
+let humanoidData;
+let onnxSession;
+let renderer, camera, scene3d, controls;
+let latentVec;
+let running = false;
+let frameCount = 0, lastFpsTime = 0;
+
+// PhysX enums (set after PhysX loads)
+let E_TWIST, E_SWING1, E_SWING2;
+let E_LIMITED, E_LOCKED;
+let E_SPHERICAL, E_REVOLUTE, E_FIX;
+let E_FORCE;
+let E_CACHE_ALL;
+let SHAPE_FLAGS_VAL;
+
+const SUBSTEPS = 4;
+const DT = 1 / 120;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+function setStatus(msg) {
+    document.getElementById('loadStatus').textContent = msg;
+}
+
+// Z-up (MJCF) to Y-up (PhysX/Three.js): (x,y,z) -> (x,z,y)
+function zup(pos) { return [pos[0], pos[2], pos[1]]; }
+
+// Convert quaternion from Z-up frame to Y-up frame
+// Conjugation by R_swap which is 90-deg rotation around X: q_s = (cos(-45), sin(-45), 0, 0) = (s, -s, 0, 0) with s = sqrt(2)/2
+function quatZupToYup(qwxyz) {
+    const [w, x, y, z] = qwxyz;
+    const s = Math.SQRT1_2;
+    // R_swap * q * R_swap_inv
+    // R_swap = (w=s, x=-s, y=0, z=0), R_swap_inv = (w=s, x=s, y=0, z=0)
+    // First compute q * R_swap_inv:
+    const rw = s, rx = s;
+    const qr_w = w*rw - x*rx;
+    const qr_x = w*rx + x*rw;
+    const qr_y = y*rw + z*rx;
+    const qr_z = z*rw - y*rx;
+    // Then R_swap * result:
+    const sw = s, sx = -s;
+    const fw = sw*qr_w - sx*qr_x;
+    const fx = sw*qr_x + sx*qr_w;
+    const fy = sw*qr_y - sx*qr_z;
+    const fz = sw*qr_z + sx*qr_y;
+    return [fw, fx, fy, fz];
+}
+
+function quatFromTwoVec(from, to) {
+    const [fx,fy,fz] = from, [tx,ty,tz] = to;
+    const dot = fx*tx + fy*ty + fz*tz;
+    if (dot > 0.999999) return [0,0,0,1];
+    if (dot < -0.999999) {
+        let ax = [0, -fz, fy];
+        if (Math.abs(fx) > 0.9) ax = [fz, 0, -fx];
+        const len = Math.sqrt(ax[0]*ax[0]+ax[1]*ax[1]+ax[2]*ax[2]);
+        return [ax[0]/len, ax[1]/len, ax[2]/len, 0];
+    }
+    const cx = fy*tz - fz*ty, cy = fz*tx - fx*tz, cz = fx*ty - fy*tx;
+    const w = 1 + dot;
+    const len = Math.sqrt(cx*cx + cy*cy + cz*cz + w*w);
+    return [cx/len, cy/len, cz/len, w/len];
+}
+
+function gaussianRandom() {
+    let u = 0, v = 0;
+    while (u === 0) u = Math.random();
+    while (v === 0) v = Math.random();
+    return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+}
+
+// ---------------------------------------------------------------------------
+// Load humanoid JSON
+// ---------------------------------------------------------------------------
+async function loadHumanoidData() {
+    setStatus('Loading humanoid data...');
+    const resp = await fetch('./humanoid_data.json');
+    humanoidData = await resp.json();
+    console.log('Humanoid data loaded:', humanoidData.bodies.length, 'bodies');
+}
+
+// ---------------------------------------------------------------------------
+// Load ONNX model
+// ---------------------------------------------------------------------------
+async function loadOnnxModel() {
+    setStatus('Loading ONNX model...');
+    ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.21.0/dist/';
+    onnxSession = await ort.InferenceSession.create(
+        './ase_humanoid_sword_shield_actor.onnx',
+        { executionProviders: ['wasm'] }
+    );
+    console.log('ONNX model loaded');
+}
+
+// ---------------------------------------------------------------------------
+// Init PhysX
+// ---------------------------------------------------------------------------
+async function initPhysX() {
+    setStatus('Loading PhysX WASM...');
+
+    const module = await import('https://cdn.jsdelivr.net/npm/physx-js-webidl@2.7.2/physx-js-webidl.mjs');
+    PhysX = await module.default({
+        locateFile: () => 'https://cdn.jsdelivr.net/npm/physx-js-webidl@2.7.2/physx-js-webidl.wasm'
+    });
+    console.log('PhysX WASM loaded');
+
+    // Cache enums (static properties on enum classes)
+    E_TWIST   = PhysX.PxArticulationAxisEnum.eTWIST;
+    E_SWING1  = PhysX.PxArticulationAxisEnum.eSWING1;
+    E_SWING2  = PhysX.PxArticulationAxisEnum.eSWING2;
+    E_LIMITED = PhysX.PxArticulationMotionEnum.eLIMITED;
+    E_LOCKED  = PhysX.PxArticulationMotionEnum.eLOCKED;
+    E_SPHERICAL = PhysX.PxArticulationJointTypeEnum.eSPHERICAL;
+    E_REVOLUTE  = PhysX.PxArticulationJointTypeEnum.eREVOLUTE;
+    E_FIX       = PhysX.PxArticulationJointTypeEnum.eFIX;
+    E_FORCE     = PhysX.PxArticulationDriveTypeEnum.eFORCE;
+    E_CACHE_ALL = PhysX.PxArticulationCacheFlagEnum.eALL;
+    SHAPE_FLAGS_VAL = PhysX.PxShapeFlagEnum.eSCENE_QUERY_SHAPE | PhysX.PxShapeFlagEnum.eSIMULATION_SHAPE;
+
+    // Top-level functions accessed via prototype
+    const tlf = PhysX.PxTopLevelFunctions.prototype;
+    const version = PhysX.PHYSICS_VERSION;
+    const allocator = new PhysX.PxDefaultAllocator();
+    const errorCb = new PhysX.PxDefaultErrorCallback();
+    foundation = tlf.CreateFoundation(version, allocator, errorCb);
+
+    const tolerances = new PhysX.PxTolerancesScale();
+    physics = tlf.CreatePhysics(version, foundation, tolerances);
+
+    // Create scene
+    const cpuDispatcher = tlf.DefaultCpuDispatcherCreate(0);
+    const sceneDesc = new PhysX.PxSceneDesc(tolerances);
+    sceneDesc.set_gravity(new PhysX.PxVec3(0, -9.81, 0));
+    sceneDesc.set_cpuDispatcher(cpuDispatcher);
+    sceneDesc.set_filterShader(tlf.DefaultFilterShader());
+    pxScene = physics.createScene(sceneDesc);
+
+    // Material
+    material = physics.createMaterial(1.0, 1.0, 0.0);
+
+    // Ground plane as a large static box
+    const groundShapeFlags = new PhysX.PxShapeFlags(SHAPE_FLAGS_VAL);
+    const groundGeom = new PhysX.PxBoxGeometry(50, 0.5, 50);
+    const groundShape = physics.createShape(groundGeom, material, true, groundShapeFlags);
+    // Set filter data so default filter shader generates contacts
+    const groundFilterData = new PhysX.PxFilterData(1, 1, 0, 0);
+    groundShape.setSimulationFilterData(groundFilterData);
+    const groundPose = new PhysX.PxTransform(
+        new PhysX.PxVec3(0, -0.5, 0),  // top surface at y=0
+        new PhysX.PxQuat(0, 0, 0, 1)
+    );
+    const groundActor = physics.createRigidStatic(groundPose);
+    groundActor.attachShape(groundShape);
+    pxScene.addActor(groundActor);
+
+    console.log('PhysX scene created');
+}
+
+// ---------------------------------------------------------------------------
+// Build PhysX articulation from humanoid data
+// ---------------------------------------------------------------------------
+function buildArticulation() {
+    setStatus('Building humanoid articulation...');
+
+    const shapeFlags = new PhysX.PxShapeFlags(SHAPE_FLAGS_VAL);
+    const rbext = PhysX.PxRigidBodyExt.prototype;
+
+    articulation = physics.createArticulationReducedCoordinate();
+    articulation.setSolverIterationCounts(32, 1);
+
+    const bodyLinkMap = {};  // name -> PxArticulationLink
+    links = [];
+
+    for (const body of humanoidData.bodies) {
+        const wp = zup(body.pos);
+        const yOff = humanoidData.pelvis_z;
+        const pose = new PhysX.PxTransform(
+            new PhysX.PxVec3(wp[0], wp[1] + yOff, wp[2]),
+            new PhysX.PxQuat(0, 0, 0, 1)
+        );
+
+        const parentLink = body.parent ? bodyLinkMap[body.parent] : null;
+        const link = articulation.createLink(parentLink, pose);
+
+        // Attach geom shapes
+        for (const geom of body.geoms) {
+            let shape = null;
+            if (geom.type === 'sphere') {
+                const g = new PhysX.PxSphereGeometry(geom.radius);
+                shape = physics.createShape(g, material, true, shapeFlags);
+                const lp = zup(geom.pos);
+                shape.setLocalPose(new PhysX.PxTransform(
+                    new PhysX.PxVec3(lp[0], lp[1], lp[2]),
+                    new PhysX.PxQuat(0, 0, 0, 1)
+                ));
+            } else if (geom.type === 'capsule' && geom.fromto) {
+                const ft = geom.fromto;
+                const p0 = zup([ft[0], ft[1], ft[2]]);
+                const p1 = zup([ft[3], ft[4], ft[5]]);
+                const dx = p1[0]-p0[0], dy = p1[1]-p0[1], dz = p1[2]-p0[2];
+                const len = Math.sqrt(dx*dx+dy*dy+dz*dz);
+                const halfH = Math.max(len / 2, 0.001);
+                const g = new PhysX.PxCapsuleGeometry(geom.radius, halfH);
+                shape = physics.createShape(g, material, true, shapeFlags);
+                const mid = [(p0[0]+p1[0])/2, (p0[1]+p1[1])/2, (p0[2]+p1[2])/2];
+                const dir = len > 0.001 ? [dx/len, dy/len, dz/len] : [1,0,0];
+                const q = quatFromTwoVec([1,0,0], dir);
+                shape.setLocalPose(new PhysX.PxTransform(
+                    new PhysX.PxVec3(mid[0], mid[1], mid[2]),
+                    new PhysX.PxQuat(q[0], q[1], q[2], q[3])
+                ));
+            } else if (geom.type === 'box') {
+                const he = geom.halfExtents;
+                const g = new PhysX.PxBoxGeometry(he[0], he[2], he[1]);  // swap Y,Z
+                shape = physics.createShape(g, material, true, shapeFlags);
+                const lp = zup(geom.pos);
+                shape.setLocalPose(new PhysX.PxTransform(
+                    new PhysX.PxVec3(lp[0], lp[1], lp[2]),
+                    new PhysX.PxQuat(0, 0, 0, 1)
+                ));
+            } else if (geom.type === 'cylinder') {
+                // Approximate cylinder with capsule
+                const r = geom.radius;
+                if (geom.fromto) {
+                    const ft = geom.fromto;
+                    const p0 = zup([ft[0], ft[1], ft[2]]);
+                    const p1 = zup([ft[3], ft[4], ft[5]]);
+                    const dx = p1[0]-p0[0], dy = p1[1]-p0[1], dz = p1[2]-p0[2];
+                    const len = Math.sqrt(dx*dx+dy*dy+dz*dz);
+                    const halfH = Math.max(len / 2, 0.001);
+                    const g = new PhysX.PxCapsuleGeometry(r, halfH);
+                    shape = physics.createShape(g, material, true, shapeFlags);
+                    const mid = [(p0[0]+p1[0])/2, (p0[1]+p1[1])/2, (p0[2]+p1[2])/2];
+                    const dir = len > 0.001 ? [dx/len, dy/len, dz/len] : [0,1,0];
+                    const q = quatFromTwoVec([1,0,0], dir);
+                    shape.setLocalPose(new PhysX.PxTransform(
+                        new PhysX.PxVec3(mid[0], mid[1], mid[2]),
+                        new PhysX.PxQuat(q[0], q[1], q[2], q[3])
+                    ));
+                } else {
+                    // Default cylinder along Z in MJCF -> along Y in Y-up
+                    const hh = geom.halfHeight || 0.015;
+                    const g = new PhysX.PxCapsuleGeometry(r, hh);
+                    shape = physics.createShape(g, material, true, shapeFlags);
+                    const lp = zup(geom.pos || [0,0,0]);
+                    // Rotate capsule X-axis to Y-axis
+                    const q = quatFromTwoVec([1,0,0], [0,1,0]);
+                    shape.setLocalPose(new PhysX.PxTransform(
+                        new PhysX.PxVec3(lp[0], lp[1], lp[2]),
+                        new PhysX.PxQuat(q[0], q[1], q[2], q[3])
+                    ));
+                }
+            }
+            if (shape) {
+                // Set filter data for collision with ground
+                shape.setSimulationFilterData(new PhysX.PxFilterData(1, 1, 0, 0));
+                link.attachShape(shape);
+            }
+        }
+
+        rbext.updateMassAndInertia(link, 1000);
+
+        bodyLinkMap[body.name] = link;
+        links.push({ name: body.name, link: link, meshGroup: null });
+    }
+
+    // Configure joints
+    const axisEnums = [E_TWIST, E_SWING1, E_SWING2];
+
+    for (const jdata of humanoidData.joints) {
+        const childLink = bodyLinkMap[jdata.child_body];
+        const joint = childLink.getInboundJoint();
+
+        if (jdata.jointType === 'spherical') {
+            joint.setJointType(E_SPHERICAL);
+        } else {
+            joint.setJointType(E_REVOLUTE);
+        }
+
+        // Joint frame poses - localPos0 in parent frame, converted to Y-up
+        const lp = zup(jdata.localPos0);
+        const lr = jdata.localRot; // [w, x, y, z] in Z-up
+        const lrY = quatZupToYup(lr);
+
+        const parentPose = new PhysX.PxTransform(
+            new PhysX.PxVec3(lp[0], lp[1], lp[2]),
+            new PhysX.PxQuat(lrY[1], lrY[2], lrY[3], lrY[0])  // PxQuat(x,y,z,w)
+        );
+        const childPose = new PhysX.PxTransform(
+            new PhysX.PxVec3(0, 0, 0),
+            new PhysX.PxQuat(lrY[1], lrY[2], lrY[3], lrY[0])
+        );
+        joint.setParentPose(parentPose);
+        joint.setChildPose(childPose);
+
+        if (jdata.jointType === 'spherical') {
+            for (let i = 0; i < jdata.axes.length; i++) {
+                const physAxis = jdata.axisMap[i];
+                const axE = axisEnums[physAxis];
+                joint.setMotion(axE, E_LIMITED);
+                const ax = jdata.axes[i];
+                const limit = new PhysX.PxArticulationLimit(ax.range[0], ax.range[1]);
+                joint.setLimitParams(axE, limit);
+                const drive = new PhysX.PxArticulationDrive(
+                    ax.stiffness, ax.damping, ax.maxForce, E_FORCE
+                );
+                joint.setDriveParams(axE, drive);
+            }
+            // Lock unused axes
+            for (let i = jdata.axes.length; i < 3; i++) {
+                joint.setMotion(axisEnums[i], E_LOCKED);
+            }
+        } else {
+            // Revolute: only twist
+            joint.setMotion(E_TWIST, E_LIMITED);
+            const ax = jdata.axes[0];
+            joint.setLimitParams(E_TWIST, new PhysX.PxArticulationLimit(ax.range[0], ax.range[1]));
+            joint.setDriveParams(E_TWIST, new PhysX.PxArticulationDrive(
+                ax.stiffness, ax.damping, ax.maxForce, E_FORCE
+            ));
+            joint.setMotion(E_SWING1, E_LOCKED);
+            joint.setMotion(E_SWING2, E_LOCKED);
+        }
+    }
+
+    // Fixed joints
+    for (const fj of humanoidData.fixedJoints) {
+        const childLink = bodyLinkMap[fj.child_body];
+        const joint = childLink.getInboundJoint();
+        joint.setJointType(E_FIX);
+        const lp = zup(fj.localPos0);
+        joint.setParentPose(new PhysX.PxTransform(
+            new PhysX.PxVec3(lp[0], lp[1], lp[2]),
+            new PhysX.PxQuat(0, 0, 0, 1)
+        ));
+        joint.setChildPose(new PhysX.PxTransform(
+            new PhysX.PxVec3(0, 0, 0),
+            new PhysX.PxQuat(0, 0, 0, 1)
+        ));
+    }
+
+    pxScene.addArticulation(articulation);
+    console.log('Articulation built with', links.length, 'links,', articulation.getDofs(), 'DOFs');
+}
+
+// ---------------------------------------------------------------------------
+// Three.js setup
+// ---------------------------------------------------------------------------
+const BODY_COLORS = {
+    pelvis: 0x5577aa, torso: 0x5577aa, head: 0xcc8866,
+    right_upper_arm: 0x77aa55, right_lower_arm: 0x77aa55, right_hand: 0xcc8866,
+    sword: 0xcccccc,
+    left_upper_arm: 0xaa7755, left_lower_arm: 0xaa7755, shield: 0x8888cc, left_hand: 0xcc8866,
+    right_thigh: 0x5577aa, right_shin: 0x5577aa, right_foot: 0x555577,
+    left_thigh: 0x5577aa, left_shin: 0x5577aa, left_foot: 0x555577,
+};
+
+function initThreeJS() {
+    setStatus('Setting up renderer...');
+
+    renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    document.body.appendChild(renderer.domElement);
+
+    scene3d = new THREE.Scene();
+    scene3d.background = new THREE.Color(0x1a1a2e);
+    scene3d.fog = new THREE.Fog(0x1a1a2e, 15, 40);
+
+    camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+    camera.position.set(3, 2, 4);
+    camera.lookAt(0, 1, 0);
+
+    controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 1, 0);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.1;
+    controls.update();
+
+    // Lights
+    scene3d.add(new THREE.AmbientLight(0x404060, 0.6));
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+    dirLight.position.set(5, 10, 5);
+    dirLight.castShadow = true;
+    dirLight.shadow.mapSize.set(2048, 2048);
+    dirLight.shadow.camera.near = 0.5;
+    dirLight.shadow.camera.far = 30;
+    dirLight.shadow.camera.left = -5;
+    dirLight.shadow.camera.right = 5;
+    dirLight.shadow.camera.top = 5;
+    dirLight.shadow.camera.bottom = -5;
+    scene3d.add(dirLight);
+    scene3d.add(new THREE.HemisphereLight(0x8888cc, 0x444422, 0.4));
+
+    // Ground
+    const groundGeo = new THREE.PlaneGeometry(40, 40);
+    const groundMat = new THREE.MeshStandardMaterial({ color: 0x2a2a4a, roughness: 0.9, metalness: 0.1 });
+    const ground = new THREE.Mesh(groundGeo, groundMat);
+    ground.rotation.x = -Math.PI / 2;
+    ground.receiveShadow = true;
+    scene3d.add(ground);
+    const grid = new THREE.GridHelper(40, 40, 0x3a3a5e, 0x2a2a4a);
+    grid.position.y = 0.001;
+    scene3d.add(grid);
+
+    // Create meshes per body
+    for (let bi = 0; bi < humanoidData.bodies.length; bi++) {
+        const body = humanoidData.bodies[bi];
+        const group = new THREE.Group();
+        const color = BODY_COLORS[body.name] || 0x888888;
+
+        for (const geom of body.geoms) {
+            const mat = new THREE.MeshStandardMaterial({ color, roughness: 0.6, metalness: 0.2 });
+            let mesh = null;
+
+            if (geom.type === 'sphere') {
+                mesh = new THREE.Mesh(new THREE.SphereGeometry(geom.radius, 16, 12), mat);
+                const lp = zup(geom.pos);
+                mesh.position.set(lp[0], lp[1], lp[2]);
+            } else if (geom.type === 'capsule' && geom.fromto) {
+                const ft = geom.fromto;
+                const p0 = new THREE.Vector3(...zup([ft[0],ft[1],ft[2]]));
+                const p1 = new THREE.Vector3(...zup([ft[3],ft[4],ft[5]]));
+                const dir = new THREE.Vector3().subVectors(p1, p0);
+                const len = dir.length();
+                mesh = new THREE.Mesh(new THREE.CapsuleGeometry(geom.radius, len, 8, 12), mat);
+                mesh.position.addVectors(p0, p1).multiplyScalar(0.5);
+                if (len > 0.001) {
+                    mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0), dir.normalize());
+                }
+            } else if (geom.type === 'box') {
+                const he = geom.halfExtents;
+                mesh = new THREE.Mesh(new THREE.BoxGeometry(he[0]*2, he[2]*2, he[1]*2), mat);
+                const lp = zup(geom.pos);
+                mesh.position.set(lp[0], lp[1], lp[2]);
+            } else if (geom.type === 'cylinder') {
+                const r = geom.radius;
+                if (geom.fromto) {
+                    const ft = geom.fromto;
+                    const p0 = new THREE.Vector3(...zup([ft[0],ft[1],ft[2]]));
+                    const p1 = new THREE.Vector3(...zup([ft[3],ft[4],ft[5]]));
+                    const dir = new THREE.Vector3().subVectors(p1, p0);
+                    const len = Math.max(dir.length(), 0.01);
+                    mesh = new THREE.Mesh(new THREE.CylinderGeometry(r, r, len, 16), mat);
+                    mesh.position.addVectors(p0, p1).multiplyScalar(0.5);
+                    if (len > 0.001) {
+                        mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0), dir.normalize());
+                    }
+                } else {
+                    const hh = geom.halfHeight || 0.015;
+                    mesh = new THREE.Mesh(new THREE.CylinderGeometry(r, r, hh*2, 16), mat);
+                    const lp = zup(geom.pos || [0,0,0]);
+                    mesh.position.set(lp[0], lp[1], lp[2]);
+                }
+            }
+            if (mesh) { mesh.castShadow = true; group.add(mesh); }
+        }
+
+        scene3d.add(group);
+        links[bi].meshGroup = group;
+    }
+
+    window.addEventListener('resize', () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Update Three.js meshes from PhysX link poses
+// ---------------------------------------------------------------------------
+function updateMeshes() {
+    for (const entry of links) {
+        if (!entry.meshGroup) continue;
+        const pose = entry.link.getGlobalPose();
+        const p = pose.get_p();
+        const q = pose.get_q();
+        entry.meshGroup.position.set(p.get_x(), p.get_y(), p.get_z());
+        entry.meshGroup.quaternion.set(q.get_x(), q.get_y(), q.get_z(), q.get_w());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Build observation vector (simplified)
+// NOTE: This is a simplified observation that approximates the training env's
+// observation. A full implementation would exactly replicate ASE env's
+// _build_obs() including proper local body positions/rotations for all key
+// bodies, correctly computed angular velocities, etc.
+// ---------------------------------------------------------------------------
+function buildObservation() {
+    const obs = new Float32Array(humanoidData.obs_dim);
+
+    // Get root (pelvis) link pose
+    const rootPose = links[0].link.getGlobalPose();
+    const rp = rootPose.get_p();
+    const rq = rootPose.get_q();
+
+    let idx = 0;
+
+    // Root height (1)
+    obs[idx++] = rp.get_y();  // Y is up
+
+    // Root rotation as quaternion (4) - wxyz
+    obs[idx++] = rq.get_w();
+    obs[idx++] = rq.get_x();
+    obs[idx++] = rq.get_y();
+    obs[idx++] = rq.get_z();
+
+    // Root linear velocity (3)
+    const rv = links[0].link.getLinearVelocity();
+    obs[idx++] = rv.get_x();
+    obs[idx++] = rv.get_y();
+    obs[idx++] = rv.get_z();
+
+    // Root angular velocity (3)
+    const raw = links[0].link.getAngularVelocity();
+    obs[idx++] = raw.get_x();
+    obs[idx++] = raw.get_y();
+    obs[idx++] = raw.get_z();
+
+    // DOF positions (31) - read per-joint
+    const axisEnums = [E_TWIST, E_SWING1, E_SWING2];
+    const bodyLinkMap = {};
+    for (const l of links) bodyLinkMap[l.name] = l.link;
+
+    for (const dof of humanoidData.dofInfo) {
+        const childLink = bodyLinkMap[dof.child_body];
+        if (childLink) {
+            const joint = childLink.getInboundJoint();
+            obs[idx++] = joint.getJointPosition(axisEnums[dof.physx_axis]);
+        } else {
+            obs[idx++] = 0;
+        }
+    }
+
+    // DOF velocities (31)
+    for (const dof of humanoidData.dofInfo) {
+        const childLink = bodyLinkMap[dof.child_body];
+        if (childLink) {
+            const joint = childLink.getInboundJoint();
+            obs[idx++] = joint.getJointVelocity(axisEnums[dof.physx_axis]);
+        } else {
+            obs[idx++] = 0;
+        }
+    }
+
+    // Key body local positions relative to root (5 bodies x 3 = 15)
+    const keyBodies = ['head', 'right_hand', 'left_hand', 'right_foot', 'left_foot'];
+    for (const bname of keyBodies) {
+        const entry = links.find(l => l.name === bname);
+        if (entry) {
+            const pose = entry.link.getGlobalPose();
+            const bp = pose.get_p();
+            obs[idx++] = bp.get_x() - rp.get_x();
+            obs[idx++] = bp.get_y() - rp.get_y();
+            obs[idx++] = bp.get_z() - rp.get_z();
+        } else {
+            idx += 3;
+        }
+    }
+
+    // Remaining dims zero-padded (up to 158)
+
+    // Normalize
+    for (let i = 0; i < humanoidData.obs_dim; i++) {
+        const std = Math.max(humanoidData.obs_std[i], 0.01);
+        obs[i] = Math.max(-5, Math.min(5, (obs[i] - humanoidData.obs_mean[i]) / std));
+    }
+
+    return obs;
+}
+
+// ---------------------------------------------------------------------------
+// ONNX inference
+// ---------------------------------------------------------------------------
+async function runPolicy(obs) {
+    const obsTensor = new ort.Tensor('float32', obs, [1, humanoidData.obs_dim]);
+    const latentTensor = new ort.Tensor('float32', latentVec, [1, humanoidData.latent_dim]);
+    const results = await onnxSession.run({ obs: obsTensor, latent: latentTensor });
+    return results.action.data;
+}
+
+// ---------------------------------------------------------------------------
+// Apply actions as PD drive targets
+// ---------------------------------------------------------------------------
+function applyActions(action) {
+    const axisEnums = [E_TWIST, E_SWING1, E_SWING2];
+    const bodyLinkMap = {};
+    for (const l of links) bodyLinkMap[l.name] = l.link;
+
+    for (let i = 0; i < humanoidData.dofInfo.length; i++) {
+        const dof = humanoidData.dofInfo[i];
+        const childLink = bodyLinkMap[dof.child_body];
+        if (!childLink) continue;
+        const joint = childLink.getInboundJoint();
+        joint.setDriveTarget(axisEnums[dof.physx_axis], action[i]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Random latent vector (unit sphere)
+// ---------------------------------------------------------------------------
+function randomLatent() {
+    latentVec = new Float32Array(humanoidData.latent_dim);
+    let norm = 0;
+    for (let i = 0; i < humanoidData.latent_dim; i++) {
+        latentVec[i] = gaussianRandom();
+        norm += latentVec[i] * latentVec[i];
+    }
+    norm = Math.sqrt(norm);
+    if (norm > 0) {
+        for (let i = 0; i < humanoidData.latent_dim; i++) latentVec[i] /= norm;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reset
+// ---------------------------------------------------------------------------
+function resetHumanoid() {
+    pxScene.removeArticulation(articulation);
+    // Rebuild mesh groups
+    for (const entry of links) {
+        if (entry.meshGroup) scene3d.remove(entry.meshGroup);
+    }
+    links = [];
+    buildArticulation();
+    // Recreate meshes
+    for (let bi = 0; bi < humanoidData.bodies.length; bi++) {
+        const body = humanoidData.bodies[bi];
+        const group = new THREE.Group();
+        const color = BODY_COLORS[body.name] || 0x888888;
+        for (const geom of body.geoms) {
+            const mat = new THREE.MeshStandardMaterial({ color, roughness: 0.6, metalness: 0.2 });
+            let mesh = null;
+            if (geom.type === 'sphere') {
+                mesh = new THREE.Mesh(new THREE.SphereGeometry(geom.radius, 16, 12), mat);
+                const lp = zup(geom.pos);
+                mesh.position.set(lp[0], lp[1], lp[2]);
+            } else if (geom.type === 'capsule' && geom.fromto) {
+                const ft = geom.fromto;
+                const p0 = new THREE.Vector3(...zup([ft[0],ft[1],ft[2]]));
+                const p1 = new THREE.Vector3(...zup([ft[3],ft[4],ft[5]]));
+                const dir = new THREE.Vector3().subVectors(p1, p0);
+                const len = dir.length();
+                mesh = new THREE.Mesh(new THREE.CapsuleGeometry(geom.radius, len, 8, 12), mat);
+                mesh.position.addVectors(p0, p1).multiplyScalar(0.5);
+                if (len > 0.001) mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0), dir.normalize());
+            } else if (geom.type === 'box') {
+                const he = geom.halfExtents;
+                mesh = new THREE.Mesh(new THREE.BoxGeometry(he[0]*2, he[2]*2, he[1]*2), mat);
+                const lp = zup(geom.pos);
+                mesh.position.set(lp[0], lp[1], lp[2]);
+            } else if (geom.type === 'cylinder') {
+                const r = geom.radius;
+                if (geom.fromto) {
+                    const ft = geom.fromto;
+                    const p0 = new THREE.Vector3(...zup([ft[0],ft[1],ft[2]]));
+                    const p1 = new THREE.Vector3(...zup([ft[3],ft[4],ft[5]]));
+                    const dir = new THREE.Vector3().subVectors(p1, p0);
+                    const len = Math.max(dir.length(), 0.01);
+                    mesh = new THREE.Mesh(new THREE.CylinderGeometry(r, r, len, 16), mat);
+                    mesh.position.addVectors(p0, p1).multiplyScalar(0.5);
+                    if (len > 0.001) mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0), dir.normalize());
+                } else {
+                    const hh = geom.halfHeight || 0.015;
+                    mesh = new THREE.Mesh(new THREE.CylinderGeometry(r, r, hh*2, 16), mat);
+                    const lp = zup(geom.pos || [0,0,0]);
+                    mesh.position.set(lp[0], lp[1], lp[2]);
+                }
+            }
+            if (mesh) { mesh.castShadow = true; group.add(mesh); }
+        }
+        scene3d.add(group);
+        links[bi].meshGroup = group;
+    }
+    randomLatent();
+}
+
+// ---------------------------------------------------------------------------
+// Main loop
+// ---------------------------------------------------------------------------
+let currentAction = null;
+let resetGraceFrames = 60;  // grace period after reset before checking fall
+const RESET_GRACE = 90;    // ~3 seconds of grace
+
+async function mainLoop(timestamp) {
+    if (!running) return;
+
+    frameCount++;
+    if (timestamp - lastFpsTime > 1000) {
+        document.getElementById('fpsDisplay').textContent = `FPS: ${frameCount}`;
+        frameCount = 0;
+        lastFpsTime = timestamp;
+    }
+
+    // Run policy
+    try {
+        const obs = buildObservation();
+        currentAction = await runPolicy(obs);
+        // Clamp actions to prevent extreme joint targets
+        for (let i = 0; i < currentAction.length; i++) {
+            currentAction[i] = Math.max(-1.5, Math.min(1.5, currentAction[i]));
+        }
+        applyActions(currentAction);
+    } catch (e) {
+        console.warn('Policy error:', e.message);
+        if (!currentAction) currentAction = new Float32Array(humanoidData.act_dim);
+    }
+
+    // Step physics
+    for (let i = 0; i < SUBSTEPS; i++) {
+        pxScene.simulate(DT);
+        pxScene.fetchResults(true);
+    }
+
+    // Auto-reset if physics explodes (NaN or extreme)
+    {
+        const rootPose = links[0].link.getGlobalPose();
+        const ry = rootPose.get_p().get_y();
+        if (resetGraceFrames > 0) {
+            resetGraceFrames--;
+        } else if (isNaN(ry) || Math.abs(ry) > 50) {
+            resetHumanoid();
+            resetGraceFrames = RESET_GRACE;
+        }
+    }
+
+    // Smoothly track camera to character root position
+    {
+        const rootPose = links[0].link.getGlobalPose();
+        const rp = rootPose.get_p();
+        const tx = rp.get_x(), ty = Math.max(rp.get_y(), 0.5), tz = rp.get_z();
+        controls.target.lerp(new THREE.Vector3(tx, ty, tz), 0.05);
+    }
+
+    updateMeshes();
+    controls.update();
+    renderer.render(scene3d, camera);
+    requestAnimationFrame(mainLoop);
+}
+
+// ---------------------------------------------------------------------------
+// Init
+// ---------------------------------------------------------------------------
+async function init() {
+    try {
+        await loadHumanoidData();
+        await Promise.all([loadOnnxModel(), initPhysX()]);
+
+        setStatus('Building humanoid...');
+        buildArticulation();
+
+        initThreeJS();
+        randomLatent();
+
+        document.getElementById('overlay').style.display = 'none';
+        document.getElementById('btnReset').addEventListener('click', resetHumanoid);
+        document.getElementById('btnNewLatent').addEventListener('click', randomLatent);
+
+        running = true;
+        lastFpsTime = performance.now();
+        requestAnimationFrame(mainLoop);
+        console.log('Demo running!');
+    } catch (err) {
+        setStatus('Error: ' + err.message);
+        console.error(err);
+    }
+}
+
+init();
+</script>
+</body>
+</html>
