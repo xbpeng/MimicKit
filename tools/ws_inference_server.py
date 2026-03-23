@@ -32,7 +32,7 @@ import websockets
 # ---------------------------------------------------------------------------
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CKPT_PATH = os.path.join(REPO_ROOT, "data/models/ase_humanoid_sword_shield_model.pt")
-ONNX_PATH = os.path.join(REPO_ROOT, "data/models/ase_humanoid_sword_shield_actor.onnx")
+ONNX_PATH = os.path.join(REPO_ROOT, "data/models/ase_humanoid_sword_shield_actor_internal.onnx")
 
 print(f"Loading checkpoint from {CKPT_PATH} ...")
 ckpt = torch.load(CKPT_PATH, map_location="cpu", weights_only=False)
