@@ -100,8 +100,8 @@ canvas { display: block; }
     <span id="dampingVal">1.0x</span>
 
     <div>Sim Substeps</div>
-    <input type="range" id="sliderSubsteps" min="1" max="16" step="1" value="8">
-    <span id="substepsVal">8</span>
+    <input type="range" id="sliderSubsteps" min="1" max="16" step="1" value="4">
+    <span id="substepsVal">4</span>
 
     <div>Time Scale</div>
     <input type="range" id="sliderTimeScale" min="0" max="2" step="0.1" value="1">
@@ -158,8 +158,8 @@ let E_FORCE;
 let E_CACHE_ALL;
 let SHAPE_FLAGS_VAL;
 
-let numSubsteps = 8;  // 8 substeps * 1/240s = 1/30s control rate (more stable than 4*1/120)
-const DT = 1 / 240;
+let numSubsteps = 4;
+const DT = 1 / 120;
 
 // Debug state
 const origDrives = [];  // [{joint, axisEnum, stiffness, damping, maxForce}]
@@ -170,6 +170,7 @@ let gravityEnabled = true;
 let stiffnessScale = 1.0;
 let dampingScale = 1.0;
 let timeScale = 1.0;
+let prevAction = null;  // For action smoothing
 
 // WebSocket inference state
 let ws = null;
@@ -315,8 +316,8 @@ function buildArticulation() {
     const rbext = PhysX.PxRigidBodyExt.prototype;
 
     articulation = physics.createArticulationReducedCoordinate();
-    // Higher solver iterations for CPU PhysX to better approximate GPU PhysX TGS
-    articulation.setSolverIterationCounts(32, 1);
+    // Match Isaac Lab default articulation solver iterations
+    articulation.setSolverIterationCounts(4, 1);
     // Disable self-collision between adjacent articulation links
     articulation.setArticulationFlag(
         PhysX.PxArticulationFlagEnum.eDISABLE_SELF_COLLISION, true
@@ -1232,9 +1233,16 @@ async function mainLoop(timestamp) {
                 console.log('ACTION range:', Math.min(...currentAction).toFixed(3), Math.max(...currentAction).toFixed(3));
                 console.log('LATENT[0:4]:', Array.from(latentVec).slice(0, 4).map(v => v.toFixed(3)).join(', '));
             }
-            // Clamp actions to per-DOF bounds from training env (joint limits * 1.2/1.4).
-            // The Python env._apply_action clips to _action_bound_low/high before set_cmd.
+            // Smooth actions with exponential moving average to reduce oscillation
+            // from CPU/GPU PhysX dynamics mismatch
             if (currentAction) {
+                const alpha = 0.5;  // smoothing factor (1.0 = no smoothing, 0.0 = full smoothing)
+                if (prevAction) {
+                    for (let i = 0; i < currentAction.length; i++) {
+                        currentAction[i] = alpha * currentAction[i] + (1 - alpha) * prevAction[i];
+                    }
+                }
+                prevAction = new Float32Array(currentAction);
                 applyActions(currentAction);  // applyActions clips to action_low/high
             }
         } catch (e) {
