@@ -484,6 +484,58 @@ function buildArticulation() {
 
     pxScene.addArticulation(articulation);
     console.log('Articulation built with', links.length, 'links,', articulation.getDofs(), 'DOFs');
+
+    // Apply init_pose from env config (combat-ready stance, not T-pose)
+    applyInitPose();
+}
+
+function applyInitPose() {
+    if (!humanoidData.init_root_pos || !humanoidData.init_dof_pos) return;
+
+    // Set root pose
+    const rp = humanoidData.init_root_pos;
+    const rq = humanoidData.init_root_rot_quat; // [x,y,z,w]
+    const rootPose = new PhysX.PxTransform(
+        new PhysX.PxVec3(rp[0], rp[1], rp[2]),
+        new PhysX.PxQuat(rq[0], rq[1], rq[2], rq[3])
+    );
+    // Use setRootGlobalPose (physx-js-webidl API)
+    articulation.setRootGlobalPose(rootPose, true);
+
+    // Set joint positions from init_dof_pos
+    const axisEnums = [E_TWIST, E_SWING1, E_SWING2];
+    const bodyLinkMap = {};
+    for (const l of links) bodyLinkMap[l.name] = l.link;
+
+    const initDof = humanoidData.init_dof_pos;
+    for (let i = 0; i < humanoidData.dofInfo.length; i++) {
+        const dof = humanoidData.dofInfo[i];
+        const childLink = bodyLinkMap[dof.child_body];
+        if (!childLink) continue;
+        try {
+            const joint = childLink.getInboundJoint();
+            joint.setJointPosition(axisEnums[dof.physx_axis], initDof[i]);
+        } catch(e) {}
+    }
+
+    // Also set drive targets to init pose (so drives hold this pose initially)
+    for (let i = 0; i < humanoidData.dofInfo.length; i++) {
+        const dof = humanoidData.dofInfo[i];
+        const childLink = bodyLinkMap[dof.child_body];
+        if (!childLink) continue;
+        try {
+            const joint = childLink.getInboundJoint();
+            joint.setDriveTarget(axisEnums[dof.physx_axis], initDof[i]);
+        } catch(e) {}
+    }
+
+    // Step physics once to propagate joint positions → body transforms (FK)
+    // This is needed because PhysX doesn't update body positions from joint
+    // positions until a simulation step runs.
+    pxScene.simulate(1/120);
+    pxScene.fetchResults(true);
+
+    console.log('Applied init_pose: root_z=' + rp[2] + ', dof_count=' + initDof.length);
 }
 
 // ---------------------------------------------------------------------------
