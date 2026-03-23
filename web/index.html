@@ -398,7 +398,35 @@ function buildArticulation() {
             }
         }
 
-        rbext.updateMassAndInertia(link, 1000);
+        // Compute average density for this body from its geom densities (weighted by volume)
+        // This matches how PhysX/MuJoCo compute mass from per-geom density
+        let totalVol = 0, totalMass = 0;
+        for (const geom of body.geoms) {
+            const d = geom.density || 1000;
+            let vol = 0;
+            if (geom.type === 'sphere') {
+                vol = (4/3) * Math.PI * geom.radius ** 3;
+            } else if (geom.type === 'capsule' && geom.fromto) {
+                const ft = geom.fromto;
+                const dx = ft[3]-ft[0], dy = ft[4]-ft[1], dz = ft[5]-ft[2];
+                const len = Math.sqrt(dx*dx + dy*dy + dz*dz);
+                vol = Math.PI * geom.radius ** 2 * len + (4/3) * Math.PI * geom.radius ** 3;
+            } else if (geom.type === 'box' && geom.halfExtents) {
+                const he = geom.halfExtents;
+                vol = 8 * he[0] * he[1] * he[2];
+            } else if (geom.type === 'cylinder') {
+                const r = geom.radius || 0.1;
+                const hh = geom.halfHeight || 0.015;
+                vol = Math.PI * r * r * 2 * hh;
+            }
+            if (vol > 0) { totalVol += vol; totalMass += d * vol; }
+        }
+        if (totalMass > 0 && totalVol > 0) {
+            const avgDensity = totalMass / totalVol;
+            rbext.updateMassAndInertia(link, avgDensity);
+        } else {
+            rbext.updateMassAndInertia(link, 1000);
+        }
 
         bodyLinkMap[body.name] = link;
         links.push({ name: body.name, link: link, meshGroup: null });
