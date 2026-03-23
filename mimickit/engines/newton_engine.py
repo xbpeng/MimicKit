@@ -408,7 +408,31 @@ class NewtonEngine(engine.Engine):
         self._solver.update_contacts(self._contacts, self._sim_state.raw_state)
         self._update_contact_sensors()
         self._sim_step_count += 1
+        self._log_diagnostics()
         return
+
+    def _log_diagnostics(self):
+        import torch as _t
+        step = self._sim_step_count
+        if step % self._sim_steps != 0:
+            return
+        ctrl = step // self._sim_steps
+        if ctrl % 10 != 0:
+            return
+        root_pos = self.get_root_pos(0)[0]
+        root_vel = self.get_root_vel(0)[0]
+        dof_pos  = self.get_dof_pos(0)[0]
+        dof_vel  = self.get_dof_vel(0)[0]
+        root_z     = float(root_pos[2])
+        root_speed = float(_t.norm(root_vel))
+        max_dof_vel = float(_t.max(_t.abs(dof_vel)))
+        dof_min    = float(_t.min(dof_pos))
+        dof_max    = float(_t.max(dof_pos))
+        print(
+            f"[NEWTON  ctrl={ctrl:5d}] root_z={root_z:.3f} spd={root_speed:.3f} "
+            f"max_dof_vel={max_dof_vel:.3f} dof_pos=[{dof_min:.2f},{dof_max:.2f}]",
+            flush=True
+        )
     
     def create_obj(self, env_id, obj_type, asset_file, name, is_visual=False, enable_self_collisions=True, 
                    fix_root=False, start_pos=None, start_rot=None, color=None, disable_motors=False):

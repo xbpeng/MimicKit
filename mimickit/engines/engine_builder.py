@@ -15,6 +15,12 @@ def build_engine(config, num_envs, device, visualize, record_video=False):
     elif (eng_name == "newton"):
         import engines.newton_engine as newton_engine
         engine = newton_engine.NewtonEngine(config, num_envs, device, visualize, record_video=record_video)
+    elif (eng_name == "warp"):
+        import engines.warp_engine as warp_engine
+        engine = warp_engine.WarpEngine(config, num_envs, device, visualize, record_video=record_video)
+    elif (eng_name == "ovphysx"):
+        import engines.ovphysx_engine as ovphysx_engine
+        engine = ovphysx_engine.OvPhysXEngine(config, num_envs, device, visualize, record_video=record_video)
     else:
         assert False, print("Unsupported engine: {:s}".format(eng_name))
 
