@@ -1235,16 +1235,7 @@ async function mainLoop(timestamp) {
                 console.log('ACTION range:', Math.min(...currentAction).toFixed(3), Math.max(...currentAction).toFixed(3));
                 console.log('LATENT[0:4]:', Array.from(latentVec).slice(0, 4).map(v => v.toFixed(3)).join(', '));
             }
-            // Smooth actions with exponential moving average to reduce oscillation
-            // from CPU/GPU PhysX dynamics mismatch
             if (currentAction) {
-                const alpha = 0.8;  // smoothing factor (1.0 = no smoothing, 0.0 = full smoothing)
-                if (prevAction) {
-                    for (let i = 0; i < currentAction.length; i++) {
-                        currentAction[i] = alpha * currentAction[i] + (1 - alpha) * prevAction[i];
-                    }
-                }
-                prevAction = new Float32Array(currentAction);
                 applyActions(currentAction);  // applyActions clips to action_low/high
             }
         } catch (e) {
