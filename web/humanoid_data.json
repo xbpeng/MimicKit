@@ -1159,7 +1159,7 @@
             -1.5708,
             1.5708
           ],
-          "armature": 0.003
+          "armature": 0.01
         },
         {
           "name": "right_hand_z",
@@ -1175,7 +1175,7 @@
             -1.5708,
             1.5708
           ],
-          "armature": 0.003
+          "armature": 0.01
         }
       ],
       "axisMap": [
