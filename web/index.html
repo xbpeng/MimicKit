@@ -872,46 +872,36 @@ function buildObservation() {
     obs[idx++] = localAngVel[1];
     obs[idx++] = localAngVel[2];
 
-    // [13..108] Joint rotations as tan_norm (16 non-root joints * 6 = 96)
-    // Must follow body traversal order (excluding root pelvis):
-    //   torso, head, right_upper_arm, right_lower_arm, right_hand, sword,
-    //   left_upper_arm, left_lower_arm, shield, left_hand, right_thigh,
-    //   right_shin, right_foot, left_thigh, left_shin, left_foot
-    // Build lookup map for actuated joints (fixed joints use identity quaternion)
-    const jointInfoMap = {};
-    for (const jinfo of humanoidData.joints) jointInfoMap[jinfo.child_body] = jinfo;
-
-    // Iterate in body order (skip root at index 0)
-    for (let bi = 1; bi < humanoidData.bodies.length; bi++) {
-        const bodyName = humanoidData.bodies[bi].name;
-        let jQuat = [0, 0, 0, 1]; // identity (used for fixed joints)
-
-        if (jointInfoMap[bodyName]) {
-            const jinfo = jointInfoMap[bodyName];
-            const childLink = bodyLinkMap[bodyName];
-            if (childLink) {
+    // [13..108] Joint rotations as tan_norm (16 joints x 6 = 96)
+    // Read all 31 DOF positions using dofInfo to match Python kinematic model order
+    const dofPositions = new Float32Array(31);
+    for (let i = 0; i < humanoidData.dofInfo.length; i++) {
+        const dof = humanoidData.dofInfo[i];
+        const childLink = bodyLinkMap[dof.child_body];
+        if (childLink) {
+            try {
                 const joint = childLink.getInboundJoint();
-                if (jinfo.jointType === 'spherical') {
-                    // Read twist, swing1, swing2 positions from PhysX
-                    const twist  = joint.getJointPosition(E_TWIST);
-                    const swing1 = joint.getJointPosition(E_SWING1);
-                    const swing2 = joint.getJointPosition(E_SWING2);
-                    // Compose rotation from individual axis rotations.
-                    // PhysX decomposition: twist around X, swing1 around Y, swing2 around Z.
-                    const qTwist  = axisAngleToQuat([1,0,0], twist);
-                    const qSwing1 = axisAngleToQuat([0,1,0], swing1);
-                    const qSwing2 = axisAngleToQuat([0,0,1], swing2);
-                    jQuat = quatMul(quatMul(qSwing2, qSwing1), qTwist);
-                } else if (jinfo.jointType === 'revolute') {
-                    const angle = joint.getJointPosition(E_TWIST);
-                    jQuat = axisAngleToQuat([1, 0, 0], angle);
-                }
-            }
+                dofPositions[i] = joint.getJointPosition(axisEnums[dof.physx_axis]);
+            } catch(e) { dofPositions[i] = 0; }
         }
-        // Fixed joints keep identity quaternion
+    }
 
-        const tn = quatToTanNorm(jQuat);
-        for (let i = 0; i < 6; i++) obs[idx++] = tn[i];
+    // Iterate kinematic joints (from humanoid_data.json) and convert to tan_norm
+    for (const kj of humanoidData.kinematicJoints) {
+        let quat;
+        if (kj.type === 'SPHERICAL') {
+            const ex = dofPositions[kj.dof_idx];
+            const ey = dofPositions[kj.dof_idx + 1];
+            const ez = dofPositions[kj.dof_idx + 2];
+            quat = expMapToQuat(ex, ey, ez);
+        } else if (kj.type === 'HINGE') {
+            const angle = dofPositions[kj.dof_idx];
+            quat = axisAngleToQuat(kj.axis, angle);  // axis is in Z-up coordinates
+        } else {  // FIXED
+            quat = [0, 0, 0, 1];  // identity
+        }
+        const tn = quatToTanNorm(quat);
+        for (let k = 0; k < 6; k++) obs[idx++] = tn[k];
     }
 
     // [109..139] DOF velocities (31)

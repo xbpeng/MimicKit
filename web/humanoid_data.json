@@ -2126,5 +2126,135 @@
     1.1519173383712769,
     1.1519173383712769,
     1.1519173383712769
+  ],
+  "kinematicJoints": [
+    {
+      "name": "abdomen",
+      "type": "SPHERICAL",
+      "dof_idx": 0,
+      "dof_dim": 3,
+      "axis": null
+    },
+    {
+      "name": "neck",
+      "type": "SPHERICAL",
+      "dof_idx": 3,
+      "dof_dim": 3,
+      "axis": null
+    },
+    {
+      "name": "right_shoulder",
+      "type": "SPHERICAL",
+      "dof_idx": 6,
+      "dof_dim": 3,
+      "axis": null
+    },
+    {
+      "name": "right_elbow",
+      "type": "HINGE",
+      "dof_idx": 9,
+      "dof_dim": 1,
+      "axis": [
+        0.0,
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "name": "right_hand",
+      "type": "SPHERICAL",
+      "dof_idx": 10,
+      "dof_dim": 3,
+      "axis": null
+    },
+    {
+      "name": "sword",
+      "type": "FIXED",
+      "dof_idx": 13,
+      "dof_dim": 0,
+      "axis": null
+    },
+    {
+      "name": "left_shoulder",
+      "type": "SPHERICAL",
+      "dof_idx": 13,
+      "dof_dim": 3,
+      "axis": null
+    },
+    {
+      "name": "left_elbow",
+      "type": "HINGE",
+      "dof_idx": 16,
+      "dof_dim": 1,
+      "axis": [
+        0.0,
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "name": "shield",
+      "type": "FIXED",
+      "dof_idx": 17,
+      "dof_dim": 0,
+      "axis": null
+    },
+    {
+      "name": "left_hand",
+      "type": "FIXED",
+      "dof_idx": 17,
+      "dof_dim": 0,
+      "axis": null
+    },
+    {
+      "name": "right_hip",
+      "type": "SPHERICAL",
+      "dof_idx": 17,
+      "dof_dim": 3,
+      "axis": null
+    },
+    {
+      "name": "right_knee",
+      "type": "HINGE",
+      "dof_idx": 20,
+      "dof_dim": 1,
+      "axis": [
+        0.0,
+        1.0,
+        0.0
+      ]
+    },
+    {
+      "name": "right_ankle",
+      "type": "SPHERICAL",
+      "dof_idx": 21,
+      "dof_dim": 3,
+      "axis": null
+    },
+    {
+      "name": "left_hip",
+      "type": "SPHERICAL",
+      "dof_idx": 24,
+      "dof_dim": 3,
+      "axis": null
+    },
+    {
+      "name": "left_knee",
+      "type": "HINGE",
+      "dof_idx": 27,
+      "dof_dim": 1,
+      "axis": [
+        0.0,
+        1.0,
+        0.0
+      ]
+    },
+    {
+      "name": "left_ankle",
+      "type": "SPHERICAL",
+      "dof_idx": 28,
+      "dof_dim": 3,
+      "axis": null
+    }
   ]
 }
