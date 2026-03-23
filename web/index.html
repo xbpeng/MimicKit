@@ -336,7 +336,7 @@ function buildArticulation() {
     if (typeof articulation.setStabilizationThreshold === 'function') {
         articulation.setStabilizationThreshold(1e-5);
     }
-    // Disable self-collision between adjacent articulation links
+    // Disable self-collision (matching env code: enable_self_collisions=False)
     articulation.setArticulationFlag(
         PhysX.PxArticulationFlagEnum.eDISABLE_SELF_COLLISION, true
     );
@@ -1681,9 +1681,10 @@ async function init() {
 
             // Load the full trace from Isaac Lab CPU
             console.log('=== AUDIT: Loading full trace from Isaac Lab CPU ===');
-            const traceResp = await fetch('./full_trace.json?' + Date.now());
+            const traceResp = await fetch('./detailed_trace.json?' + Date.now());
             const traceData = await traceResp.json();
-            const refStep = traceData.steps[0];
+            const refStep = traceData.steps[0].state_before;
+            const refObs0 = traceData.steps[0].obs;
             console.log('Reference state: root_z=' + refStep.root_pos[2].toFixed(4));
 
             // 1. Set the EXACT physical state from the trace
@@ -1741,7 +1742,7 @@ async function init() {
 
             // 3. Build observation in JS
             const webObs = buildObservation();
-            const refObs = refStep.obs;
+            const refObs = refObs0;
 
             // 4. Compare every observation dimension
             console.log('\n=== OBSERVATION COMPARISON (158 dims) ===');
@@ -1801,8 +1802,9 @@ async function init() {
                 ' (' + (maxObsIdx < obsLabels.length ? obsLabels[maxObsIdx] : '?') + ')');
 
             // 5. Run ONNX on both observations and compare actions
-            if (refStep.action) {
-                const refLatent = new Float32Array(refStep.latent);
+            const step0 = traceData.steps[0];
+            if (step0.action) {
+                const refLatent = new Float32Array(step0.latent);
                 const webObsTensor = new ort.Tensor('float32', webObs, [1, humanoidData.obs_dim]);
                 const refObsTensor = new ort.Tensor('float32', new Float32Array(refObs), [1, humanoidData.obs_dim]);
                 const latentTensor = new ort.Tensor('float32', refLatent, [1, humanoidData.latent_dim]);
@@ -1812,7 +1814,7 @@ async function init() {
 
                 const webAction = webResult.action.data;
                 const refAction = refResult.action.data;
-                const isaacAction = refStep.action;
+                const isaacAction = step0.action;
 
                 let maxActionDiff = 0;
                 console.log('\n=== ACTION COMPARISON ===');
@@ -1829,6 +1831,83 @@ async function init() {
                     }
                 }
                 console.log('Max action diff from obs mismatch: ' + maxActionDiff.toFixed(4));
+            }
+
+            // 6. Step-by-step replay: apply same actions as Isaac Lab and compare after each step
+            if (traceData.steps.length > 1 && traceData.steps[0].action) {
+                console.log('\n=== STEP-BY-STEP REPLAY (same actions, compare dynamics) ===');
+                for (let step = 0; step < traceData.steps.length; step++) {
+                    const ts = traceData.steps[step];
+                    if (!ts.action) break;
+
+                    // Read web state before step
+                    const webRP = links[0].link.getGlobalPose();
+                    const webRV = links[0].link.getLinearVelocity();
+                    const webRAV = links[0].link.getAngularVelocity();
+                    const webRootZ = webRP.get_p().get_z();
+
+                    // Read web DOF positions
+                    const webDof = [];
+                    for (let i = 0; i < humanoidData.dofInfo.length; i++) {
+                        const dof = humanoidData.dofInfo[i];
+                        const cl = bodyLinkMap[dof.child_body];
+                        try { webDof.push(cl.getInboundJoint().getJointPosition(axisEnums[dof.physx_axis])); }
+                        catch(e) { webDof.push(0); }
+                    }
+
+                    // Compute web observation
+                    const webStepObs = buildObservation();
+
+                    // Compare obs before step
+                    let maxObsDiff = 0, worstObsIdx = -1;
+                    for (let i = 0; i < Math.min(webStepObs.length, ts.obs.length); i++) {
+                        const d = Math.abs(webStepObs[i] - ts.obs[i]);
+                        if (d > maxObsDiff) { maxObsDiff = d; worstObsIdx = i; }
+                    }
+
+                    // Apply Isaac Lab's action
+                    const act = new Float32Array(ts.action);
+                    applyActions(act);
+
+                    // Step physics (4 substeps)
+                    for (let i = 0; i < 4; i++) {
+                        pxScene.simulate(DT);
+                        pxScene.fetchResults(true);
+                    }
+
+                    // Read web state after step
+                    const webRPa = links[0].link.getGlobalPose();
+                    const webRZa = webRPa.get_p().get_z();
+                    const webRVa = links[0].link.getLinearVelocity();
+
+                    // Compare with Isaac Lab after-step state
+                    const isaacAfter = ts.state_after;
+                    const rootZDiff = Math.abs(webRZa - isaacAfter.root_pos[2]);
+
+                    // DOF position comparison after step
+                    let maxDofDiff = 0, worstDofName = '';
+                    for (let i = 0; i < humanoidData.dofInfo.length; i++) {
+                        const dof = humanoidData.dofInfo[i];
+                        const cl = bodyLinkMap[dof.child_body];
+                        try {
+                            const webVal = cl.getInboundJoint().getJointPosition(axisEnums[dof.physx_axis]);
+                            const d = Math.abs(webVal - isaacAfter.dof_pos[i]);
+                            if (d > maxDofDiff) { maxDofDiff = d; worstDofName = dof.child_body + '/' + dof.axis_name; }
+                        } catch(e) {}
+                    }
+
+                    // Velocity comparison after step
+                    const webVelZ = webRVa.get_z();
+                    const isaacVelZ = isaacAfter.root_vel[2];
+                    const velZDiff = Math.abs(webVelZ - isaacVelZ);
+
+                    console.log('Step ' + step + ': ' +
+                        'rootZ web=' + webRZa.toFixed(4) + ' isaac=' + isaacAfter.root_pos[2].toFixed(4) + ' diff=' + rootZDiff.toFixed(4) +
+                        ' | velZ web=' + webVelZ.toFixed(3) + ' isaac=' + isaacVelZ.toFixed(3) + ' diff=' + velZDiff.toFixed(3) +
+                        ' | maxDof=' + maxDofDiff.toFixed(4) + ' (' + worstDofName + ')' +
+                        ' | obsErr=' + maxObsDiff.toFixed(4) + '@' + worstObsIdx);
+                }
+                console.log('=== STEP-BY-STEP REPLAY COMPLETE ===');
             }
 
             console.log('\n=== AUDIT COMPLETE ===');
