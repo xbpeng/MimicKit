@@ -911,6 +911,17 @@ function buildObservation() {
     // Compute heading inverse quaternion for local-frame transform
     const headingInv = calcHeadingQuatInv(rootRot);
 
+    // Debug: log actual up-vector direction periodically
+    if (!window._obsLogCount) window._obsLogCount = 0;
+    window._obsLogCount++;
+    if (window._obsLogCount % 60 === 1) {
+        const upVec = quatRotateVec(rootRot, [0, 0, 1]);
+        console.log('ROOT DEBUG: pos=' + rootPos.map(v=>v.toFixed(3)).join(',') +
+            ' quat=[' + rootRot.map(v=>v.toFixed(4)).join(',') + ']' +
+            ' upVec=[' + upVec.map(v=>v.toFixed(3)).join(',') + ']' +
+            ' heading=' + calcHeading(rootRot).toFixed(3));
+    }
+
     let idx = 0;
 
     // [0] Root height (Z coordinate in Z-up frame)
