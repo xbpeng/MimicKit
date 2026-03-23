@@ -492,22 +492,20 @@ function buildArticulation() {
 function applyInitPose() {
     if (!humanoidData.init_root_pos || !humanoidData.init_dof_pos) return;
 
-    // Set root pose
     const rp = humanoidData.init_root_pos;
     const rq = humanoidData.init_root_rot_quat; // [x,y,z,w]
-    const rootPose = new PhysX.PxTransform(
-        new PhysX.PxVec3(rp[0], rp[1], rp[2]),
-        new PhysX.PxQuat(rq[0], rq[1], rq[2], rq[3])
-    );
-    // Use setRootGlobalPose (physx-js-webidl API)
-    articulation.setRootGlobalPose(rootPose, true);
-
-    // Set joint positions from init_dof_pos
+    const initDof = humanoidData.init_dof_pos;
     const axisEnums = [E_TWIST, E_SWING1, E_SWING2];
     const bodyLinkMap = {};
     for (const l of links) bodyLinkMap[l.name] = l.link;
 
-    const initDof = humanoidData.init_dof_pos;
+    // Set root pose
+    articulation.setRootGlobalPose(new PhysX.PxTransform(
+        new PhysX.PxVec3(rp[0], rp[1], rp[2]),
+        new PhysX.PxQuat(rq[0], rq[1], rq[2], rq[3])
+    ), true);
+
+    // Set joint positions and velocities via the per-joint API
     for (let i = 0; i < humanoidData.dofInfo.length; i++) {
         const dof = humanoidData.dofInfo[i];
         const childLink = bodyLinkMap[dof.child_body];
@@ -515,27 +513,19 @@ function applyInitPose() {
         try {
             const joint = childLink.getInboundJoint();
             joint.setJointPosition(axisEnums[dof.physx_axis], initDof[i]);
-        } catch(e) {}
-    }
-
-    // Also set drive targets to init pose (so drives hold this pose initially)
-    for (let i = 0; i < humanoidData.dofInfo.length; i++) {
-        const dof = humanoidData.dofInfo[i];
-        const childLink = bodyLinkMap[dof.child_body];
-        if (!childLink) continue;
-        try {
-            const joint = childLink.getInboundJoint();
+            joint.setJointVelocity(axisEnums[dof.physx_axis], 0);
             joint.setDriveTarget(axisEnums[dof.physx_axis], initDof[i]);
         } catch(e) {}
     }
 
-    // Step physics once to propagate joint positions → body transforms (FK)
-    // This is needed because PhysX doesn't update body positions from joint
-    // positions until a simulation step runs.
-    pxScene.simulate(1/120);
-    pxScene.fetchResults(true);
+    // Use cache copy+apply to propagate joint positions to link transforms via FK.
+    // This replaces the old simulate() call which didn't propagate FK correctly.
+    const flags = new PhysX.PxArticulationCacheFlags(PhysX.PxArticulationCacheFlagEnum.eALL);
+    const cache = articulation.createCache();
+    articulation.copyInternalStateToCache(cache, flags);
+    articulation.applyCache(cache, flags, true);
 
-    console.log('Applied init_pose: root_z=' + rp[2] + ', dof_count=' + initDof.length);
+    console.log('Applied init_pose via cache FK: root_z=' + rp[2] + ', dofs=' + initDof.length);
 }
 
 // ---------------------------------------------------------------------------
@@ -919,7 +909,9 @@ function buildObservation() {
         }
     }
 
-    // Iterate kinematic joints (from humanoid_data.json) and convert to tan_norm
+    // Iterate kinematic joints and convert to tan_norm
+    // Also store quaternions for FK computation later
+    const jointRotQuats = [];
     for (const kj of humanoidData.kinematicJoints) {
         let quat;
         if (kj.type === 'SPHERICAL') {
@@ -933,6 +925,7 @@ function buildObservation() {
         } else {  // FIXED
             quat = [0, 0, 0, 1];  // identity
         }
+        jointRotQuats.push(quat);
         const tn = quatToTanNorm(quat);
         for (let k = 0; k < 6; k++) obs[idx++] = tn[k];
     }
@@ -948,25 +941,50 @@ function buildObservation() {
         } catch(e) { obs[idx++] = 0; }
     }
 
-    // [140..157] Key body positions relative to root, in heading frame (6 bodies * 3 = 18)
-    const keyBodies = ['head', 'right_hand', 'left_hand', 'right_foot', 'left_foot', 'sword'];
-    for (const bname of keyBodies) {
-        const entry = links.find(l => l.name === bname);
-        if (entry) {
-            const pose = entry.link.getGlobalPose();
-            const bp = pose.get_p();
-            // Already Z-up
-            const bodyPos = [bp.get_x(), bp.get_y(), bp.get_z()];
-            // Relative to root
-            const rel = [bodyPos[0] - rootPos[0], bodyPos[1] - rootPos[1], bodyPos[2] - rootPos[2]];
-            // Rotate to heading frame
+    // [140..157] Key body positions via JS-side forward kinematics
+    // (matches Python kin_char_model.forward_kinematics exactly)
+    if (humanoidData.fk_parent_indices && humanoidData.fk_local_translations) {
+        const numBodies = humanoidData.fk_parent_indices.length;
+        const fkPos = new Array(numBodies);
+        const fkRot = new Array(numBodies);
+
+        // Body 0 = root
+        fkPos[0] = rootPos;
+        fkRot[0] = rootRot;
+
+        // jointRotQuats was built during joint rotation section above
+        for (let j = 1; j < numBodies; j++) {
+            const jRot = jointRotQuats[j - 1];  // quaternion for this joint
+            const localTrans = humanoidData.fk_local_translations[j];
+            const localRot = humanoidData.fk_local_rotations[j];
+            const parentIdx = humanoidData.fk_parent_indices[j];
+
+            const parentPos = fkPos[parentIdx];
+            const parentRot = fkRot[parentIdx];
+
+            // worldTrans = quat_rotate(parentRot, localTrans)
+            const worldTrans = quatRotateVec(parentRot, localTrans);
+            fkPos[j] = [parentPos[0] + worldTrans[0], parentPos[1] + worldTrans[1], parentPos[2] + worldTrans[2]];
+
+            // currRot = quat_mul(localRot, jRot) then quat_mul(parentRot, that)
+            // Python: curr_rot = torch_util.quat_mul(local_rot, j_rot)
+            //         curr_rot = torch_util.quat_mul(parent_rot, curr_rot)
+            const localCombined = quatMul(localRot, jRot);
+            fkRot[j] = quatMul(parentRot, localCombined);
+        }
+
+        // Key body positions relative to root, in heading frame
+        const keyIds = humanoidData.key_body_ids || [2, 5, 10, 13, 16, 6];
+        for (const bid of keyIds) {
+            const bp = fkPos[bid];
+            const rel = [bp[0] - rootPos[0], bp[1] - rootPos[1], bp[2] - rootPos[2]];
             const localRel = quatRotateVec(headingInv, rel);
             obs[idx++] = localRel[0];
             obs[idx++] = localRel[1];
             obs[idx++] = localRel[2];
-        } else {
-            idx += 3;
         }
+    } else {
+        idx += 18;  // fallback: zeros
     }
 
     // No normalization here - the ONNX model handles it internally
@@ -1176,9 +1194,12 @@ async function mainLoop(timestamp) {
             if (!currentAction) currentAction = new Float32Array(humanoidData.act_dim);
         }
     } else {
-        // Rest pose: all targets to 0
-        const restAction = new Float32Array(humanoidData.act_dim);
-        applyActions(restAction);
+        // Drive to init_pose when policy is off (combat stance, not T-pose)
+        if (humanoidData.init_dof_pos) {
+            applyActions(new Float32Array(humanoidData.init_dof_pos));
+        } else {
+            applyActions(new Float32Array(humanoidData.act_dim));
+        }
     }
 
     // Step physics
