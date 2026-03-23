@@ -74,6 +74,7 @@ canvas { display: block; }
 <div id="controls">
     <button id="btnReset">Reset</button>
     <button id="btnNewLatent">New Skill (Random Latent)</button>
+    <button id="btnTestPose">Test Pose (raise right arm)</button>
     <span style="margin-left: 12px;">Orbit: drag | Zoom: scroll | Pan: right-drag</span>
 </div>
 
@@ -1090,6 +1091,11 @@ async function mainLoop(timestamp) {
             // One-time diagnostic log
             if (!window._policyLogCount) window._policyLogCount = 0;
             window._policyLogCount++;
+            if (window._policyLogCount === 1) {
+                // Dump full obs on first frame for Python comparison
+                console.log('FULL_OBS_JSON:' + JSON.stringify(Array.from(obs).map(v => Math.round(v * 10000) / 10000)));
+                console.log('FULL_LATENT_JSON:' + JSON.stringify(Array.from(latentVec).map(v => Math.round(v * 10000) / 10000)));
+            }
             if (window._policyLogCount <= 3 || window._policyLogCount % 60 === 0) {
                 const obsArr = Array.from(obs);
                 console.log('OBS[0:13]:', obsArr.slice(0, 13).map(v => v.toFixed(3)).join(', '));
@@ -1180,6 +1186,18 @@ async function init() {
         document.getElementById('overlay').style.display = 'none';
         document.getElementById('btnReset').addEventListener('click', resetHumanoid);
         document.getElementById('btnNewLatent').addEventListener('click', randomLatent);
+        document.getElementById('btnTestPose').addEventListener('click', () => {
+            // Disable policy and apply a known test pose
+            document.getElementById('chkPolicy').checked = false;
+            policyEnabled = false;
+            // Set right shoulder to raise arm: DOFs 6,7,8 = right_shoulder x,y,z
+            // A positive right_shoulder_y should abduct (raise) the arm
+            const testAction = new Float32Array(humanoidData.act_dim);
+            testAction[7] = 1.5;   // right_shoulder_y = 1.5 rad (raise arm)
+            testAction[13] = -1.5; // left_shoulder_y = -1.5 rad (raise other arm)
+            applyActions(testAction);
+            console.log('Test pose applied: right_shoulder_y=1.5, left_shoulder_y=-1.5');
+        });
 
         // Debug panel event listeners
         document.getElementById('chkDrives').addEventListener('change', (e) => {
