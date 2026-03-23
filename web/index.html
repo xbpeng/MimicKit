@@ -100,8 +100,8 @@ canvas { display: block; }
     <span id="dampingVal">1.0x</span>
 
     <div>Sim Substeps</div>
-    <input type="range" id="sliderSubsteps" min="1" max="16" step="1" value="4">
-    <span id="substepsVal">4</span>
+    <input type="range" id="sliderSubsteps" min="1" max="16" step="1" value="8">
+    <span id="substepsVal">8</span>
 
     <div>Time Scale</div>
     <input type="range" id="sliderTimeScale" min="0" max="2" step="0.1" value="1">
@@ -158,8 +158,8 @@ let E_FORCE;
 let E_CACHE_ALL;
 let SHAPE_FLAGS_VAL;
 
-let numSubsteps = 4;
-const DT = 1 / 120;
+let numSubsteps = 8;  // 8 substeps * 1/240s = 1/30s control rate (more stable than 4*1/120)
+const DT = 1 / 240;
 
 // Debug state
 const origDrives = [];  // [{joint, axisEnum, stiffness, damping, maxForce}]
@@ -215,7 +215,7 @@ function gaussianRandom() {
 // ---------------------------------------------------------------------------
 async function loadHumanoidData() {
     setStatus('Loading humanoid data...');
-    const resp = await fetch('./humanoid_data.json');
+    const resp = await fetch('./humanoid_data.json?v=' + Date.now());
     humanoidData = await resp.json();
     console.log('Humanoid data loaded:', humanoidData.bodies.length, 'bodies');
 }
@@ -315,9 +315,8 @@ function buildArticulation() {
     const rbext = PhysX.PxRigidBodyExt.prototype;
 
     articulation = physics.createArticulationReducedCoordinate();
-    // PhysX default articulation solver iterations: 4 position, 1 velocity
-    // Isaac Lab doesn't override this, so use defaults
-    articulation.setSolverIterationCounts(4, 1);
+    // Higher solver iterations for CPU PhysX to better approximate GPU PhysX TGS
+    articulation.setSolverIterationCounts(32, 1);
     // Disable self-collision between adjacent articulation links
     articulation.setArticulationFlag(
         PhysX.PxArticulationFlagEnum.eDISABLE_SELF_COLLISION, true
@@ -427,12 +426,12 @@ function buildArticulation() {
             rbext.updateMassAndInertia(link, 1000);
         }
 
-        // Match Isaac Lab rigid body properties (tuned for CPU PhysX stability)
-        link.setAngularDamping(0.05);  // Higher than Isaac Lab (0.01) to compensate CPU solver
+        // Match Isaac Lab rigid body properties
+        link.setAngularDamping(0.01);
         link.setLinearDamping(0.0);
-        link.setMaxDepenetrationVelocity(1.0);  // Much lower than Isaac Lab (10.0) for CPU stability
+        link.setMaxDepenetrationVelocity(10.0);
         link.setMaxLinearVelocity(1000.0);
-        link.setMaxAngularVelocity(64.0);  // Prevent rotational explosions
+        link.setMaxAngularVelocity(1000.0);
 
         bodyLinkMap[body.name] = link;
         links.push({ name: body.name, link: link, meshGroup: null });
@@ -1052,6 +1051,8 @@ function applyActions(action) {
     const aHigh = humanoidData.action_high;
 
     let appliedCount = 0;
+    let clippedMin = Infinity, clippedMax = -Infinity;
+    let rawMin = Infinity, rawMax = -Infinity;
     for (let i = 0; i < humanoidData.dofInfo.length; i++) {
         const dof = humanoidData.dofInfo[i];
         const childLink = bodyLinkMap[dof.child_body];
@@ -1061,9 +1062,13 @@ function applyActions(action) {
             if (!joint) continue;
             // Clip to action bounds
             let a = action[i];
+            rawMin = Math.min(rawMin, a);
+            rawMax = Math.max(rawMax, a);
             if (aLow && aHigh) {
                 a = Math.max(aLow[i], Math.min(aHigh[i], a));
             }
+            clippedMin = Math.min(clippedMin, a);
+            clippedMax = Math.max(clippedMax, a);
             joint.setDriveTarget(axisEnums[dof.physx_axis], a);
             appliedCount++;
         } catch(e) {
@@ -1073,9 +1078,14 @@ function applyActions(action) {
             }
         }
     }
-    if (!window._applyLogged) {
+    if (!window._applyLogged || window._applyLogCount < 5) {
+        if (!window._applyLogCount) window._applyLogCount = 0;
+        window._applyLogCount++;
         window._applyLogged = true;
-        console.log('applyActions: applied', appliedCount, '/', humanoidData.dofInfo.length, 'targets');
+        console.log('applyActions: applied', appliedCount, '/', humanoidData.dofInfo.length,
+            'raw=[' + rawMin.toFixed(3) + ',' + rawMax.toFixed(3) + ']',
+            'clipped=[' + clippedMin.toFixed(3) + ',' + clippedMax.toFixed(3) + ']',
+            'hasBounds=' + (!!aLow && !!aHigh));
         console.log('  dofInfo[0]:', JSON.stringify(humanoidData.dofInfo[0]));
         console.log('  action[0:5]:', Array.from(action).slice(0,5).map(v=>v.toFixed(3)));
         // Read back the first target to verify
