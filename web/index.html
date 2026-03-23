@@ -84,6 +84,7 @@ canvas { display: block; }
     <label><input type="checkbox" id="chkPolicy" checked> NN Policy</label>
     <label><input type="checkbox" id="chkSelfCollision"> Self-Collision</label>
     <label><input type="checkbox" id="chkGravity" checked> Gravity</label>
+    <label><input type="checkbox" id="chkWSInference"> WS Inference (localhost:8765)</label>
 
     <div class="separator"></div>
 
@@ -109,7 +110,8 @@ canvas { display: block; }
         root_z: --<br>
         root_speed: --<br>
         max_dof_vel: --<br>
-        tracking_err: --
+        tracking_err: --<br>
+        ws_max_diff: --
     </div>
 </div>
 
@@ -162,6 +164,12 @@ let gravityEnabled = true;
 let stiffnessScale = 1.0;
 let dampingScale = 1.0;
 let timeScale = 1.0;
+
+// WebSocket inference state
+let ws = null;
+let wsEnabled = false;
+let wsAction = null;
+let wsMaxDiff = null;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -539,11 +547,13 @@ function updateDebugInfo() {
             }
         } catch(e) { /* some joints may not support velocity query */ }
 
+        const wsInfo = wsMaxDiff !== null ? wsMaxDiff.toExponential(3) : '--';
         document.getElementById('debugInfo').innerHTML =
             `root_z: ${rootZ.toFixed(3)}<br>` +
             `root_speed: ${speed.toFixed(3)}<br>` +
             `max_dof_vel: ${maxDofVel.toFixed(1)}<br>` +
-            `links: ${links.length} / DOFs: ${articulation.getDofs()}`;
+            `links: ${links.length} / DOFs: ${articulation.getDofs()}<br>` +
+            `ws_max_diff: ${wsInfo}`;
     } catch(e) {
         // Silently skip if articulation not ready
     }
@@ -1061,7 +1071,22 @@ async function mainLoop(timestamp) {
     if (policyEnabled) {
         try {
             const obs = buildObservation();
-            currentAction = await runPolicy(obs);
+
+            // WebSocket inference mode: send obs+latent to server, use pytorch_action
+            if (wsEnabled && ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    obs: Array.from(obs),
+                    latent: Array.from(latentVec)
+                }));
+                // Use the latest action received from the server (if any)
+                if (wsAction) {
+                    currentAction = new Float32Array(wsAction);
+                }
+            } else {
+                // Local ONNX inference
+                currentAction = await runPolicy(obs);
+            }
+
             // One-time diagnostic log
             if (!window._policyLogCount) window._policyLogCount = 0;
             window._policyLogCount++;
@@ -1078,12 +1103,14 @@ async function mainLoop(timestamp) {
             // The ONNX model outputs unnormalized actions (already scaled by a_std + a_mean).
             // The Python code clamps to _action_bound_low/high which are derived from joint limits.
             // We use a_mean +/- 3*a_std as a reasonable safety bound.
-            for (let i = 0; i < currentAction.length; i++) {
-                const lo = humanoidData.a_mean[i] - 3.0 * humanoidData.a_std[i];
-                const hi = humanoidData.a_mean[i] + 3.0 * humanoidData.a_std[i];
-                currentAction[i] = Math.max(lo, Math.min(hi, currentAction[i]));
+            if (currentAction) {
+                for (let i = 0; i < currentAction.length; i++) {
+                    const lo = humanoidData.a_mean[i] - 3.0 * humanoidData.a_std[i];
+                    const hi = humanoidData.a_mean[i] + 3.0 * humanoidData.a_std[i];
+                    currentAction[i] = Math.max(lo, Math.min(hi, currentAction[i]));
+                }
+                applyActions(currentAction);
             }
-            applyActions(currentAction);
         } catch (e) {
             if (!window._policyErrCount) window._policyErrCount = 0;
             window._policyErrCount++;
@@ -1167,6 +1194,32 @@ async function init() {
         });
         document.getElementById('chkGravity').addEventListener('change', (e) => {
             setGravity(e.target.checked);
+        });
+        document.getElementById('chkWSInference').addEventListener('change', (e) => {
+            wsEnabled = e.target.checked;
+            if (wsEnabled && !ws) {
+                ws = new WebSocket('ws://localhost:8765');
+                ws.onopen = () => {
+                    console.log('WebSocket connected to localhost:8765');
+                };
+                ws.onmessage = (evt) => {
+                    const data = JSON.parse(evt.data);
+                    wsAction = data.pytorch_action;
+                    wsMaxDiff = data.max_diff;
+                    console.log('WS max_diff pytorch vs onnx:', data.max_diff);
+                };
+                ws.onerror = (err) => {
+                    console.error('WebSocket error:', err);
+                };
+                ws.onclose = () => {
+                    console.log('WebSocket disconnected');
+                    ws = null;
+                    wsAction = null;
+                };
+            }
+            if (!wsEnabled) {
+                wsMaxDiff = null;
+            }
         });
         document.getElementById('sliderStiffness').addEventListener('input', (e) => {
             stiffnessScale = parseFloat(e.target.value);

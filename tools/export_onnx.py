@@ -28,11 +28,11 @@ class ASEActorForExport(nn.Module):
 
         # --- Observation normalizer ---
         self.register_buffer("obs_mean", ckpt["_obs_norm._mean"])
-        self.register_buffer("obs_std",  ckpt["_obs_norm._std"].clamp(min=1e-5))
+        self.register_buffer("obs_std",  ckpt["_obs_norm._std"].clamp(min=1e-4))  # min_std=1e-4 from Normalizer
 
         # --- Action unnormalizer ---
         self.register_buffer("a_mean", ckpt["_a_norm._mean"])
-        self.register_buffer("a_std",  ckpt["_a_norm._std"].clamp(min=1e-5))
+        self.register_buffer("a_std",  ckpt["_a_norm._std"].clamp(min=1e-4))  # min_std=1e-4 from Normalizer
 
         # --- Actor network layers ---
         # Reconstruct the Sequential from state dict keys
@@ -65,8 +65,9 @@ class ASEActorForExport(nn.Module):
         self.mean_net.bias.data = mean_b
 
     def forward(self, raw_obs: torch.Tensor, latent: torch.Tensor) -> torch.Tensor:
-        # Normalize observation
+        # Normalize observation (with clamp matching the agent's normalizer)
         norm_obs = (raw_obs - self.obs_mean) / self.obs_std
+        norm_obs = torch.clamp(norm_obs, -10.0, 10.0)  # clip=10.0 from base_agent
 
         # Concatenate obs + latent
         x = torch.cat([norm_obs, latent], dim=-1)
