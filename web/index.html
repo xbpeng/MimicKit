@@ -267,7 +267,7 @@ async function initPhysX() {
 
     // Ground plane as a large static box
     const groundShapeFlags = new PhysX.PxShapeFlags(SHAPE_FLAGS_VAL);
-    const groundGeom = new PhysX.PxBoxGeometry(50, 0.5, 50);
+    const groundGeom = new PhysX.PxBoxGeometry(50, 50, 0.5)  // Z-up: thin in Z;
     const groundShape = physics.createShape(groundGeom, material, true, groundShapeFlags);
     // Ground: group 1, collides with group 1 and 2
     const groundFilterData = new PhysX.PxFilterData(1, 3, 0, 0);
