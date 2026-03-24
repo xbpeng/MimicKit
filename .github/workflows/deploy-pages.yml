@@ -2,7 +2,7 @@ name: Deploy Web Demo to GitHub Pages
 
 on:
   push:
-    branches: [ovphysx-engine]
+    branches: [main, ovphysx-engine]
     paths: ['web/**']
   workflow_dispatch:
 
