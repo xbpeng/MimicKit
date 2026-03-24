@@ -1906,7 +1906,99 @@ async function init() {
                 console.log('=== STEP-BY-STEP REPLAY COMPLETE ===');
             }
 
-            // 7. Pose test cases: set specific poses and compare obs + action
+            // 7. Random pose test: set fully random state with velocities
+            console.log('\n=== RANDOM POSE TEST ===');
+            const rpResp = await fetch('./random_pose_test.json?' + Date.now());
+            const rpData = await rpResp.json();
+            if (rpData && rpData.root_pos) {
+                // Set the exact state via per-joint API (NOT resetHumanoid)
+                const rpAxes = [E_TWIST, E_SWING1, E_SWING2];
+                const rpMap = {};
+                for (const l of links) rpMap[l.name] = l.link;
+
+                articulation.setRootGlobalPose(new PhysX.PxTransform(
+                    new PhysX.PxVec3(rpData.root_pos[0], rpData.root_pos[1], rpData.root_pos[2]),
+                    new PhysX.PxQuat(rpData.root_rot[0], rpData.root_rot[1], rpData.root_rot[2], rpData.root_rot[3])
+                ), true);
+                try {
+                    articulation.setRootLinearVelocity(new PhysX.PxVec3(rpData.root_vel[0], rpData.root_vel[1], rpData.root_vel[2]));
+                    articulation.setRootAngularVelocity(new PhysX.PxVec3(rpData.root_ang_vel[0], rpData.root_ang_vel[1], rpData.root_ang_vel[2]));
+                } catch(e) { console.log('setRootVelocity failed:', e.message); }
+
+                for (let i = 0; i < humanoidData.dofInfo.length; i++) {
+                    const dof = humanoidData.dofInfo[i];
+                    const cl = rpMap[dof.child_body];
+                    if (!cl) continue;
+                    try {
+                        const jnt = cl.getInboundJoint();
+                        jnt.setJointPosition(rpAxes[dof.physx_axis], rpData.dof_pos[i]);
+                        jnt.setJointVelocity(rpAxes[dof.physx_axis], rpData.dof_vel[i]);
+                    } catch(e) {}
+                }
+
+                // Propagate via cache
+                const rpFlags = new PhysX.PxArticulationCacheFlags(PhysX.PxArticulationCacheFlagEnum.eALL);
+                const rpCache = articulation.createCache();
+                articulation.copyInternalStateToCache(rpCache, rpFlags);
+                articulation.applyCache(rpCache, rpFlags, true);
+
+                // Build obs
+                const rpObs = buildObservation();
+                const rpRef = rpData.obs;
+
+                // Per-dim comparison
+                const rpLabels = ['h'];
+                for (let i = 0; i < 6; i++) rpLabels.push('rtn' + i);
+                for (let i = 0; i < 3; i++) rpLabels.push('rv' + i);
+                for (let i = 0; i < 3; i++) rpLabels.push('rav' + i);
+                for (let j = 0; j < 16; j++) for (let k = 0; k < 6; k++) rpLabels.push('j' + j + 't' + k);
+                for (let i = 0; i < 31; i++) rpLabels.push('dv' + i);
+                for (let i = 0; i < 18; i++) rpLabels.push('kp' + i);
+
+                const rpCats = [
+                    ['height', 0, 1],
+                    ['root_rot', 1, 7],
+                    ['root_vel', 7, 10],
+                    ['root_angvel', 10, 13],
+                    ['joint_rot', 13, 109],
+                    ['dof_vel', 109, 140],
+                    ['key_pos', 140, 158]
+                ];
+
+                let rpSummary = '';
+                const rpErrors = [];
+                for (const [name, lo, hi] of rpCats) {
+                    let maxE = 0, worstIdx = -1;
+                    for (let i = lo; i < hi; i++) {
+                        const d = Math.abs(rpObs[i] - rpRef[i]);
+                        if (d > maxE) { maxE = d; worstIdx = i; }
+                        if (d > 0.01) rpErrors.push({ idx: i, label: rpLabels[i] || ('d'+i), web: rpObs[i], ref: rpRef[i], err: d });
+                    }
+                    rpSummary += name + '=' + maxE.toFixed(4) + ' ';
+                }
+
+                console.log('RANDOM POSE per-category max err: ' + rpSummary);
+
+                // Top errors
+                rpErrors.sort((a, b) => b.err - a.err);
+                for (const e of rpErrors.slice(0, 15)) {
+                    console.log('  [' + e.idx + '] ' + e.label + ': web=' + e.web.toFixed(6) + ' ref=' + e.ref.toFixed(6) + ' err=' + e.err.toFixed(6));
+                }
+
+                // ONNX action comparison
+                const rpZL = new Float32Array(humanoidData.latent_dim);
+                const rpWR = await onnxSession.run({
+                    obs: new ort.Tensor('float32', rpObs, [1, humanoidData.obs_dim]),
+                    latent: new ort.Tensor('float32', rpZL, [1, humanoidData.latent_dim])
+                });
+                const rpWA = rpWR.action.data;
+                let rpMaxAE = 0;
+                for (let i = 0; i < rpWA.length; i++) rpMaxAE = Math.max(rpMaxAE, Math.abs(rpWA[i] - rpData.action[i]));
+                console.log('RANDOM POSE action max err: ' + rpMaxAE.toFixed(6));
+                console.log('=== RANDOM POSE TEST COMPLETE ===');
+            }
+
+            // 8. Pose test cases: set specific poses and compare obs + action
             console.log('\n=== POSE TEST CASES ===');
             const ptResp = await fetch('./pose_tests.json?' + Date.now());
             const ptData = await ptResp.json();
