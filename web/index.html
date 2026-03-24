@@ -1035,20 +1035,46 @@ function buildObservation() {
         } catch(e) { obs[idx++] = 0; }
     }
 
-    // [140..157] Key body positions from PhysX link global poses
-    // (Python uses engine.get_body_pos, NOT kin_char_model FK)
-    {
+    // [140..157] Key body positions via JS-side forward kinematics
+    // (Python uses kin_char_model.forward_kinematics via get_body_pos)
+    if (humanoidData.fk_parent_indices && humanoidData.fk_local_translations) {
+        const numBodies = humanoidData.fk_parent_indices.length;
+        const fkPos = new Array(numBodies);
+        const fkRot = new Array(numBodies);
+
+        // Body 0 = root
+        fkPos[0] = rootPos;
+        fkRot[0] = rootRot;
+
+        // jointRotQuats was built during joint rotation section above
+        for (let j = 1; j < numBodies; j++) {
+            const jRot = jointRotQuats[j - 1];
+            const localTrans = humanoidData.fk_local_translations[j];
+            const localRot = humanoidData.fk_local_rotations[j];
+            const parentIdx = humanoidData.fk_parent_indices[j];
+
+            const parentPos = fkPos[parentIdx];
+            const parentRot = fkRot[parentIdx];
+
+            const worldTrans = quatRotateVec(parentRot, localTrans);
+            fkPos[j] = [parentPos[0] + worldTrans[0], parentPos[1] + worldTrans[1], parentPos[2] + worldTrans[2]];
+
+            const localCombined = quatMul(localRot, jRot);
+            fkRot[j] = quatMul(parentRot, localCombined);
+        }
+
+        // Key body positions relative to root, in heading frame
         const keyIds = humanoidData.key_body_ids || [2, 5, 10, 13, 16, 6];
         for (const bid of keyIds) {
-            const linkPose = links[bid].link.getGlobalPose();
-            const lp = linkPose.get_p();
-            const bp = [lp.get_x(), lp.get_y(), lp.get_z()];
+            const bp = fkPos[bid];
             const rel = [bp[0] - rootPos[0], bp[1] - rootPos[1], bp[2] - rootPos[2]];
             const localRel = quatRotateVec(headingInv, rel);
             obs[idx++] = localRel[0];
             obs[idx++] = localRel[1];
             obs[idx++] = localRel[2];
         }
+    } else {
+        idx += 18;
     }
 
     // No normalization here - the ONNX model handles it internally
@@ -1880,7 +1906,85 @@ async function init() {
                 console.log('=== STEP-BY-STEP REPLAY COMPLETE ===');
             }
 
-            // 7. Closed-loop comparison: run ONNX from init_pose, compare step by step
+            // 7. Pose test cases: set specific poses and compare obs + action
+            console.log('\n=== POSE TEST CASES ===');
+            const ptResp = await fetch('./pose_tests.json?' + Date.now());
+            const ptData = await ptResp.json();
+            if (ptData && ptData.test_cases) {
+                const axisE = [E_TWIST, E_SWING1, E_SWING2];
+                for (const tc of ptData.test_cases) {
+                    // Reset and set pose
+                    resetHumanoid();
+                    const blm = {};
+                    for (const l of links) blm[l.name] = l.link;
+
+                    // Set root pose
+                    articulation.setRootGlobalPose(new PhysX.PxTransform(
+                        new PhysX.PxVec3(tc.root_pos[0], tc.root_pos[1], tc.root_pos[2]),
+                        new PhysX.PxQuat(tc.root_rot[0], tc.root_rot[1], tc.root_rot[2], tc.root_rot[3])
+                    ), true);
+                    // Zero velocities
+                    articulation.setRootLinearVelocity(new PhysX.PxVec3(0, 0, 0));
+                    articulation.setRootAngularVelocity(new PhysX.PxVec3(0, 0, 0));
+                    // Set DOF positions
+                    for (let i = 0; i < humanoidData.dofInfo.length; i++) {
+                        const dof = humanoidData.dofInfo[i];
+                        const cl = blm[dof.child_body];
+                        if (cl) {
+                            try {
+                                cl.getInboundJoint().setJointPosition(axisE[dof.physx_axis], tc.dof_pos[i]);
+                                cl.getInboundJoint().setJointVelocity(axisE[dof.physx_axis], 0);
+                            } catch(e) {}
+                        }
+                    }
+                    // Propagate FK
+                    const fl = new PhysX.PxArticulationCacheFlags(PhysX.PxArticulationCacheFlagEnum.eALL);
+                    const ca = articulation.createCache();
+                    articulation.copyInternalStateToCache(ca, fl);
+                    articulation.applyCache(ca, fl, true);
+
+                    // Build obs
+                    const webObs = buildObservation();
+                    const refObs = tc.obs;
+
+                    // Compare per-category
+                    const cats = [
+                        ['height', 0, 1],
+                        ['rot_tn', 1, 7],
+                        ['vel', 7, 10],
+                        ['angvel', 10, 13],
+                        ['jrot', 13, 109],
+                        ['dofvel', 109, 140],
+                        ['keypos', 140, 158]
+                    ];
+                    let summary = tc.name + ': ';
+                    for (const [name, lo, hi] of cats) {
+                        let maxE = 0;
+                        for (let i = lo; i < hi; i++) {
+                            maxE = Math.max(maxE, Math.abs(webObs[i] - refObs[i]));
+                        }
+                        if (maxE > 0.01) summary += name + '=' + maxE.toFixed(3) + ' ';
+                    }
+
+                    // Run ONNX
+                    const zl = new Float32Array(humanoidData.latent_dim);
+                    const webR = await onnxSession.run({
+                        obs: new ort.Tensor('float32', webObs, [1, humanoidData.obs_dim]),
+                        latent: new ort.Tensor('float32', zl, [1, humanoidData.latent_dim])
+                    });
+                    const webAct = webR.action.data;
+                    let maxAE = 0;
+                    for (let i = 0; i < webAct.length; i++) {
+                        maxAE = Math.max(maxAE, Math.abs(webAct[i] - tc.action[i]));
+                    }
+                    summary += '| actErr=' + maxAE.toFixed(4);
+
+                    console.log('POSE ' + summary);
+                }
+                console.log('=== POSE TESTS COMPLETE ===');
+            }
+
+            // 8. Closed-loop comparison: run ONNX from init_pose, compare step by step
             console.log('\n=== CLOSED-LOOP COMPARISON ===');
             const clResp = await fetch('./closedloop_trace.json?' + Date.now());
             const clTrace = await clResp.json();
