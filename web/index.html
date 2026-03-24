@@ -1545,6 +1545,8 @@ async function init() {
         document.getElementById('overlay').style.display = 'none';
         document.getElementById('btnReset').addEventListener('click', resetHumanoid);
         document.getElementById('btnNewLatent').addEventListener('click', randomLatent);
+        // NOTE: Debug button handlers below are dead code (buttons removed from UI).
+        // They're guarded with ?. and never execute. Clean up in a future PR.
         document.getElementById('btnTestPose')?.addEventListener('click', () => {
             // Disable policy and apply a known test pose
             document.getElementById('chkPolicy').checked = false;
