@@ -214,7 +214,10 @@ async function loadHumanoidData() {
     // Try MJCF + ONNX metadata first, fall back to humanoid_data.json
     let mjcfParsed = null;
     try {
-        const xmlResp = await fetch('./humanoid_sword_shield.xml');
+        // Try same-directory first (GitHub Pages deploys MJCF into web/),
+        // then repo-relative (local dev: python -m http.server from repo root)
+        let xmlResp = await fetch('./humanoid_sword_shield.xml');
+        if (!xmlResp.ok) xmlResp = await fetch('../data/assets/sword_shield/humanoid_sword_shield.xml');
         if (xmlResp.ok) {
             const xmlText = await xmlResp.text();
             mjcfParsed = parseMJCF(xmlText);
