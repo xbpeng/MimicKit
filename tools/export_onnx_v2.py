@@ -203,30 +203,45 @@ def main():
         meta['action_low'] = agent._action_low.cpu().numpy().tolist()
         meta['action_high'] = agent._action_high.cpu().numpy().tolist()
 
-    # Init pose from env
-    try:
-        init_dof = env._init_dof_pos[0].cpu().numpy().tolist() if hasattr(env, '_init_dof_pos') else None
-        init_root_pos = env._init_root_pos[0].cpu().numpy().tolist() if hasattr(env, '_init_root_pos') else None
-        init_root_rot = env._init_root_rot[0].cpu().numpy().tolist() if hasattr(env, '_init_root_rot') else None
-        if init_dof: meta['init_dof_pos'] = init_dof
-        if init_root_pos: meta['init_root_pos'] = init_root_pos
-        if init_root_rot: meta['init_root_rot_quat'] = init_root_rot  # xyzw
-    except Exception as e:
-        print(f"  Could not extract init pose: {e}")
+    # Init pose and env config — try env attributes, fall back to existing JSON
+    json_fallback = {}
+    json_path = os.path.join(os.path.dirname(args.output), 'humanoid_data.json')
+    if os.path.isfile(json_path):
+        import json as _json
+        json_fallback = _json.load(open(json_path))
+        print(f"  Loaded JSON fallback from {json_path}")
 
-    # Key body IDs and settings from env
-    try:
-        if hasattr(env, '_key_body_ids'):
-            meta['key_body_ids'] = env._key_body_ids.cpu().numpy().tolist()
-        meta['global_obs'] = bool(getattr(env, '_global_obs', False))
-        meta['pelvis_z'] = float(getattr(env, '_pelvis_z', 0.703))
-        meta['tpose_pelvis_z'] = float(getattr(env, '_tpose_pelvis_z', 0.903))
-    except Exception as e:
-        print(f"  Could not extract env config: {e}")
+    def _try_tensor(obj, attr, idx=0):
+        """Extract a list from a tensor attribute, handling 1D and 2D tensors."""
+        t = getattr(obj, attr, None)
+        if t is None: return None
+        t = t.cpu()
+        if t.dim() > 1: t = t[idx]
+        return t.numpy().flatten().tolist()
 
-    # MJCF path (relative)
-    if hasattr(env, '_char_file'):
-        meta['mjcf_file'] = env._char_file
+    # Init pose
+    init_dof = _try_tensor(env, '_init_dof_pos') or json_fallback.get('init_dof_pos')
+    init_root_pos = _try_tensor(env, '_init_root_pos') or json_fallback.get('init_root_pos')
+    init_root_rot = _try_tensor(env, '_init_root_rot') or json_fallback.get('init_root_rot_quat')
+    if init_dof and isinstance(init_dof, list) and len(init_dof) > 1:
+        meta['init_dof_pos'] = init_dof
+    if init_root_pos and isinstance(init_root_pos, list) and len(init_root_pos) == 3:
+        meta['init_root_pos'] = init_root_pos
+    if init_root_rot and isinstance(init_root_rot, list) and len(init_root_rot) == 4:
+        meta['init_root_rot_quat'] = init_root_rot
+
+    # Action bounds
+    action_low = _try_tensor(agent, '_action_low') or json_fallback.get('action_low')
+    action_high = _try_tensor(agent, '_action_high') or json_fallback.get('action_high')
+    if action_low: meta['action_low'] = action_low
+    if action_high: meta['action_high'] = action_high
+
+    # Key body IDs and settings
+    key_ids = _try_tensor(env, '_key_body_ids') or json_fallback.get('key_body_ids')
+    if key_ids: meta['key_body_ids'] = [int(x) for x in key_ids]
+    meta['global_obs'] = bool(getattr(env, '_global_obs', json_fallback.get('global_obs', False)))
+    meta['pelvis_z'] = float(getattr(env, '_pelvis_z', json_fallback.get('pelvis_z', 0.703)))
+    meta['tpose_pelvis_z'] = float(getattr(env, '_tpose_pelvis_z', json_fallback.get('tpose_pelvis_z', 0.903)))
 
     # Write metadata as JSON string key-value pairs
     import json
