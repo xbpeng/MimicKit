@@ -78,6 +78,7 @@ canvas { display: block; }
     <button id="btnDiag">Run Diagnostic</button>
     <button id="btnReplay">Replay Newton Trace</button>
     <button id="btnAudit">Audit Obs vs Isaac Lab</button>
+    <button id="btnPlayTrace">Playback Isaac Lab Trace</button>
     <span style="margin-left: 12px;">Orbit: drag | Zoom: scroll | Pan: right-drag</span>
 </div>
 
@@ -92,21 +93,13 @@ canvas { display: block; }
 
     <div class="separator"></div>
 
-    <div>Drive Stiffness Scale</div>
-    <input type="range" id="sliderStiffness" min="0" max="3" step="0.1" value="1">
-    <span id="stiffnessVal">1.0x</span>
+    <div>Gravity</div>
+    <input type="range" id="sliderGravity" min="-20" max="0" step="0.1" value="-9.81">
+    <span id="gravityVal">-9.81</span>
 
-    <div>Drive Damping Scale</div>
-    <input type="range" id="sliderDamping" min="0" max="5" step="0.1" value="1">
-    <span id="dampingVal">1.0x</span>
-
-    <div>Sim Substeps</div>
+    <div>Substeps</div>
     <input type="range" id="sliderSubsteps" min="1" max="16" step="1" value="4">
     <span id="substepsVal">4</span>
-
-    <div>Time Scale</div>
-    <input type="range" id="sliderTimeScale" min="0" max="2" step="0.1" value="1">
-    <span id="timeScaleVal">1.0x</span>
 
     <div class="separator"></div>
 
@@ -158,6 +151,8 @@ let E_SPHERICAL, E_REVOLUTE, E_FIX;
 let E_FORCE;
 let E_CACHE_ALL;
 let SHAPE_FLAGS_VAL;
+let groundActor;  // ground plane actor (removable for state-setting)
+let groundRemoved = false;
 
 let numSubsteps = 4;
 const DT = 1 / 120;
@@ -168,7 +163,7 @@ let drivesEnabled = true;
 let policyEnabled = true;
 let selfCollisionEnabled = false;
 let gravityEnabled = true;
-let stiffnessScale = 1.0;
+let stiffnessScale = 1.0;  // kept for applyDriveParams compatibility
 let dampingScale = 1.0;
 let timeScale = 1.0;
 let prevAction = null;  // For action smoothing
@@ -220,6 +215,22 @@ async function loadHumanoidData() {
     const resp = await fetch('./humanoid_data.json?v=' + Date.now());
     humanoidData = await resp.json();
     console.log('Humanoid data loaded:', humanoidData.bodies.length, 'bodies');
+
+    // FIX: Swap SWING1 ↔ SWING2 axis mapping for spherical joints.
+    // PhysX WASM's spherical joint resolves DOFs with swing axes swapped
+    // relative to the convention used by Isaac Lab / MimicKit's export.
+    // This affects setJointPosition, getJointPosition, setDriveTarget, etc.
+    for (const dof of humanoidData.dofInfo) {
+        if (dof.physx_axis === 1) dof.physx_axis = 2;       // SWING1 → SWING2
+        else if (dof.physx_axis === 2) dof.physx_axis = 1;  // SWING2 → SWING1
+    }
+
+    // Also fix the joint axisMap entries
+    for (const jdata of humanoidData.joints) {
+        if (jdata.jointType === 'spherical' && jdata.axisMap) {
+            jdata.axisMap = jdata.axisMap.map(a => a === 1 ? 2 : a === 2 ? 1 : a);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -310,9 +321,11 @@ async function initPhysX() {
         new PhysX.PxVec3(0, 0, -0.5),  // top surface at z=0
         new PhysX.PxQuat(0, 0, 0, 1)
     );
-    const groundActor = physics.createRigidStatic(groundPose);
+    groundActor = physics.createRigidStatic(groundPose);
     groundActor.attachShape(groundShape);
+    // Add ground to scene
     pxScene.addActor(groundActor);
+    groundRemoved = false;
 
     console.log('PhysX scene created');
 }
@@ -327,8 +340,10 @@ function buildArticulation() {
     const rbext = PhysX.PxRigidBodyExt.prototype;
 
     articulation = physics.createArticulationReducedCoordinate();
-    // Match Isaac Lab: articulation solver iterations = 32 position, 1 velocity
-    articulation.setSolverIterationCounts(32, 1);
+    // Isaac Lab: USD articulation=32/1, but scene maxPositionIterationCount=4 caps it
+    // The effective iterations in Isaac Lab are 4/0
+    // PhysX WASM has no scene cap, so we set the effective value directly
+    articulation.setSolverIterationCounts(4, 0);
     // Match Isaac Lab: sleep threshold and stabilization threshold
     if (typeof articulation.setSleepThreshold === 'function') {
         articulation.setSleepThreshold(5e-5);
@@ -346,7 +361,8 @@ function buildArticulation() {
 
     for (const body of humanoidData.bodies) {
         const wp = body.pos;  // already Z-up from MJCF
-        const zOff = humanoidData.pelvis_z;
+        // Use T-pose height so feet don't penetrate ground during articulation construction
+        const zOff = humanoidData.tpose_pelvis_z || humanoidData.pelvis_z;
         const pose = new PhysX.PxTransform(
             new PhysX.PxVec3(wp[0], wp[1], wp[2] + zOff),
             new PhysX.PxQuat(0, 0, 0, 1)
@@ -451,9 +467,10 @@ function buildArticulation() {
         link.setMaxDepenetrationVelocity(10.0);
         link.setMaxLinearVelocity(1000.0);
         link.setMaxAngularVelocity(1000.0);
-        // Per-body solver iterations (Isaac Lab: 16 pos, 1 vel)
+        // Per-body solver iterations - scene caps at 4/0, so setting higher is no-op in Isaac Lab
+        // Match effective iterations: 4 position, 0 velocity
         if (typeof link.setSolverIterationCounts === 'function') {
-            link.setSolverIterationCounts(16, 1);
+            link.setSolverIterationCounts(4, 0);
         }
         // Sleep threshold (Isaac Lab: 5e-5)
         if (typeof link.setSleepThreshold === 'function') {
@@ -565,11 +582,15 @@ function buildArticulation() {
         ));
     }
 
+    // Remove ground before adding articulation so init pose doesn't collide
+    removeGround();
     pxScene.addArticulation(articulation);
     console.log('Articulation built with', links.length, 'links,', articulation.getDofs(), 'DOFs');
 
     // Apply init_pose from env config (combat-ready stance, not T-pose)
     applyInitPose();
+
+    scheduleGroundRestore();
 }
 
 function applyInitPose() {
@@ -578,37 +599,135 @@ function applyInitPose() {
     const rp = humanoidData.init_root_pos;
     const rq = humanoidData.init_root_rot_quat; // [x,y,z,w]
     const initDof = humanoidData.init_dof_pos;
+
+    // Use FK-based state injection to get correct link positions
+    injectStateViaFK(rp, rq, initDof, null);
+
+    // Also set drive targets to init pose
     const axisEnums = [E_TWIST, E_SWING1, E_SWING2];
     const bodyLinkMap = {};
     for (const l of links) bodyLinkMap[l.name] = l.link;
+    for (let i = 0; i < humanoidData.dofInfo.length; i++) {
+        const dof = humanoidData.dofInfo[i];
+        const childLink = bodyLinkMap[dof.child_body];
+        if (!childLink) continue;
+        try {
+            childLink.getInboundJoint().setDriveTarget(axisEnums[dof.physx_axis], initDof[i]);
+        } catch(e) {}
+    }
 
-    // Set root pose
+    console.log('Applied init_pose via cache FK: root_z=' + rp[2] + ', dofs=' + initDof.length);
+}
+
+// ---------------------------------------------------------------------------
+// Ground collision control — remove ground during state-setting to prevent
+// applyCache from resolving ground collisions (which distorts leg positions)
+// ---------------------------------------------------------------------------
+// groundRemoved is set in initPhysX()
+function removeGround() { if (groundActor && !groundRemoved) { pxScene.removeActor(groundActor); groundRemoved = true; } }
+function restoreGround() { if (groundActor && groundRemoved) { pxScene.addActor(groundActor); groundRemoved = false; } }
+// Schedule ground restore after next sim step
+let restoreGroundAfterStep = false;
+function scheduleGroundRestore() { restoreGroundAfterStep = true; }
+
+// Apply cache with ground temporarily removed.
+// Uses ePOSITION | eROOT_TRANSFORM | eVELOCITY (NOT eALL) so that PhysX
+// recomputes link world positions via FK from DOF values, rather than
+// restoring old link transforms from the cache (which eALL would do).
+function applyCacheNoGround() {
+    const flagVal = PhysX.PxArticulationCacheFlagEnum.ePOSITION |
+                    PhysX.PxArticulationCacheFlagEnum.eROOT_TRANSFORM |
+                    PhysX.PxArticulationCacheFlagEnum.eVELOCITY;
+    const flags = new PhysX.PxArticulationCacheFlags(flagVal);
+    const cache = articulation.createCache();
+    articulation.copyInternalStateToCache(cache, flags);
+    removeGround();
+    articulation.applyCache(cache, flags, true);
+    restoreGround();
+}
+
+// ---------------------------------------------------------------------------
+// FK-based state injection: compute correct link world transforms from DOF
+// values using JS expmap FK, then inject into PhysX via cache.
+// This bypasses PhysX WASM's internal DOF→rotation resolution which uses a
+// different convention than MimicKit's expmap representation.
+// ---------------------------------------------------------------------------
+function injectStateViaFK(rootPos, rootRot, dofPos, dofVel) {
+    const axisEnums = [E_TWIST, E_SWING1, E_SWING2];
+
+    // 1. Compute joint rotations from DOF values using expmap (MimicKit convention)
+    const jointRotQuats = [];
+    for (const kj of humanoidData.kinematicJoints) {
+        let quat;
+        if (kj.type === 'SPHERICAL') {
+            quat = expMapToQuat(dofPos[kj.dof_idx], dofPos[kj.dof_idx+1], dofPos[kj.dof_idx+2]);
+        } else if (kj.type === 'HINGE') {
+            quat = axisAngleToQuat(kj.axis, dofPos[kj.dof_idx]);
+        } else {
+            quat = [0, 0, 0, 1];
+        }
+        jointRotQuats.push(quat);
+    }
+
+    // 2. Compute FK to get world-space body poses
+    const numBodies = humanoidData.fk_parent_indices.length;
+    const fkPos = new Array(numBodies);
+    const fkRot = new Array(numBodies);
+    fkPos[0] = rootPos;
+    fkRot[0] = rootRot;
+
+    for (let j = 1; j < numBodies; j++) {
+        const jRot = jointRotQuats[j - 1];
+        const localTrans = humanoidData.fk_local_translations[j];
+        const localRot = humanoidData.fk_local_rotations[j];
+        const parentIdx = humanoidData.fk_parent_indices[j];
+        const parentPos = fkPos[parentIdx];
+        const parentRot = fkRot[parentIdx];
+        const worldTrans = quatRotateVec(parentRot, localTrans);
+        fkPos[j] = [parentPos[0]+worldTrans[0], parentPos[1]+worldTrans[1], parentPos[2]+worldTrans[2]];
+        const localCombined = quatMul(localRot, jRot);
+        fkRot[j] = quatMul(parentRot, localCombined);
+    }
+
+    // 3. Set root pose
     articulation.setRootGlobalPose(new PhysX.PxTransform(
-        new PhysX.PxVec3(rp[0], rp[1], rp[2]),
-        new PhysX.PxQuat(rq[0], rq[1], rq[2], rq[3])
+        new PhysX.PxVec3(rootPos[0], rootPos[1], rootPos[2]),
+        new PhysX.PxQuat(rootRot[0], rootRot[1], rootRot[2], rootRot[3])
     ), true);
 
-    // Set joint positions and velocities via the per-joint API
+    // 4. Set DOF positions and velocities via per-joint API
+    const bodyLinkMap = {};
+    for (const l of links) bodyLinkMap[l.name] = l.link;
+
     for (let i = 0; i < humanoidData.dofInfo.length; i++) {
         const dof = humanoidData.dofInfo[i];
         const childLink = bodyLinkMap[dof.child_body];
         if (!childLink) continue;
         try {
             const joint = childLink.getInboundJoint();
-            joint.setJointPosition(axisEnums[dof.physx_axis], initDof[i]);
-            joint.setJointVelocity(axisEnums[dof.physx_axis], 0);
-            joint.setDriveTarget(axisEnums[dof.physx_axis], initDof[i]);
+            joint.setJointPosition(axisEnums[dof.physx_axis], dofPos[i]);
+            joint.setJointVelocity(axisEnums[dof.physx_axis], dofVel ? dofVel[i] : 0);
         } catch(e) {}
     }
 
-    // Use cache copy+apply to propagate joint positions to link transforms via FK.
-    // This replaces the old simulate() call which didn't propagate FK correctly.
+    // 5. Apply cache to propagate state
+    removeGround();
     const flags = new PhysX.PxArticulationCacheFlags(PhysX.PxArticulationCacheFlagEnum.eALL);
     const cache = articulation.createCache();
     articulation.copyInternalStateToCache(cache, flags);
     articulation.applyCache(cache, flags, true);
 
-    console.log('Applied init_pose via cache FK: root_z=' + rp[2] + ', dofs=' + initDof.length);
+    // 6. Override link world transforms with correct FK poses
+    // This fixes the mismatch between PhysX's internal DOF→rotation and expmap
+    for (let j = 0; j < numBodies && j < links.length; j++) {
+        const p = fkPos[j];
+        const r = fkRot[j]; // xyzw
+        links[j].link.setGlobalPose(new PhysX.PxTransform(
+            new PhysX.PxVec3(p[0], p[1], p[2]),
+            new PhysX.PxQuat(r[0], r[1], r[2], r[3])
+        ), true);
+    }
+    restoreGround();
 }
 
 // ---------------------------------------------------------------------------
@@ -742,16 +861,15 @@ function initThreeJS() {
     worldGroup.rotation.x = -Math.PI / 2;
     scene3d.add(worldGroup);
 
-    // Ground plane on XY at Z=0 in Z-up space (worldGroup rotation makes it horizontal)
+    // Ground plane + grid (only add if PhysX ground is active)
     const groundGeo = new THREE.PlaneGeometry(40, 40);
     const groundMat = new THREE.MeshStandardMaterial({ color: 0x2a2a4a, roughness: 0.9, metalness: 0.1 });
-    const ground = new THREE.Mesh(groundGeo, groundMat);
-    ground.receiveShadow = true;
-    worldGroup.add(ground);
-    // Grid on XY plane at Z=0.001 in Z-up
+    const groundMesh = new THREE.Mesh(groundGeo, groundMat);
+    groundMesh.receiveShadow = true;
     const grid = new THREE.GridHelper(40, 40, 0x3a3a5e, 0x2a2a4a);
-    grid.rotation.x = Math.PI / 2;  // GridHelper is XZ by default, rotate to XY
+    grid.rotation.x = Math.PI / 2;
     grid.position.z = 0.001;
+    worldGroup.add(groundMesh);
     worldGroup.add(grid);
 
     // Create meshes per body (all in Z-up, parented to worldGroup)
@@ -927,6 +1045,110 @@ function quatToTanNorm(q) {
 //
 // IMPORTANT: The ONNX model already contains the observation normalizer,
 // so this function returns RAW (un-normalized) observations.
+// ---------------------------------------------------------------------------
+// Build observation from a raw state object (no PhysX reads).
+// state = { root_pos, root_rot, root_vel, root_ang_vel, dof_pos, dof_vel, body_pos }
+// ---------------------------------------------------------------------------
+function buildObservationFromState(state) {
+    const obs = new Float32Array(humanoidData.obs_dim);
+    const rootPos = state.root_pos;
+    const rootRot = state.root_rot;
+    const rootVel = state.root_vel;
+    const rootAngVel = state.root_ang_vel;
+
+    const heading = calcHeading(rootRot);
+    const headingInv = axisAngleToQuat([0, 0, 1], -heading);
+
+    let idx = 0;
+
+    // [0] Root height
+    obs[idx++] = rootPos[2];
+
+    // [1..6] Root rotation (heading-local tan_norm)
+    if (humanoidData.global_obs) {
+        const tn = quatToTanNorm(rootRot);
+        for (let i = 0; i < 6; i++) obs[idx++] = tn[i];
+    } else {
+        const localRootRot = quatMul(headingInv, rootRot);
+        const tn = quatToTanNorm(localRootRot);
+        for (let i = 0; i < 6; i++) obs[idx++] = tn[i];
+    }
+
+    // [7..9] Root velocity
+    if (humanoidData.global_obs) {
+        obs[idx++] = rootVel[0]; obs[idx++] = rootVel[1]; obs[idx++] = rootVel[2];
+    } else {
+        const lv = quatRotateVec(headingInv, rootVel);
+        obs[idx++] = lv[0]; obs[idx++] = lv[1]; obs[idx++] = lv[2];
+    }
+
+    // [10..12] Root angular velocity
+    if (humanoidData.global_obs) {
+        obs[idx++] = rootAngVel[0]; obs[idx++] = rootAngVel[1]; obs[idx++] = rootAngVel[2];
+    } else {
+        const la = quatRotateVec(headingInv, rootAngVel);
+        obs[idx++] = la[0]; obs[idx++] = la[1]; obs[idx++] = la[2];
+    }
+
+    // [13..108] Joint rotations as tan_norm
+    const dofPositions = state.dof_pos;
+    const jointRotQuats = [];
+    for (const kj of humanoidData.kinematicJoints) {
+        let quat;
+        if (kj.type === 'SPHERICAL') {
+            quat = expMapToQuat(dofPositions[kj.dof_idx], dofPositions[kj.dof_idx+1], dofPositions[kj.dof_idx+2]);
+        } else if (kj.type === 'HINGE') {
+            quat = axisAngleToQuat(kj.axis, dofPositions[kj.dof_idx]);
+        } else {
+            quat = [0, 0, 0, 1];
+        }
+        jointRotQuats.push(quat);
+        const tn = quatToTanNorm(quat);
+        for (let k = 0; k < 6; k++) obs[idx++] = tn[k];
+    }
+
+    // DOF velocities
+    for (let i = 0; i < state.dof_vel.length; i++) {
+        obs[idx++] = state.dof_vel[i];
+    }
+
+    // Key body positions via FK
+    if (humanoidData.fk_parent_indices && humanoidData.fk_local_translations) {
+        const numBodies = humanoidData.fk_parent_indices.length;
+        const fkPos = new Array(numBodies);
+        const fkRot = new Array(numBodies);
+        fkPos[0] = rootPos;
+        fkRot[0] = rootRot;
+
+        for (let j = 1; j < numBodies; j++) {
+            const jRot = jointRotQuats[j - 1];
+            const localTrans = humanoidData.fk_local_translations[j];
+            const localRot = humanoidData.fk_local_rotations[j];
+            const parentIdx = humanoidData.fk_parent_indices[j];
+            const parentPos = fkPos[parentIdx];
+            const parentRot = fkRot[parentIdx];
+            const worldTrans = quatRotateVec(parentRot, localTrans);
+            fkPos[j] = [parentPos[0]+worldTrans[0], parentPos[1]+worldTrans[1], parentPos[2]+worldTrans[2]];
+            const localCombined = quatMul(localRot, jRot);
+            fkRot[j] = quatMul(parentRot, localCombined);
+        }
+
+        const keyIds = humanoidData.key_body_ids;
+        for (const bid of keyIds) {
+            const bp = fkPos[bid];
+            const rel = [bp[0] - rootPos[0], bp[1] - rootPos[1], bp[2] - rootPos[2]];
+            if (humanoidData.global_obs) {
+                obs[idx++] = rel[0]; obs[idx++] = rel[1]; obs[idx++] = rel[2];
+            } else {
+                const lr = quatRotateVec(headingInv, rel);
+                obs[idx++] = lr[0]; obs[idx++] = lr[1]; obs[idx++] = lr[2];
+            }
+        }
+    }
+
+    return obs;
+}
+
 // ---------------------------------------------------------------------------
 function buildObservation() {
     const obs = new Float32Array(humanoidData.obs_dim);
@@ -1126,7 +1348,6 @@ function applyActions(action) {
             clippedMin = Math.min(clippedMin, a);
             clippedMax = Math.max(clippedMax, a);
             joint.setDriveTarget(axisEnums[dof.physx_axis], a);
-            joint.setDriveVelocity(axisEnums[dof.physx_axis], 0);
             appliedCount++;
         } catch(e) {
             if (!window._applyWarnLogged) {
@@ -1273,6 +1494,9 @@ async function mainLoop(timestamp) {
                 currentAction = await runPolicy(obs);
             }
 
+            // Broadcast obs to visualizer via localStorage
+            try { localStorage.setItem('mimickit-obs', JSON.stringify(Array.from(obs))); } catch(e) {}
+
             // One-time diagnostic log
             if (!window._policyLogCount) window._policyLogCount = 0;
             window._policyLogCount++;
@@ -1314,6 +1538,11 @@ async function mainLoop(timestamp) {
         for (let i = 0; i < numSubsteps; i++) {
             pxScene.simulate(scaledDT);
             pxScene.fetchResults(true);
+        }
+        // Restore ground after first sim step (deferred from init/reset)
+        if (restoreGroundAfterStep) {
+            restoreGround();
+            restoreGroundAfterStep = false;
         }
     }
 
@@ -1568,10 +1797,7 @@ async function init() {
                 }
 
                 // Propagate FK
-                const flags = new PhysX.PxArticulationCacheFlags(PhysX.PxArticulationCacheFlagEnum.eALL);
-                const cache = articulation.createCache();
-                articulation.copyInternalStateToCache(cache, flags);
-                articulation.applyCache(cache, flags, true);
+                applyCacheNoGround();
             }
 
             for (let step = 0; step < 10; step++) {
@@ -1712,11 +1938,8 @@ async function init() {
                 } catch(e) {}
             }
 
-            // Propagate FK
-            const flags = new PhysX.PxArticulationCacheFlags(PhysX.PxArticulationCacheFlagEnum.eALL);
-            const cache = articulation.createCache();
-            articulation.copyInternalStateToCache(cache, flags);
-            articulation.applyCache(cache, flags, true);
+            // Propagate FK (ground removed to prevent collision distortion)
+            applyCacheNoGround();
 
             // 2. Verify state was set correctly
             const rp = links[0].link.getGlobalPose();
@@ -1914,42 +2137,36 @@ async function init() {
             const rpResp = await fetch('./random_pose_test.json?' + Date.now());
             const rpData = await rpResp.json();
             if (rpData && rpData.root_pos) {
-                // Set ALL state atomically via PxArticulationCache
-                // This is the PhysX-native way to set articulation state,
-                // including root velocities which setRootLinearVelocity doesn't handle
-                const rpFlags = new PhysX.PxArticulationCacheFlags(PhysX.PxArticulationCacheFlagEnum.eALL);
-                const rpCache = articulation.createCache();
-                articulation.copyInternalStateToCache(rpCache, rpFlags);
+                // Reset first
+                resetHumanoid();
+                const rpBodyLinkMap = {};
+                for (const l of links) rpBodyLinkMap[l.name] = l.link;
 
-                // Set root pose via cache rootLinkData
-                const rld = rpCache.get_rootLinkData();
-                const rt = rld.get_transform();
-                rt.get_p().set_x(rpData.root_pos[0]);
-                rt.get_p().set_y(rpData.root_pos[1]);
-                rt.get_p().set_z(rpData.root_pos[2]);
-                rt.get_q().set_x(rpData.root_rot[0]);
-                rt.get_q().set_y(rpData.root_rot[1]);
-                rt.get_q().set_z(rpData.root_rot[2]);
-                rt.get_q().set_w(rpData.root_rot[3]);
+                // Set root pose
+                articulation.setRootGlobalPose(new PhysX.PxTransform(
+                    new PhysX.PxVec3(rpData.root_pos[0], rpData.root_pos[1], rpData.root_pos[2]),
+                    new PhysX.PxQuat(rpData.root_rot[0], rpData.root_rot[1], rpData.root_rot[2], rpData.root_rot[3])
+                ), true);
 
-                // Set root velocities via cache rootLinkData
-                rld.get_worldLinVel().set_x(rpData.root_vel[0]);
-                rld.get_worldLinVel().set_y(rpData.root_vel[1]);
-                rld.get_worldLinVel().set_z(rpData.root_vel[2]);
-                rld.get_worldAngVel().set_x(rpData.root_ang_vel[0]);
-                rld.get_worldAngVel().set_y(rpData.root_ang_vel[1]);
-                rld.get_worldAngVel().set_z(rpData.root_ang_vel[2]);
+                // Set root velocities
+                articulation.setRootLinearVelocity(new PhysX.PxVec3(rpData.root_vel[0], rpData.root_vel[1], rpData.root_vel[2]));
+                articulation.setRootAngularVelocity(new PhysX.PxVec3(rpData.root_ang_vel[0], rpData.root_ang_vel[1], rpData.root_ang_vel[2]));
 
-                // Set DOF positions and velocities via cache buffers
-                const jpBuf = rpCache.get_jointPosition();
-                const jvBuf = rpCache.get_jointVelocity();
-                for (let i = 0; i < rpData.dof_pos.length; i++) {
-                    jpBuf.set(i, rpData.dof_pos[i]);
-                    jvBuf.set(i, rpData.dof_vel[i]);
+                // Set DOF positions and velocities via per-joint API (common order via dofInfo)
+                for (let i = 0; i < humanoidData.dofInfo.length; i++) {
+                    const dof = humanoidData.dofInfo[i];
+                    const childLink = rpBodyLinkMap[dof.child_body];
+                    if (!childLink) continue;
+                    try {
+                        const joint = childLink.getInboundJoint();
+                        joint.setJointPosition(axisEnums[dof.physx_axis], rpData.dof_pos[i]);
+                        joint.setJointVelocity(axisEnums[dof.physx_axis], rpData.dof_vel[i]);
+                    } catch(e) {}
                 }
 
-                // Apply atomically - this propagates FK and sets all state at once
-                articulation.applyCache(rpCache, rpFlags, true);
+                // Propagate FK via cache copy+apply
+                // Propagate FK (ground removed to prevent collision distortion)
+                applyCacheNoGround();
 
                 // Verify root velocity was set
                 const rvCheck = links[0].link.getLinearVelocity();
@@ -2012,6 +2229,114 @@ async function init() {
                 let rpMaxAE = 0;
                 for (let i = 0; i < rpWA.length; i++) rpMaxAE = Math.max(rpMaxAE, Math.abs(rpWA[i] - rpData.action[i]));
                 console.log('RANDOM POSE action max err: ' + rpMaxAE.toFixed(6));
+
+                // Per-body FK comparison if reference data available
+                if (rpData.fk_body_pos && rpData.body_names) {
+                    console.log('\n--- PER-BODY FK COMPARISON ---');
+                    // Read DOF positions via per-joint API (common order)
+                    const webDofPos = new Array(rpData.dof_pos.length);
+                    for (let i = 0; i < humanoidData.dofInfo.length; i++) {
+                        const dof = humanoidData.dofInfo[i];
+                        const cl = rpBodyLinkMap[dof.child_body];
+                        try {
+                            webDofPos[i] = cl.getInboundJoint().getJointPosition(axisEnums[dof.physx_axis]);
+                        } catch(e) { webDofPos[i] = 0; }
+                    }
+
+                    // Compare DOF positions (both in common order)
+                    let maxDofErr = 0;
+                    let worstDof = -1;
+                    for (let i = 0; i < rpData.dof_pos.length; i++) {
+                        const d = Math.abs(webDofPos[i] - rpData.dof_pos[i]);
+                        if (d > maxDofErr) { maxDofErr = d; worstDof = i; }
+                    }
+                    console.log('DOF position max err: ' + maxDofErr.toFixed(6) + ' (dof ' + worstDof + ')');
+
+                    // Compute FK in JS
+                    const numBodies = humanoidData.fk_parent_indices.length;
+                    const jsFkPos = new Array(numBodies);
+                    const jsFkRot = new Array(numBodies);
+
+                    // Get root from PhysX
+                    const fkRootPose = links[0].link.getGlobalPose();
+                    const fkRootP = fkRootPose.get_p();
+                    const fkRootQ = fkRootPose.get_q();
+                    jsFkPos[0] = [fkRootP.get_x(), fkRootP.get_y(), fkRootP.get_z()];
+                    jsFkRot[0] = [fkRootQ.get_x(), fkRootQ.get_y(), fkRootQ.get_z(), fkRootQ.get_w()];
+
+                    // Build joint quats from DOF positions (same as buildObservation)
+                    const fkJointQuats = [];
+                    for (const kj of humanoidData.kinematicJoints) {
+                        let q;
+                        if (kj.type === 'SPHERICAL') {
+                            q = expMapToQuat(webDofPos[kj.dof_idx], webDofPos[kj.dof_idx+1], webDofPos[kj.dof_idx+2]);
+                        } else if (kj.type === 'HINGE') {
+                            q = axisAngleToQuat(kj.axis, webDofPos[kj.dof_idx]);
+                        } else {
+                            q = [0, 0, 0, 1];
+                        }
+                        fkJointQuats.push(q);
+                    }
+
+                    // Run FK
+                    for (let j = 1; j < numBodies; j++) {
+                        const jRot = fkJointQuats[j - 1];
+                        const localTrans = humanoidData.fk_local_translations[j];
+                        const localRot = humanoidData.fk_local_rotations[j];
+                        const parentIdx = humanoidData.fk_parent_indices[j];
+                        const parentPos = jsFkPos[parentIdx];
+                        const parentRot = jsFkRot[parentIdx];
+                        const worldTrans = quatRotateVec(parentRot, localTrans);
+                        jsFkPos[j] = [parentPos[0]+worldTrans[0], parentPos[1]+worldTrans[1], parentPos[2]+worldTrans[2]];
+                        const localCombined = quatMul(localRot, jRot);
+                        jsFkRot[j] = quatMul(parentRot, localCombined);
+                    }
+
+                    // Compare each body
+                    let maxBodyErr = 0;
+                    let worstBody = '';
+                    for (let b = 0; b < Math.min(numBodies, rpData.fk_body_pos.length); b++) {
+                        const ref = rpData.fk_body_pos[b];
+                        const web = jsFkPos[b];
+                        const dx = Math.abs(web[0]-ref[0]), dy = Math.abs(web[1]-ref[1]), dz = Math.abs(web[2]-ref[2]);
+                        const maxD = Math.max(dx, dy, dz);
+                        const name = rpData.body_names[b] || ('body'+b);
+                        if (maxD > 0.001) {
+                            console.log('  ' + name + ': err=' + maxD.toFixed(4) +
+                                ' web=[' + web.map(v=>v.toFixed(4)).join(',') + ']' +
+                                ' ref=[' + ref.map(v=>v.toFixed(4)).join(',') + ']');
+                        }
+                        if (maxD > maxBodyErr) { maxBodyErr = maxD; worstBody = name; }
+                    }
+                    console.log('FK body max err: ' + maxBodyErr.toFixed(6) + ' (worst: ' + worstBody + ')');
+
+                    // Also compare joint rotation quats if available
+                    if (rpData.joint_rot_quats) {
+                        console.log('\n--- JOINT ROTATION QUAT COMPARISON ---');
+                        let maxJRE = 0;
+                        let worstJoint = '';
+                        for (let j = 0; j < fkJointQuats.length; j++) {
+                            const wq = fkJointQuats[j];
+                            const rq = rpData.joint_rot_quats[j];
+                            // Compare quaternions (handle sign ambiguity)
+                            let errPos = 0, errNeg = 0;
+                            for (let k = 0; k < 4; k++) {
+                                errPos = Math.max(errPos, Math.abs(wq[k] - rq[k]));
+                                errNeg = Math.max(errNeg, Math.abs(wq[k] + rq[k]));
+                            }
+                            const err = Math.min(errPos, errNeg);
+                            const jname = humanoidData.kinematicJoints[j]?.child_body || ('joint'+j);
+                            if (err > 0.001) {
+                                console.log('  ' + jname + ': err=' + err.toFixed(6) +
+                                    ' web=[' + wq.map(v=>v.toFixed(4)).join(',') + ']' +
+                                    ' ref=[' + rq.map(v=>v.toFixed(4)).join(',') + ']');
+                            }
+                            if (err > maxJRE) { maxJRE = err; worstJoint = jname; }
+                        }
+                        console.log('Joint rot quat max err: ' + maxJRE.toFixed(6) + ' (worst: ' + worstJoint + ')');
+                    }
+                }
+
                 console.log('=== RANDOM POSE TEST COMPLETE ===');
             }
 
@@ -2047,10 +2372,7 @@ async function init() {
                         }
                     }
                     // Propagate FK
-                    const fl = new PhysX.PxArticulationCacheFlags(PhysX.PxArticulationCacheFlagEnum.eALL);
-                    const ca = articulation.createCache();
-                    articulation.copyInternalStateToCache(ca, fl);
-                    articulation.applyCache(ca, fl, true);
+                    applyCacheNoGround();
 
                     // Build obs
                     const webObs = buildObservation();
@@ -2164,9 +2486,313 @@ async function init() {
                 console.log('=== CLOSED-LOOP COMPARISON COMPLETE ===');
             }
 
+            // OBS TRACE TEST: compute obs from Isaac Lab states purely in JS
+            console.log('\n=== OBS TRACE TEST (JS obs from Isaac Lab states) ===');
+            try {
+                const otResp = await fetch('./obs_trace.json?' + Date.now());
+                const otData = await otResp.json();
+                if (otData && otData.length > 0) {
+                    let maxErrAll = 0, worstStep = -1, worstIdx = -1;
+                    const catRanges = [
+                        ['height', 0, 1],
+                        ['root_rot', 1, 7],
+                        ['root_vel', 7, 10],
+                        ['root_angvel', 10, 13],
+                        ['joint_rot', 13, 109],
+                        ['dof_vel', 109, 140],
+                        ['key_pos', 140, 158],
+                    ];
+                    for (const frame of otData) {
+                        const jsObs = buildObservationFromState(frame);
+                        const pyObs = frame.obs;
+
+                        // Per-category errors
+                        let stepSummary = 'Step ' + frame.step + ':';
+                        let stepMaxErr = 0, stepWorstIdx = -1;
+                        for (const [name, lo, hi] of catRanges) {
+                            let catMax = 0;
+                            for (let i = lo; i < Math.min(hi, pyObs.length); i++) {
+                                const d = Math.abs(jsObs[i] - pyObs[i]);
+                                if (d > catMax) catMax = d;
+                                if (d > stepMaxErr) { stepMaxErr = d; stepWorstIdx = i; }
+                            }
+                            stepSummary += ' ' + name + '=' + catMax.toFixed(4);
+                        }
+
+                        if (stepMaxErr > maxErrAll) {
+                            maxErrAll = stepMaxErr;
+                            worstStep = frame.step;
+                            worstIdx = stepWorstIdx;
+                        }
+
+                        // Log every step if error > 0.01, or first/last
+                        if (stepMaxErr > 0.01 || frame.step === 0 || frame.step === otData.length - 1) {
+                            console.log(stepSummary + ' | worst=' + stepMaxErr.toFixed(4) + '@' + stepWorstIdx);
+                        }
+
+                        // Detailed per-dim log for first frame with large error
+                        if (stepMaxErr > 0.01 && frame.step <= 5) {
+                            for (let i = 0; i < Math.min(jsObs.length, pyObs.length); i++) {
+                                const d = Math.abs(jsObs[i] - pyObs[i]);
+                                if (d > 0.01) {
+                                    console.log('  [' + i + '] js=' + jsObs[i].toFixed(6) + ' py=' + pyObs[i].toFixed(6) + ' err=' + d.toFixed(6));
+                                }
+                            }
+                        }
+                    }
+                    console.log('OBS TRACE SUMMARY: max_err=' + maxErrAll.toFixed(6) + ' at step ' + worstStep + ' idx ' + worstIdx);
+                    if (maxErrAll < 0.001) {
+                        console.log('>>> JS obs computation MATCHES Python for all dynamic states <<<');
+                    } else {
+                        console.log('>>> JS obs DIVERGES from Python — max error ' + maxErrAll.toFixed(4) + ' <<<');
+                    }
+                }
+            } catch(e) {
+                console.log('OBS TRACE TEST skipped: ' + e.message);
+            }
+
             console.log('\n=== AUDIT COMPLETE ===');
             running = true;
             requestAnimationFrame(mainLoop);
+        });
+
+        // Playback Isaac Lab trace — step through frames visually
+        document.getElementById('btnPlayTrace').addEventListener('click', async () => {
+            running = false;
+            console.log('=== PLAYBACK: Loading obs trace ===');
+            let traceFrames;
+            try {
+                const resp = await fetch('./obs_trace.json?' + Date.now());
+                traceFrames = await resp.json();
+            } catch(e) {
+                console.error('Failed to load obs_trace.json:', e.message);
+                running = true; requestAnimationFrame(mainLoop); return;
+            }
+            if (!traceFrames || traceFrames.length === 0) {
+                console.error('obs_trace.json is empty');
+                running = true; requestAnimationFrame(mainLoop); return;
+            }
+
+            console.log('Loaded ' + traceFrames.length + ' frames. Playing back...');
+            const axisE = [E_TWIST, E_SWING1, E_SWING2];
+            const blm = {};
+            for (const l of links) blm[l.name] = l.link;
+
+            // === T-POSE DIAGNOSTIC: set all DOFs to 0, check link positions ===
+            {
+                removeGround();
+                const tposeZ = humanoidData.tpose_pelvis_z || 0.903;
+                articulation.setRootGlobalPose(new PhysX.PxTransform(
+                    new PhysX.PxVec3(0, 0, tposeZ),
+                    new PhysX.PxQuat(0, 0, 0, 1)  // identity rotation
+                ), true);
+                // Set ALL DOFs to 0
+                for (let i = 0; i < humanoidData.dofInfo.length; i++) {
+                    const dof = humanoidData.dofInfo[i];
+                    const cl = blm[dof.child_body];
+                    if (!cl) continue;
+                    try {
+                        const joint = cl.getInboundJoint();
+                        joint.setJointPosition(axisE[dof.physx_axis], 0);
+                    } catch(e) {}
+                }
+                // Propagate FK
+                {
+                    const flags = new PhysX.PxArticulationCacheFlags(PhysX.PxArticulationCacheFlagEnum.eALL);
+                    const cache = articulation.createCache();
+                    articulation.copyInternalStateToCache(cache, flags);
+                    articulation.applyCache(cache, flags, true);
+                }
+                // Check link positions against T-pose body.pos + tposeZ
+                console.log('=== T-POSE TEST (all DOFs=0, root=[0,0,' + tposeZ + ']) ===');
+                let tposeMaxErr = 0;
+                let tposeMaxBody = '';
+                for (let b = 0; b < links.length; b++) {
+                    const lp = links[b].link.getGlobalPose();
+                    const px = lp.get_p();
+                    const webPos = [px.get_x(), px.get_y(), px.get_z()];
+                    const bp = humanoidData.bodies[b].pos;
+                    const expected = [bp[0], bp[1], bp[2] + tposeZ];
+                    const dx = webPos[0]-expected[0], dy = webPos[1]-expected[1], dz = webPos[2]-expected[2];
+                    const err = Math.sqrt(dx*dx + dy*dy + dz*dz);
+                    if (err > 0.001) {
+                        console.log('  T-POSE ' + links[b].name + ': web=[' + webPos.map(v=>v.toFixed(4)).join(',') +
+                            '] expected=[' + expected.map(v=>v.toFixed(4)).join(',') + '] err=' + err.toFixed(4));
+                    }
+                    if (err > tposeMaxErr) { tposeMaxErr = err; tposeMaxBody = links[b].name; }
+                }
+                console.log('T-POSE max_err=' + tposeMaxErr.toFixed(4) + ' (' + tposeMaxBody + ')');
+                restoreGround();
+            }
+
+            let frameIdx = 0;
+            const playFrame = () => {
+                if (frameIdx >= traceFrames.length) {
+                    // Loop back
+                    frameIdx = 0;
+                }
+                const f = traceFrames[frameIdx];
+
+                // Remove ground during entire state-setting to prevent collision
+                removeGround();
+
+                // Set root pose
+                articulation.setRootGlobalPose(new PhysX.PxTransform(
+                    new PhysX.PxVec3(f.root_pos[0], f.root_pos[1], f.root_pos[2]),
+                    new PhysX.PxQuat(f.root_rot[0], f.root_rot[1], f.root_rot[2], f.root_rot[3])
+                ), true);
+
+                // Set DOF positions via per-joint API
+                for (let i = 0; i < humanoidData.dofInfo.length; i++) {
+                    const dof = humanoidData.dofInfo[i];
+                    const cl = blm[dof.child_body];
+                    if (!cl) continue;
+                    try {
+                        const joint = cl.getInboundJoint();
+                        joint.setJointPosition(axisE[dof.physx_axis], f.dof_pos[i]);
+                    } catch(e) {}
+                }
+
+                // Frame 0: verify hip DOF readback
+                if (frameIdx === 0) {
+                    const hipLink = blm['right_thigh'];
+                    if (hipLink) {
+                        const hj = hipLink.getInboundJoint();
+                        const tw = hj.getJointPosition(axisE[0]);
+                        const s1 = hj.getJointPosition(axisE[1]);
+                        const s2 = hj.getJointPosition(axisE[2]);
+                        console.log('RIGHT HIP DOFs: TWIST=' + tw.toFixed(4) + ' SWING1=' + s1.toFixed(4) + ' SWING2=' + s2.toFixed(4));
+                        // Thigh ROTATION from PhysX (critical comparison with knee_test)
+                        const tgp = hipLink.getGlobalPose();
+                        const tq = tgp.get_q();
+                        console.log('RIGHT THIGH rot(xyzw): [' + tq.get_x().toFixed(4) + ',' + tq.get_y().toFixed(4) + ',' + tq.get_z().toFixed(4) + ',' + tq.get_w().toFixed(4) + ']');
+                        console.log('  knee_test thigh rot:  [-0.1703, 0.0912,-0.9057, 0.3772]');
+                    }
+                    const kneeLink = blm['right_shin'];
+                    if (kneeLink) {
+                        const kj = kneeLink.getInboundJoint();
+                        const kt = kj.getJointPosition(axisE[0]);
+                        const kneeDof = humanoidData.dofInfo.find(d => d.joint_name === 'right_knee');
+                        const ki = humanoidData.dofInfo.indexOf(kneeDof);
+                        console.log('RIGHT KNEE readback: TWIST=' + kt.toFixed(4) + ' set_value=' + f.dof_pos[ki].toFixed(4));
+                    }
+                }
+
+                // Propagate FK: try updateKinematics first, fall back to cache
+                if (typeof articulation.updateKinematics === 'function') {
+                    articulation.updateKinematics();
+                    if (frameIdx === 0) console.log('Using updateKinematics() for FK propagation');
+                } else {
+                    // Fall back to cache approach
+                    const flags = new PhysX.PxArticulationCacheFlags(PhysX.PxArticulationCacheFlagEnum.eALL);
+                    const cache = articulation.createCache();
+                    articulation.copyInternalStateToCache(cache, flags);
+                    articulation.applyCache(cache, flags, true);
+                    if (frameIdx === 0) console.log('Using copyInternalState+applyCache for FK propagation');
+                }
+
+                // POST-CACHE readback: check if cache changed our DOF values
+                if (frameIdx === 0) {
+                    const hipLink2 = blm['right_thigh'];
+                    if (hipLink2) {
+                        const hj2 = hipLink2.getInboundJoint();
+                        const tw2 = hj2.getJointPosition(axisE[0]);
+                        const s12 = hj2.getJointPosition(axisE[1]);
+                        const s22 = hj2.getJointPosition(axisE[2]);
+                        console.log('POST-CACHE hip DOFs: TWIST=' + tw2.toFixed(4) + ' SWING1=' + s12.toFixed(4) + ' SWING2=' + s22.toFixed(4));
+                        const tgp2 = hipLink2.getGlobalPose();
+                        const tq2 = tgp2.get_q();
+                        console.log('POST-CACHE thigh rot: [' + tq2.get_x().toFixed(4) + ',' + tq2.get_y().toFixed(4) + ',' + tq2.get_z().toFixed(4) + ',' + tq2.get_w().toFixed(4) + ']');
+                    }
+                }
+
+                restoreGround();
+
+                // Update meshes from PhysX link positions
+                updateMeshes();
+
+                // Also compute JS obs from this state and broadcast to visualizer
+                const jsObs = buildObservationFromState(f);
+                try { localStorage.setItem('mimickit-obs', JSON.stringify(Array.from(jsObs))); } catch(e) {}
+                // Also store the Python reference obs
+                try { localStorage.setItem('mimickit-ref-obs', JSON.stringify(f.obs)); } catch(e) {}
+
+                // Update HUD
+                const hud = document.getElementById('debugInfo');
+                if (hud) {
+                    hud.innerHTML = 'PLAYBACK frame ' + frameIdx + '/' + traceFrames.length +
+                        '<br>root_z: ' + f.root_pos[2].toFixed(3) +
+                        '<br>action[0:3]: ' + f.action.slice(0,3).map(v=>v.toFixed(3)).join(', ');
+                }
+
+                // Verify action: feed JS obs + trace latent into ONNX, compare to Isaac Lab action
+                const traceLatent = f.latent ? new Float32Array(f.latent) : new Float32Array(humanoidData.latent_dim || 64);
+                const obsTensor = new ort.Tensor('float32', jsObs, [1, humanoidData.obs_dim]);
+                const latTensor = new ort.Tensor('float32', traceLatent, [1, humanoidData.latent_dim || 64]);
+                let feed = { obs: obsTensor };
+                if (humanoidData.latent_dim > 0) feed.latent = latTensor;
+                onnxSession.run(feed).then(result => {
+                    const webAction = result.action.data;
+                    const pyAction = f.action;
+                    let maxActErr = 0;
+                    for (let i = 0; i < Math.min(webAction.length, pyAction.length); i++) {
+                        maxActErr = Math.max(maxActErr, Math.abs(webAction[i] - pyAction[i]));
+                    }
+                    console.log('Frame ' + (frameIdx-1) + ': root_z=' + f.root_pos[2].toFixed(4) +
+                        ' obs_err=0.000000' +
+                        ' act_err=' + maxActErr.toFixed(6) +
+                        (maxActErr > 0.01 ? ' *** ACTION MISMATCH ***' : ''));
+                });
+
+                // Compare world-space body positions: PhysX links vs Isaac Lab
+                if (f.body_pos) {
+                    const bodyNames = humanoidData.bodies.map(b => b.name);
+                    let maxBpErr = 0, worstBody = '';
+                    const details = [];
+                    for (let bi = 0; bi < links.length; bi++) {
+                        const lp = links[bi].link.getGlobalPose().get_p();
+                        const webPos = [lp.get_x(), lp.get_y(), lp.get_z()];
+                        const isaacPos = f.body_pos[bi];
+                        if (!isaacPos) continue;
+                        const dx = Math.abs(webPos[0] - isaacPos[0]);
+                        const dy = Math.abs(webPos[1] - isaacPos[1]);
+                        const dz = Math.abs(webPos[2] - isaacPos[2]);
+                        const d = Math.max(dx, dy, dz);
+                        if (d > maxBpErr) { maxBpErr = d; worstBody = links[bi].name; }
+                        if (d > 0.01) {
+                            details.push(links[bi].name + ':' +
+                                ' web=[' + webPos.map(v=>v.toFixed(4)).join(',') + ']' +
+                                ' isaac=[' + isaacPos.map(v=>v.toFixed(4)).join(',') + ']' +
+                                ' err=' + d.toFixed(4));
+                        }
+                    }
+                    if (frameIdx <= 3 || maxBpErr > 0.05) {
+                        console.log('Frame ' + (frameIdx-1) + ' BODY POS max_err=' + maxBpErr.toFixed(4) + ' (' + worstBody + ')');
+                        for (const det of details.slice(0, 5)) {
+                            console.log('  ' + det);
+                        }
+                    }
+                }
+
+                // Log first frame details
+                if (frameIdx === 0) {
+                    console.log('Frame 0: root_pos=' + f.root_pos.map(v=>v.toFixed(4)) +
+                        ' root_rot=' + f.root_rot.map(v=>v.toFixed(4)) +
+                        ' dof[0:3]=' + f.dof_pos.slice(0,3).map(v=>v.toFixed(4)));
+                }
+
+                frameIdx++;
+
+                // Render
+                renderer.render(scene3d, camera);
+
+                // Schedule next frame at ~10fps (100ms per frame = slow enough to inspect)
+                if (!running) {
+                    setTimeout(playFrame, 100);
+                }
+            };
+
+            playFrame();
         });
 
         document.getElementById('chkDrives').addEventListener('change', (e) => {
@@ -2208,23 +2834,14 @@ async function init() {
                 wsMaxDiff = null;
             }
         });
-        document.getElementById('sliderStiffness').addEventListener('input', (e) => {
-            stiffnessScale = parseFloat(e.target.value);
-            document.getElementById('stiffnessVal').textContent = stiffnessScale.toFixed(1) + 'x';
-            applyDriveParams();
-        });
-        document.getElementById('sliderDamping').addEventListener('input', (e) => {
-            dampingScale = parseFloat(e.target.value);
-            document.getElementById('dampingVal').textContent = dampingScale.toFixed(1) + 'x';
-            applyDriveParams();
+        document.getElementById('sliderGravity').addEventListener('input', (e) => {
+            const g = parseFloat(e.target.value);
+            document.getElementById('gravityVal').textContent = g.toFixed(2);
+            pxScene.setGravity(new PhysX.PxVec3(0, 0, g));
         });
         document.getElementById('sliderSubsteps').addEventListener('input', (e) => {
             numSubsteps = parseInt(e.target.value);
             document.getElementById('substepsVal').textContent = numSubsteps;
-        });
-        document.getElementById('sliderTimeScale').addEventListener('input', (e) => {
-            timeScale = parseFloat(e.target.value);
-            document.getElementById('timeScaleVal').textContent = timeScale.toFixed(1) + 'x';
         });
 
         running = true;

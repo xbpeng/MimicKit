@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Knee Joint Test - PhysX WASM localRot</title>
+<style>
+body { font-family: monospace; background: #1a1a2e; color: #e0e0e0; padding: 20px; }
+pre { background: #0d0d1a; padding: 10px; border-radius: 4px; overflow-x: auto; }
+.pass { color: #4caf50; } .fail { color: #ff5252; } .warn { color: #ffeb3b; }
+h2 { color: #7c7cff; }
+</style>
+</head>
+<body>
+<h1>Minimal Knee Joint Test</h1>
+<p>Tests a 3-link articulation (pelvis → thigh → shin) with different localRot values to find what PhysX WASM handles correctly.</p>
+<pre id="log">Loading PhysX WASM...</pre>
+
+<script type="module">
+const log = document.getElementById('log');
+function L(msg, cls) {
+    const span = document.createElement('span');
+    span.className = cls || '';
+    span.textContent = msg + '\n';
+    log.appendChild(span);
+}
+
+// Quaternion math
+function quatMul(a, b) {
+    return [
+        a[3]*b[0] + a[0]*b[3] + a[1]*b[2] - a[2]*b[1],
+        a[3]*b[1] - a[0]*b[2] + a[1]*b[3] + a[2]*b[0],
+        a[3]*b[2] + a[0]*b[1] - a[1]*b[0] + a[2]*b[3],
+        a[3]*b[3] - a[0]*b[0] - a[1]*b[1] - a[2]*b[2]
+    ];
+}
+function quatRotVec(q, v) {
+    const qv = [q[0], q[1], q[2]];
+    const uv = [qv[1]*v[2]-qv[2]*v[1], qv[2]*v[0]-qv[0]*v[2], qv[0]*v[1]-qv[1]*v[0]];
+    const uuv = [qv[1]*uv[2]-qv[2]*uv[1], qv[2]*uv[0]-qv[0]*uv[2], qv[0]*uv[1]-qv[1]*uv[0]];
+    return [v[0]+2*(q[3]*uv[0]+uuv[0]), v[1]+2*(q[3]*uv[1]+uuv[1]), v[2]+2*(q[3]*uv[2]+uuv[2])];
+}
+function axisAngleToQuat(axis, angle) {
+    const ha = angle * 0.5, s = Math.sin(ha), c = Math.cos(ha);
+    return [axis[0]*s, axis[1]*s, axis[2]*s, c];
+}
+function dist(a, b) {
+    const d = [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
+    return Math.sqrt(d[0]*d[0]+d[1]*d[1]+d[2]*d[2]);
+}
+
+// FK prediction: given root pos/rot, knee angle, compute shin position
+// Joint offset (thigh→shin) = [0, 0, -0.421546] (from humanoid_data.json)
+// MJCF knee axis = [0, 1, 0]
+function fkShinPos(rootPos, rootRot, hipRot, kneeAngle) {
+    // thigh position (hip offset from pelvis)
+    const hipOffset = [0, -0.084887, 0];
+    const thighPos = [
+        rootPos[0] + quatRotVec(rootRot, hipOffset)[0],
+        rootPos[1] + quatRotVec(rootRot, hipOffset)[1],
+        rootPos[2] + quatRotVec(rootRot, hipOffset)[2]
+    ];
+    const thighRot = quatMul(rootRot, hipRot); // hip joint rotation
+
+    // shin position (knee offset from thigh)
+    const kneeOffset = [0, 0, -0.421546];
+    const kneeRot = axisAngleToQuat([0, 1, 0], kneeAngle);
+    const shinLocalRot = quatMul([0,0,0,1], kneeRot); // identity local_rot * joint_rot
+    const shinRot = quatMul(thighRot, shinLocalRot);
+    const worldOffset = quatRotVec(thighRot, kneeOffset);
+    return [thighPos[0]+worldOffset[0], thighPos[1]+worldOffset[1], thighPos[2]+worldOffset[2]];
+}
+
+const module = await import('https://cdn.jsdelivr.net/npm/physx-js-webidl@2.7.2/physx-js-webidl.mjs');
+const PhysX = await module.default({
+    locateFile: () => 'https://cdn.jsdelivr.net/npm/physx-js-webidl@2.7.2/physx-js-webidl.wasm'
+});
+{
+    log.textContent = '';
+    L('PhysX WASM loaded');
+
+    const tlf = PhysX.PxTopLevelFunctions.prototype;
+    const version = PhysX.PHYSICS_VERSION;
+    const allocator = new PhysX.PxDefaultAllocator();
+    const errorCb = new PhysX.PxDefaultErrorCallback();
+    const foundation = tlf.CreateFoundation(version, allocator, errorCb);
+    const tolerances = new PhysX.PxTolerancesScale();
+    const physics = tlf.CreatePhysics(version, foundation, tolerances);
+
+    // Scene
+    const sceneDesc = new PhysX.PxSceneDesc(tolerances);
+    sceneDesc.set_gravity(new PhysX.PxVec3(0, 0, 0)); // no gravity for this test
+    sceneDesc.set_cpuDispatcher(tlf.DefaultCpuDispatcherCreate(0));
+    sceneDesc.set_filterShader(tlf.DefaultFilterShader());
+    sceneDesc.set_solverType(PhysX.PxSolverTypeEnum.eTGS);
+    const scene = physics.createScene(sceneDesc);
+
+    const E_TWIST = PhysX.PxArticulationAxisEnum.eTWIST;
+    const E_SWING1 = PhysX.PxArticulationAxisEnum.eSWING1;
+    const E_SWING2 = PhysX.PxArticulationAxisEnum.eSWING2;
+    const E_SPHERICAL = PhysX.PxArticulationJointTypeEnum.eSPHERICAL;
+    const E_REVOLUTE = PhysX.PxArticulationJointTypeEnum.eREVOLUTE;
+    const E_LIMITED = PhysX.PxArticulationMotionEnum.eLIMITED;
+    const E_LOCKED = PhysX.PxArticulationMotionEnum.eLOCKED;
+    const E_FORCE = PhysX.PxArticulationDriveTypeEnum.eFORCE;
+    const shapeFlags = new PhysX.PxShapeFlags(
+        PhysX.PxShapeFlagEnum.eSCENE_QUERY_SHAPE | PhysX.PxShapeFlagEnum.eSIMULATION_SHAPE
+    );
+    const material = physics.createMaterial(1.0, 1.0, 0.0);
+
+    // Test configurations: different localRot values for the knee
+    const configs = [
+        {
+            name: 'Original (90° around Z)',
+            localRot: [0.7071067811865476, 0, 0, 0.7071067811865475], // wxyz
+            jointType: 'revolute', axis: E_TWIST
+        },
+        {
+            name: 'Negative (−90° around Z)',
+            localRot: [0.7071067811865476, 0, 0, -0.7071067811865475],
+            jointType: 'revolute', axis: E_TWIST
+        },
+        {
+            name: 'Elbow-style (90° around −Y)',
+            localRot: [0.7071067811865476, 0, -0.7071067811865475, 0],
+            jointType: 'revolute', axis: E_TWIST
+        },
+        {
+            name: 'Identity localRot + SWING1',
+            localRot: [1, 0, 0, 0],
+            jointType: 'spherical', axis: E_SWING1
+        },
+        {
+            name: 'Identity localRot + SWING1 (revolute type)',
+            localRot: [1, 0, 0, 0],
+            jointType: 'revolute_swing1', axis: E_SWING1
+        },
+        {
+            name: '120° triple rotation [0.5,0.5,0.5,0.5]',
+            localRot: [0.5, 0.5, 0.5, 0.5],
+            jointType: 'revolute', axis: E_TWIST
+        },
+        {
+            name: '90° around X',
+            localRot: [0.7071067811865476, 0.7071067811865475, 0, 0],
+            jointType: 'revolute', axis: E_TWIST
+        },
+        {
+            name: '90° around Y',
+            localRot: [0.7071067811865476, 0, 0.7071067811865475, 0],
+            jointType: 'revolute', axis: E_TWIST
+        },
+    ];
+
+    const testAngles = [0, 0.5, 1.0, 1.5, -0.5];
+    // Also test with actual trace hip DOF values
+    const hipDofSets = [
+        { name: 'hip=0', twist: 0, swing1: 0, swing2: 0 },
+        { name: 'hip=trace', twist: -0.1405, swing1: -0.3460, swing2: -0.8115 },
+    ];
+
+    // === DEFINITIVE TEST: exact trace data ===
+    // Isaac Lab frame 0 reference foot position:
+    const isaacLabFoot = [-0.2844, 0.7846, 0.1010];
+    const traceRoot = { pos: [-0.0310, 0.7890, 0.7972], rot: [0.0593, 0.1507, -0.7036, 0.6919] }; // xyzw
+    const traceHip = { twist: -0.14048, swing1: -0.34596, swing2: -0.81146 };
+    const traceKnee = 1.01240;
+    const rootZ = 0.903; // T-pose height
+    const rootPos = [0, 0, rootZ];
+    const rootRot = [0, 0, 0, 1]; // identity
+
+    for (const cfg of configs) {
+        L('\n=== ' + cfg.name + ' ===');
+        L('localRot (wxyz): [' + cfg.localRot.join(', ') + ']');
+
+        // Build 3-link articulation
+        const artic = physics.createArticulationReducedCoordinate();
+        artic.setSolverIterationCounts(4, 0);
+
+        // Pelvis (root) at T-pose height
+        const pelvisPose = new PhysX.PxTransform(
+            new PhysX.PxVec3(0, 0, rootZ), new PhysX.PxQuat(0,0,0,1));
+        const pelvis = artic.createLink(null, pelvisPose);
+        const sg = new PhysX.PxSphereGeometry(0.09);
+        const ps = physics.createShape(sg, material, true, shapeFlags);
+        pelvis.attachShape(ps);
+        PhysX.PxRigidBodyExt.prototype.setMassAndUpdateInertia(pelvis, 10);
+
+        // Thigh (child of pelvis, offset Y=-0.084887)
+        const thighPose = new PhysX.PxTransform(
+            new PhysX.PxVec3(0, -0.084887, rootZ), new PhysX.PxQuat(0,0,0,1));
+        const thigh = artic.createLink(pelvis, thighPose);
+        const tg = new PhysX.PxCapsuleGeometry(0.055, 0.2);
+        const ts = physics.createShape(tg, material, true, shapeFlags);
+        thigh.attachShape(ts);
+        PhysX.PxRigidBodyExt.prototype.setMassAndUpdateInertia(thigh, 5);
+
+        // Hip joint (spherical, identity localRot)
+        const hipJoint = thigh.getInboundJoint();
+        hipJoint.setJointType(E_SPHERICAL);
+        hipJoint.setParentPose(new PhysX.PxTransform(
+            new PhysX.PxVec3(0, -0.084887, 0), new PhysX.PxQuat(0,0,0,1)));
+        hipJoint.setChildPose(new PhysX.PxTransform(
+            new PhysX.PxVec3(0,0,0), new PhysX.PxQuat(0,0,0,1)));
+        hipJoint.setMotion(E_TWIST, E_LIMITED);
+        hipJoint.setMotion(E_SWING1, E_LIMITED);
+        hipJoint.setMotion(E_SWING2, E_LIMITED);
+
+        // Shin (child of thigh, offset Z=-0.421546)
+        const shinPose = new PhysX.PxTransform(
+            new PhysX.PxVec3(0, -0.084887, rootZ - 0.421546), new PhysX.PxQuat(0,0,0,1));
+        const shin = artic.createLink(thigh, shinPose);
+        const sg2 = new PhysX.PxCapsuleGeometry(0.05, 0.2);
+        const ss = physics.createShape(sg2, material, true, shapeFlags);
+        shin.attachShape(ss);
+        PhysX.PxRigidBodyExt.prototype.setMassAndUpdateInertia(shin, 3);
+
+        // Foot (child of shin, offset Z=-0.40987)
+        const footPose = new PhysX.PxTransform(
+            new PhysX.PxVec3(0, -0.084887, rootZ - 0.421546 - 0.40987), new PhysX.PxQuat(0,0,0,1));
+        const foot = artic.createLink(shin, footPose);
+        const fg = new PhysX.PxBoxGeometry(0.09, 0.045, 0.03);
+        const fs = physics.createShape(fg, material, true, shapeFlags);
+        foot.attachShape(fs);
+        PhysX.PxRigidBodyExt.prototype.setMassAndUpdateInertia(foot, 1);
+
+        // Ankle joint (spherical, identity localRot, locked)
+        const ankleJoint = foot.getInboundJoint();
+        ankleJoint.setJointType(E_SPHERICAL);
+        ankleJoint.setParentPose(new PhysX.PxTransform(
+            new PhysX.PxVec3(0, 0, -0.40987), new PhysX.PxQuat(0,0,0,1)));
+        ankleJoint.setChildPose(new PhysX.PxTransform(
+            new PhysX.PxVec3(0,0,0), new PhysX.PxQuat(0,0,0,1)));
+        ankleJoint.setMotion(E_TWIST, E_LOCKED);
+        ankleJoint.setMotion(E_SWING1, E_LOCKED);
+        ankleJoint.setMotion(E_SWING2, E_LOCKED);
+
+        // Knee joint with test config
+        const kneeJoint = shin.getInboundJoint();
+        const lr = cfg.localRot;
+        const lp = [0, 0, -0.421546]; // localPos0
+
+        if (cfg.jointType === 'revolute' || cfg.jointType === 'revolute_swing1') {
+            kneeJoint.setJointType(E_REVOLUTE);
+        } else {
+            kneeJoint.setJointType(E_SPHERICAL);
+        }
+
+        kneeJoint.setParentPose(new PhysX.PxTransform(
+            new PhysX.PxVec3(lp[0], lp[1], lp[2]),
+            new PhysX.PxQuat(lr[1], lr[2], lr[3], lr[0]) // PxQuat(x,y,z,w)
+        ));
+        kneeJoint.setChildPose(new PhysX.PxTransform(
+            new PhysX.PxVec3(0,0,0),
+            new PhysX.PxQuat(lr[1], lr[2], lr[3], lr[0])
+        ));
+
+        const hingeAxis = cfg.axis;
+        kneeJoint.setMotion(hingeAxis, E_LIMITED);
+        kneeJoint.setLimitParams(hingeAxis, new PhysX.PxArticulationLimit(-3.14, 3.14));
+        // Lock other axes
+        if (hingeAxis !== E_TWIST) kneeJoint.setMotion(E_TWIST, E_LOCKED);
+        if (hingeAxis !== E_SWING1) kneeJoint.setMotion(E_SWING1, E_LOCKED);
+        if (hingeAxis !== E_SWING2) kneeJoint.setMotion(E_SWING2, E_LOCKED);
+
+        // Add to scene
+        scene.addArticulation(artic);
+
+        let maxErr = 0;
+        let allPass = true;
+
+        for (const hipSet of hipDofSets) {
+          L('  --- ' + hipSet.name + ' ---');
+          for (const angle of testAngles) {
+            // Set root pose
+            artic.setRootGlobalPose(new PhysX.PxTransform(
+                new PhysX.PxVec3(0, 0, rootZ), new PhysX.PxQuat(0,0,0,1)), true);
+
+            // Set hip DOFs
+            hipJoint.setJointPosition(E_TWIST, hipSet.twist);
+            hipJoint.setJointPosition(E_SWING1, hipSet.swing1);
+            hipJoint.setJointPosition(E_SWING2, hipSet.swing2);
+
+            // Set knee angle
+            kneeJoint.setJointPosition(hingeAxis, angle);
+
+            // Apply cache to propagate FK
+            const flags = new PhysX.PxArticulationCacheFlags(PhysX.PxArticulationCacheFlagEnum.eALL);
+            const cache = artic.createCache();
+            artic.copyInternalStateToCache(cache, flags);
+            artic.applyCache(cache, flags, true);
+
+            // Read FOOT position
+            const footGP = foot.getGlobalPose();
+            const fp = footGP.get_p();
+            const webFoot = [fp.get_x(), fp.get_y(), fp.get_z()];
+
+            // FK: hip rotation as expmap → quat (PhysX twist-swing → expmap)
+            // For spherical joints with identity localRot, PhysX axes = world axes:
+            // TWIST=X, SWING1=Y, SWING2=Z
+            // PhysX composes as: q = Rz(swing2) * Ry(swing1) * Rx(twist) [swing-twist decomp]
+            // BUT our FK uses expmap: q = expmap(ex, ey, ez) where dof_pos = [twist, swing1, swing2]
+            // These are DIFFERENT decompositions! The actual hip quat in PhysX may not match expmap.
+            // For this test, compute hipRot using the same twist-swing composition PhysX uses:
+            const rx = axisAngleToQuat([1,0,0], hipSet.twist);
+            const ry = axisAngleToQuat([0,1,0], hipSet.swing1);
+            const rz = axisAngleToQuat([0,0,1], hipSet.swing2);
+            // PhysX twist-swing: q = swing2 * swing1 * twist (right-to-left application)
+            const hipRot = quatMul(rz, quatMul(ry, rx));
+
+            const hipOffset = [0, -0.084887, 0];
+            const worldHipOff = quatRotVec(rootRot, hipOffset);
+            const thighPos = [rootPos[0]+worldHipOff[0], rootPos[1]+worldHipOff[1], rootPos[2]+worldHipOff[2]];
+            const thighRot = quatMul(rootRot, hipRot);
+
+            const kneeOffset = [0, 0, -0.421546];
+            const worldKneeOff = quatRotVec(thighRot, kneeOffset);
+            const shinPos = [thighPos[0]+worldKneeOff[0], thighPos[1]+worldKneeOff[1], thighPos[2]+worldKneeOff[2]];
+            const kneeRot = axisAngleToQuat([0, 1, 0], angle);
+            const shinRot = quatMul(thighRot, kneeRot);
+
+            const ankleOffset = [0, 0, -0.40987];
+            const rotatedAnkle = quatRotVec(shinRot, ankleOffset);
+            const fkFoot = [shinPos[0]+rotatedAnkle[0], shinPos[1]+rotatedAnkle[1], shinPos[2]+rotatedAnkle[2]];
+
+            const err = dist(webFoot, fkFoot);
+            maxErr = Math.max(maxErr, err);
+
+            const cls = err < 0.01 ? 'pass' : 'fail';
+            if (err >= 0.01) allPass = false;
+            L('  angle=' + angle.toFixed(1) + ': PhysX=[' + webFoot.map(v=>v.toFixed(4)).join(',') +
+              '] FK=[' + fkFoot.map(v=>v.toFixed(4)).join(',') + '] err=' + err.toFixed(4), cls);
+          }
+        }
+
+        L('  max_err=' + maxErr.toFixed(4) + (allPass ? ' ✓ ALL PASS' : ' ✗ FAILED'), allPass ? 'pass' : 'fail');
+
+        // Cleanup
+        scene.removeArticulation(artic);
+    }
+
+    // === DEFINITIVE TEST: reproduce exact Isaac Lab frame 0 ===
+    L('\n=== DEFINITIVE TEST: exact trace root + hip + knee ===');
+    {
+        const artic = physics.createArticulationReducedCoordinate();
+        artic.setSolverIterationCounts(4, 0);
+
+        // Build chain WITH a sibling torso branch (like the full character)
+        const pelvisPose = new PhysX.PxTransform(
+            new PhysX.PxVec3(0, 0, rootZ), new PhysX.PxQuat(0,0,0,1));
+        const pelvis = artic.createLink(null, pelvisPose);
+        const sg = new PhysX.PxSphereGeometry(0.09);
+        const ps = physics.createShape(sg, material, true, shapeFlags);
+        pelvis.attachShape(ps);
+        PhysX.PxRigidBodyExt.prototype.setMassAndUpdateInertia(pelvis, 10);
+
+        // Add torso as SIBLING branch (created BEFORE thigh, same as full character)
+        const torsoPose = new PhysX.PxTransform(
+            new PhysX.PxVec3(0, 0, rootZ + 0.236), new PhysX.PxQuat(0,0,0,1));
+        const torso = artic.createLink(pelvis, torsoPose);
+        const torsoG = new PhysX.PxSphereGeometry(0.07);
+        const torsoS = physics.createShape(torsoG, material, true, shapeFlags);
+        torso.attachShape(torsoS);
+        PhysX.PxRigidBodyExt.prototype.setMassAndUpdateInertia(torso, 8);
+        const abdJoint = torso.getInboundJoint();
+        abdJoint.setJointType(E_SPHERICAL);
+        abdJoint.setParentPose(new PhysX.PxTransform(
+            new PhysX.PxVec3(0, 0, 0.236), new PhysX.PxQuat(0,0,0,1)));
+        abdJoint.setChildPose(new PhysX.PxTransform(
+            new PhysX.PxVec3(0,0,0), new PhysX.PxQuat(0,0,0,1)));
+        abdJoint.setMotion(E_TWIST, E_LIMITED);
+        abdJoint.setMotion(E_SWING1, E_LIMITED);
+        abdJoint.setMotion(E_SWING2, E_LIMITED);
+
+        const thighPose = new PhysX.PxTransform(
+            new PhysX.PxVec3(0, -0.084887, rootZ), new PhysX.PxQuat(0,0,0,1));
+        const thigh = artic.createLink(pelvis, thighPose);
+        const tg = new PhysX.PxCapsuleGeometry(0.055, 0.2);
+        const ts = physics.createShape(tg, material, true, shapeFlags);
+        thigh.attachShape(ts);
+        PhysX.PxRigidBodyExt.prototype.setMassAndUpdateInertia(thigh, 5);
+
+        const hipJoint = thigh.getInboundJoint();
+        hipJoint.setJointType(E_SPHERICAL);
+        hipJoint.setParentPose(new PhysX.PxTransform(
+            new PhysX.PxVec3(0, -0.084887, 0), new PhysX.PxQuat(0,0,0,1)));
+        hipJoint.setChildPose(new PhysX.PxTransform(
+            new PhysX.PxVec3(0,0,0), new PhysX.PxQuat(0,0,0,1)));
+        hipJoint.setMotion(E_TWIST, E_LIMITED);
+        hipJoint.setMotion(E_SWING1, E_LIMITED);
+        hipJoint.setMotion(E_SWING2, E_LIMITED);
+
+        const shinPose = new PhysX.PxTransform(
+            new PhysX.PxVec3(0, -0.084887, rootZ - 0.421546), new PhysX.PxQuat(0,0,0,1));
+        const shin = artic.createLink(thigh, shinPose);
+        const sg2 = new PhysX.PxCapsuleGeometry(0.05, 0.2);
+        const ss = physics.createShape(sg2, material, true, shapeFlags);
+        shin.attachShape(ss);
+        PhysX.PxRigidBodyExt.prototype.setMassAndUpdateInertia(shin, 3);
+
+        const footPose = new PhysX.PxTransform(
+            new PhysX.PxVec3(0, -0.084887, rootZ - 0.421546 - 0.40987), new PhysX.PxQuat(0,0,0,1));
+        const foot = artic.createLink(shin, footPose);
+        const fg = new PhysX.PxBoxGeometry(0.09, 0.045, 0.03);
+        const fs = physics.createShape(fg, material, true, shapeFlags);
+        foot.attachShape(fs);
+        PhysX.PxRigidBodyExt.prototype.setMassAndUpdateInertia(foot, 1);
+
+        const ankleJoint = foot.getInboundJoint();
+        ankleJoint.setJointType(E_SPHERICAL);
+        ankleJoint.setParentPose(new PhysX.PxTransform(
+            new PhysX.PxVec3(0, 0, -0.40987), new PhysX.PxQuat(0,0,0,1)));
+        ankleJoint.setChildPose(new PhysX.PxTransform(
+            new PhysX.PxVec3(0,0,0), new PhysX.PxQuat(0,0,0,1)));
+        ankleJoint.setMotion(E_TWIST, E_LOCKED);
+        ankleJoint.setMotion(E_SWING1, E_LOCKED);
+        ankleJoint.setMotion(E_SWING2, E_LOCKED);
+
+        // Knee joint - original localRot
+        const kneeJoint = shin.getInboundJoint();
+        const lr = [0.7071067811865476, 0, 0, 0.7071067811865475]; // wxyz
+        kneeJoint.setJointType(E_REVOLUTE);
+        kneeJoint.setParentPose(new PhysX.PxTransform(
+            new PhysX.PxVec3(0, 0, -0.421546),
+            new PhysX.PxQuat(lr[1], lr[2], lr[3], lr[0])));
+        kneeJoint.setChildPose(new PhysX.PxTransform(
+            new PhysX.PxVec3(0, 0, 0),
+            new PhysX.PxQuat(lr[1], lr[2], lr[3], lr[0])));
+        kneeJoint.setMotion(E_TWIST, E_LIMITED);
+        kneeJoint.setLimitParams(E_TWIST, new PhysX.PxArticulationLimit(-3.14, 3.14));
+        kneeJoint.setMotion(E_SWING1, E_LOCKED);
+        kneeJoint.setMotion(E_SWING2, E_LOCKED);
+
+        scene.addArticulation(artic);
+
+        // Set exact trace state
+        const rp = traceRoot.pos, rr = traceRoot.rot;
+        artic.setRootGlobalPose(new PhysX.PxTransform(
+            new PhysX.PxVec3(rp[0], rp[1], rp[2]),
+            new PhysX.PxQuat(rr[0], rr[1], rr[2], rr[3])), true);
+
+        // Set abdomen DOFs to the trace values (from dofInfo[0:3])
+        abdJoint.setJointPosition(E_TWIST, -0.0330);  // abdomen_x
+        abdJoint.setJointPosition(E_SWING1, 0.7190);  // abdomen_y
+        abdJoint.setJointPosition(E_SWING2, -0.0476); // abdomen_z
+
+        hipJoint.setJointPosition(E_TWIST, traceHip.twist);
+        hipJoint.setJointPosition(E_SWING1, traceHip.swing1);
+        hipJoint.setJointPosition(E_SWING2, traceHip.swing2);
+        kneeJoint.setJointPosition(E_TWIST, traceKnee);
+
+        // Apply cache
+        const flags = new PhysX.PxArticulationCacheFlags(PhysX.PxArticulationCacheFlagEnum.eALL);
+        const cache = artic.createCache();
+        artic.copyInternalStateToCache(cache, flags);
+        artic.applyCache(cache, flags, true);
+
+        // Read positions AND rotations
+        const bodies = [
+            { name: 'pelvis', link: pelvis },
+            { name: 'thigh', link: thigh },
+            { name: 'shin', link: shin },
+            { name: 'foot', link: foot },
+        ];
+        for (const b of bodies) {
+            const gp = b.link.getGlobalPose();
+            const p = gp.get_p();
+            const q = gp.get_q();
+            L('  ' + b.name + ' pos: [' + p.get_x().toFixed(4) + ',' + p.get_y().toFixed(4) + ',' + p.get_z().toFixed(4) + ']' +
+              ' rot(xyzw): [' + q.get_x().toFixed(4) + ',' + q.get_y().toFixed(4) + ',' + q.get_z().toFixed(4) + ',' + q.get_w().toFixed(4) + ']');
+        }
+        // Read back hip DOF values to verify
+        const hipTw = hipJoint.getJointPosition(E_TWIST);
+        const hipS1 = hipJoint.getJointPosition(E_SWING1);
+        const hipS2 = hipJoint.getJointPosition(E_SWING2);
+        const kneeTw = kneeJoint.getJointPosition(E_TWIST);
+        L('  Hip DOF readback: twist=' + hipTw.toFixed(4) + ' swing1=' + hipS1.toFixed(4) + ' swing2=' + hipS2.toFixed(4));
+        L('  Knee DOF readback: twist=' + kneeTw.toFixed(4));
+
+        const footGP = foot.getGlobalPose().get_p();
+        const webFoot = [footGP.get_x(), footGP.get_y(), footGP.get_z()];
+        const err = dist(webFoot, isaacLabFoot);
+        const cls = err < 0.05 ? 'pass' : 'fail';
+        L('  PhysX WASM foot: [' + webFoot.map(v=>v.toFixed(4)).join(',') + ']', cls);
+        L('  Isaac Lab foot:  [' + isaacLabFoot.map(v=>v.toFixed(4)).join(',') + ']', cls);
+        L('  Error: ' + err.toFixed(4) + (err < 0.05 ? ' ✓ MATCH' : ' ✗ MISMATCH'), cls);
+
+        // Now compute FK with proper EXPMAP for the hip (not Rz*Ry*Rx!)
+        // expmap: axis_angle_vec = [twist, swing1, swing2], angle = |vec|
+        function expMapToQuat(ex, ey, ez) {
+            const angle = Math.sqrt(ex*ex + ey*ey + ez*ez);
+            if (angle < 1e-10) return [0, 0, 0, 1];
+            const ha = angle * 0.5, s = Math.sin(ha) / angle, c = Math.cos(ha);
+            return [ex*s, ey*s, ez*s, c];
+        }
+        const hipExpQuat = expMapToQuat(traceHip.twist, traceHip.swing1, traceHip.swing2);
+        const rr2 = traceRoot.rot;
+        const rootQuat = [rr2[0], rr2[1], rr2[2], rr2[3]]; // xyzw
+        const thighRotFK = quatMul(rootQuat, hipExpQuat);
+
+        const hipOff = [0, -0.084887, 0];
+        const wHipOff = quatRotVec(rootQuat, hipOff);
+        const thighPosFK = [traceRoot.pos[0]+wHipOff[0], traceRoot.pos[1]+wHipOff[1], traceRoot.pos[2]+wHipOff[2]];
+
+        const kneeOff = [0, 0, -0.421546];
+        const wKneeOff = quatRotVec(thighRotFK, kneeOff);
+        const shinPosFK = [thighPosFK[0]+wKneeOff[0], thighPosFK[1]+wKneeOff[1], thighPosFK[2]+wKneeOff[2]];
+        const kneeRotQ = axisAngleToQuat([0,1,0], traceKnee);
+        const shinRotFK = quatMul(thighRotFK, kneeRotQ);
+
+        const ankleOff = [0, 0, -0.40987];
+        const wAnkleOff = quatRotVec(shinRotFK, ankleOff);
+        const footPosFK = [shinPosFK[0]+wAnkleOff[0], shinPosFK[1]+wAnkleOff[1], shinPosFK[2]+wAnkleOff[2]];
+
+        const errFK = dist(footPosFK, isaacLabFoot);
+        const errWasm = dist(webFoot, footPosFK);
+        L('  ExpMap FK foot: [' + footPosFK.map(v=>v.toFixed(4)).join(',') + ']');
+        L('  ExpMap FK vs Isaac Lab: ' + errFK.toFixed(4));
+        L('  PhysX WASM vs ExpMap FK: ' + errWasm.toFixed(4));
+
+        scene.removeArticulation(artic);
+    }
+
+    L('\n=== DONE ===');
+}
+</script>
+</body>
+</html>
