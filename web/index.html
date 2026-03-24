@@ -196,38 +196,10 @@ function gaussianRandom() {
 // ---------------------------------------------------------------------------
 async function loadHumanoidData() {
     setStatus('Loading character data...');
-    humanoidData = {};
 
-    // After loadOnnxModel(), humanoidData may already have MJCF + config
-    // from baked ONNX metadata. If not, try external MJCF file + JSON config.
-    if (!humanoidData.bodies) {
-        // Try MJCF file (Pages: same dir; local dev: repo-relative)
-        try {
-            let xmlResp = await fetch('./humanoid_sword_shield.xml');
-            if (!xmlResp.ok) xmlResp = await fetch('../data/assets/sword_shield/humanoid_sword_shield.xml');
-            if (xmlResp.ok) {
-                const mjcf = parseMJCF(await xmlResp.text());
-                Object.assign(humanoidData, mjcf);
-                console.log('MJCF parsed:', humanoidData.bodies.length, 'bodies');
-            }
-        } catch(e) {}
-    }
-
-    // Load model config from JSON if not already provided by ONNX metadata
-    if (!humanoidData.obs_dim) {
-        try {
-            const cfgResp = await fetch('./model_config.json');
-            if (cfgResp.ok) {
-                const cfg = await cfgResp.json();
-                for (const [k, v] of Object.entries(cfg)) {
-                    if (humanoidData[k] === undefined) humanoidData[k] = v;
-                }
-                console.log('Loaded model config from JSON');
-            }
-        } catch(e) {}
-    }
-
-    if (!humanoidData.bodies) throw new Error('No character data available');
+    // All data comes from ONNX metadata (baked MJCF + config).
+    // loadOnnxModel() already extracted it into humanoidData.
+    if (!humanoidData.bodies) throw new Error('No character data in ONNX metadata');
 
     // FIX: Force consecutive PhysX axis assignment for spherical joints.
     // PhysX WASM resolves spherical DOFs as expmap(TWIST, SWING1, SWING2).
