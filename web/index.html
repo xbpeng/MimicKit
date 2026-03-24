@@ -1063,7 +1063,10 @@ function buildObservation() {
             fkRot[j] = quatMul(parentRot, localCombined);
         }
 
-        // Key body positions relative to root, in heading frame
+        // Key body positions from JS-side FK (matches Python kin_char_model)
+        // Note: Isaac Lab's get_body_pos returns PhysX link positions which differ
+        // from FK, but the policy was trained with the kin_char_model FK positions
+        // passed through compute_char_obs.
         const keyIds = humanoidData.key_body_ids || [2, 5, 10, 13, 16, 6];
         for (const bid of keyIds) {
             const bp = fkPos[bid];
