@@ -339,7 +339,7 @@ function buildArticulation() {
     // Isaac Lab: USD articulation=32/1, but scene maxPositionIterationCount=4 caps it
     // The effective iterations in Isaac Lab are 4/0
     // PhysX WASM has no scene cap, so we set the effective value directly
-    articulation.setSolverIterationCounts(16, 4);
+    articulation.setSolverIterationCounts(16, 1);
     // Match Isaac Lab: sleep threshold and stabilization threshold
     if (typeof articulation.setSleepThreshold === 'function') {
         articulation.setSleepThreshold(5e-5);
@@ -466,7 +466,7 @@ function buildArticulation() {
         // Per-body solver iterations - scene caps at 4/0, so setting higher is no-op in Isaac Lab
         // Match effective iterations: 4 position, 0 velocity
         if (typeof link.setSolverIterationCounts === 'function') {
-            link.setSolverIterationCounts(16, 4);
+            link.setSolverIterationCounts(16, 1);
         }
         // Sleep threshold (Isaac Lab: 5e-5)
         if (typeof link.setSleepThreshold === 'function') {
