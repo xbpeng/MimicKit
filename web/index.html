@@ -1914,36 +1914,50 @@ async function init() {
             const rpResp = await fetch('./random_pose_test.json?' + Date.now());
             const rpData = await rpResp.json();
             if (rpData && rpData.root_pos) {
-                // Set the exact state via per-joint API (NOT resetHumanoid)
-                const rpAxes = [E_TWIST, E_SWING1, E_SWING2];
-                const rpMap = {};
-                for (const l of links) rpMap[l.name] = l.link;
-
-                articulation.setRootGlobalPose(new PhysX.PxTransform(
-                    new PhysX.PxVec3(rpData.root_pos[0], rpData.root_pos[1], rpData.root_pos[2]),
-                    new PhysX.PxQuat(rpData.root_rot[0], rpData.root_rot[1], rpData.root_rot[2], rpData.root_rot[3])
-                ), true);
-                try {
-                    articulation.setRootLinearVelocity(new PhysX.PxVec3(rpData.root_vel[0], rpData.root_vel[1], rpData.root_vel[2]));
-                    articulation.setRootAngularVelocity(new PhysX.PxVec3(rpData.root_ang_vel[0], rpData.root_ang_vel[1], rpData.root_ang_vel[2]));
-                } catch(e) { console.log('setRootVelocity failed:', e.message); }
-
-                for (let i = 0; i < humanoidData.dofInfo.length; i++) {
-                    const dof = humanoidData.dofInfo[i];
-                    const cl = rpMap[dof.child_body];
-                    if (!cl) continue;
-                    try {
-                        const jnt = cl.getInboundJoint();
-                        jnt.setJointPosition(rpAxes[dof.physx_axis], rpData.dof_pos[i]);
-                        jnt.setJointVelocity(rpAxes[dof.physx_axis], rpData.dof_vel[i]);
-                    } catch(e) {}
-                }
-
-                // Propagate via cache
+                // Set ALL state atomically via PxArticulationCache
+                // This is the PhysX-native way to set articulation state,
+                // including root velocities which setRootLinearVelocity doesn't handle
                 const rpFlags = new PhysX.PxArticulationCacheFlags(PhysX.PxArticulationCacheFlagEnum.eALL);
                 const rpCache = articulation.createCache();
                 articulation.copyInternalStateToCache(rpCache, rpFlags);
+
+                // Set root pose via cache rootLinkData
+                const rld = rpCache.get_rootLinkData();
+                const rt = rld.get_transform();
+                rt.get_p().set_x(rpData.root_pos[0]);
+                rt.get_p().set_y(rpData.root_pos[1]);
+                rt.get_p().set_z(rpData.root_pos[2]);
+                rt.get_q().set_x(rpData.root_rot[0]);
+                rt.get_q().set_y(rpData.root_rot[1]);
+                rt.get_q().set_z(rpData.root_rot[2]);
+                rt.get_q().set_w(rpData.root_rot[3]);
+
+                // Set root velocities via cache rootLinkData
+                rld.get_worldLinVel().set_x(rpData.root_vel[0]);
+                rld.get_worldLinVel().set_y(rpData.root_vel[1]);
+                rld.get_worldLinVel().set_z(rpData.root_vel[2]);
+                rld.get_worldAngVel().set_x(rpData.root_ang_vel[0]);
+                rld.get_worldAngVel().set_y(rpData.root_ang_vel[1]);
+                rld.get_worldAngVel().set_z(rpData.root_ang_vel[2]);
+
+                // Set DOF positions and velocities via cache buffers
+                const jpBuf = rpCache.get_jointPosition();
+                const jvBuf = rpCache.get_jointVelocity();
+                for (let i = 0; i < rpData.dof_pos.length; i++) {
+                    jpBuf.set(i, rpData.dof_pos[i]);
+                    jvBuf.set(i, rpData.dof_vel[i]);
+                }
+
+                // Apply atomically - this propagates FK and sets all state at once
                 articulation.applyCache(rpCache, rpFlags, true);
+
+                // Verify root velocity was set
+                const rvCheck = links[0].link.getLinearVelocity();
+                const ravCheck = links[0].link.getAngularVelocity();
+                console.log('Root vel set: [' + rvCheck.get_x().toFixed(3) + ',' + rvCheck.get_y().toFixed(3) + ',' + rvCheck.get_z().toFixed(3) + ']' +
+                    ' expected: [' + rpData.root_vel.map(v=>v.toFixed(3)).join(',') + ']');
+                console.log('Root angvel set: [' + ravCheck.get_x().toFixed(3) + ',' + ravCheck.get_y().toFixed(3) + ',' + ravCheck.get_z().toFixed(3) + ']' +
+                    ' expected: [' + rpData.root_ang_vel.map(v=>v.toFixed(3)).join(',') + ']');
 
                 // Build obs
                 const rpObs = buildObservation();
