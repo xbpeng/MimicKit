@@ -243,9 +243,38 @@ def main():
     meta['pelvis_z'] = float(getattr(env, '_pelvis_z', json_fallback.get('pelvis_z', 0.703)))
     meta['tpose_pelvis_z'] = float(getattr(env, '_tpose_pelvis_z', json_fallback.get('tpose_pelvis_z', 0.903)))
 
-    # Write metadata as JSON string key-value pairs
+    # Bake MJCF XML into metadata so the ONNX is a single-file character kit
+    mjcf_path = getattr(env, '_char_file', None) or json_fallback.get('mjcf_file')
+    # Also try the arg_file's char_file
+    if not mjcf_path:
+        try:
+            mjcf_path = mk_args.parse_string('char_file')
+        except: pass
+    # Try common locations
+    if not mjcf_path or not os.path.isfile(mjcf_path):
+        for candidate in [
+            'data/assets/sword_shield/humanoid_sword_shield.xml',
+            os.path.join(os.path.dirname(args.output), 'humanoid_sword_shield.xml'),
+        ]:
+            if os.path.isfile(candidate):
+                mjcf_path = candidate
+                break
+    if mjcf_path and os.path.isfile(mjcf_path):
+        with open(mjcf_path) as f:
+            meta['mjcf_xml'] = f.read()
+        print(f"  Baked MJCF from {mjcf_path} ({len(meta['mjcf_xml'])} chars)")
+
+    # Write ALL metadata as a single JSON blob under a sentinel key.
+    # This allows the web demo to find it by scanning the raw ONNX bytes
+    # (onnxruntime-web doesn't expose metadata via its JS API).
     import json
+    sentinel_key = 'mimickit_config'
+    config_json = json.dumps(meta, separators=(',', ':'))  # compact
+    entry = onnx.StringStringEntryProto(key=sentinel_key, value=config_json)
+    model.metadata_props.append(entry)
+    # Also write individual entries for tools that read metadata normally
     for key, value in meta.items():
+        if key == 'mjcf_xml': continue  # already in the blob
         entry = onnx.StringStringEntryProto(key=key, value=json.dumps(value))
         model.metadata_props.append(entry)
 

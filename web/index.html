@@ -131,7 +131,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 // ---------------------------------------------------------------------------
 let PhysX, physics, pxScene, foundation, material;
 let articulation, links = [];  // { name, link, meshGroup }
-let humanoidData;
+let humanoidData = {};
 let onnxSession;
 let renderer, camera, scene3d, controls, worldGroup;
 let latentVec;
@@ -196,27 +196,27 @@ function gaussianRandom() {
 // ---------------------------------------------------------------------------
 async function loadHumanoidData() {
     setStatus('Loading character data...');
+    humanoidData = {};
 
-    // Try MJCF + ONNX metadata first, fall back to humanoid_data.json
-    let mjcfParsed = null;
-    try {
-        // Try same-directory first (GitHub Pages deploys MJCF into web/),
-        // then repo-relative (local dev: python -m http.server from repo root)
-        let xmlResp = await fetch('./humanoid_sword_shield.xml');
-        if (!xmlResp.ok) xmlResp = await fetch('../data/assets/sword_shield/humanoid_sword_shield.xml');
-        if (xmlResp.ok) {
-            const xmlText = await xmlResp.text();
-            mjcfParsed = parseMJCF(xmlText);
-            console.log('MJCF parsed:', mjcfParsed.bodies.length, 'bodies,', mjcfParsed.dofInfo.length, 'DOFs');
-        }
-    } catch(e) { console.log('MJCF not available, will use JSON fallback'); }
-
-    if (mjcfParsed) {
-        humanoidData = mjcfParsed;
-        // Load model config (normalizers, init pose, action bounds)
-        // These come from ONNX metadata if available, otherwise from model_config.json
+    // After loadOnnxModel(), humanoidData may already have MJCF + config
+    // from baked ONNX metadata. If not, try external MJCF file + JSON config.
+    if (!humanoidData.bodies) {
+        // Try MJCF file (Pages: same dir; local dev: repo-relative)
         try {
-            const cfgResp = await fetch('./model_config.json?v=' + Date.now());
+            let xmlResp = await fetch('./humanoid_sword_shield.xml');
+            if (!xmlResp.ok) xmlResp = await fetch('../data/assets/sword_shield/humanoid_sword_shield.xml');
+            if (xmlResp.ok) {
+                const mjcf = parseMJCF(await xmlResp.text());
+                Object.assign(humanoidData, mjcf);
+                console.log('MJCF parsed:', humanoidData.bodies.length, 'bodies');
+            }
+        } catch(e) {}
+    }
+
+    // Load model config from JSON if not already provided by ONNX metadata
+    if (!humanoidData.obs_dim) {
+        try {
+            const cfgResp = await fetch('./model_config.json');
             if (cfgResp.ok) {
                 const cfg = await cfgResp.json();
                 for (const [k, v] of Object.entries(cfg)) {
@@ -225,13 +225,9 @@ async function loadHumanoidData() {
                 console.log('Loaded model config from JSON');
             }
         } catch(e) {}
-    } else {
-        // Fallback: try loading legacy humanoid_data.json (full skeleton + model config)
-        const resp = await fetch('./humanoid_data.json?v=' + Date.now());
-        if (!resp.ok) throw new Error('No MJCF or JSON character data available');
-        humanoidData = await resp.json();
-        console.log('Loaded from JSON fallback:', humanoidData.bodies.length, 'bodies');
     }
+
+    if (!humanoidData.bodies) throw new Error('No character data available');
 
     // FIX: Force consecutive PhysX axis assignment for spherical joints.
     // PhysX WASM resolves spherical DOFs as expmap(TWIST, SWING1, SWING2).
@@ -252,41 +248,92 @@ async function loadHumanoidData() {
 // ---------------------------------------------------------------------------
 // Load ONNX model + extract baked metadata
 // ---------------------------------------------------------------------------
+// ONNX binary buffer (kept for metadata extraction)
+let onnxBuffer = null;
+
 async function loadOnnxModel() {
     setStatus('Loading ONNX model...');
     ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.21.0/dist/';
-    onnxSession = await ort.InferenceSession.create(
-        './ase_humanoid_sword_shield_actor.onnx',
-        { executionProviders: ['wasm'] }
-    );
-    console.log('ONNX model loaded');
 
-    // Extract metadata baked into the ONNX file by export_onnx_v2.py.
-    // This provides normalizers, init pose, action bounds, etc.
-    // Falls back to humanoid_data.json values if metadata is absent.
-    const meta = {};
-    try {
-        // Try multiple API paths for ONNX Runtime Web metadata access
-        const rawMeta = onnxSession.handler?.metadata
-            || onnxSession._model?.metadataMap
-            || onnxSession.metadata
-            || {};
-        for (const [k, v] of Object.entries(rawMeta)) {
-            try { meta[k] = JSON.parse(v); } catch { meta[k] = v; }
+    // Fetch as ArrayBuffer so we can both create the session AND scan for metadata
+    const resp = await fetch('./ase_humanoid_sword_shield_actor.onnx');
+    onnxBuffer = await resp.arrayBuffer();
+    onnxSession = await ort.InferenceSession.create(onnxBuffer, { executionProviders: ['wasm'] });
+    console.log('ONNX model loaded (' + (onnxBuffer.byteLength / 1024 / 1024).toFixed(1) + ' MB)');
+
+    // Extract baked metadata by scanning the ONNX binary for our sentinel key.
+    // onnxruntime-web doesn't expose metadata_props via its JS API, so we
+    // search the raw protobuf bytes for the 'mimickit_config' key and extract
+    // the JSON value that follows it.
+    const meta = extractOnnxMetadata(onnxBuffer);
+    onnxBuffer = null; // free memory
+
+    if (meta) {
+        const fields = ['obs_dim','act_dim','latent_dim','obs_mean','obs_std','a_mean','a_std',
+                        'init_dof_pos','init_root_pos','init_root_rot_quat','action_low','action_high',
+                        'key_body_ids','global_obs','pelvis_z','tpose_pelvis_z'];
+        for (const f of fields) {
+            if (meta[f] !== undefined) humanoidData[f] = meta[f];
         }
-        if (Object.keys(meta).length > 0)
-            console.log('ONNX metadata:', Object.keys(meta).join(', '));
-        else
-            console.log('No ONNX metadata found (will need JSON fallback for model config)');
-    } catch(e) { console.log('ONNX metadata extraction failed:', e.message); }
-
-    // Merge metadata into humanoidData (metadata takes priority)
-    const fields = ['obs_dim','act_dim','latent_dim','obs_mean','obs_std','a_mean','a_std',
-                    'init_dof_pos','init_root_pos','init_root_rot_quat','action_low','action_high',
-                    'key_body_ids','global_obs','pelvis_z','tpose_pelvis_z'];
-    for (const f of fields) {
-        if (meta[f] !== undefined) humanoidData[f] = meta[f];
+        // If MJCF XML is baked in and we haven't parsed it yet, parse it now
+        if (meta.mjcf_xml && !humanoidData.bodies) {
+            const mjcfData = parseMJCF(meta.mjcf_xml);
+            Object.assign(humanoidData, mjcfData);
+            console.log('Parsed MJCF from ONNX metadata:', humanoidData.bodies.length, 'bodies');
+        }
     }
+}
+
+/**
+ * Scan ONNX protobuf bytes for the 'mimickit_config' sentinel key and
+ * extract the JSON config blob that follows it.
+ */
+function extractOnnxMetadata(buffer) {
+    const bytes = new Uint8Array(buffer);
+    // Search for the sentinel key as UTF-8 bytes
+    const sentinel = 'mimickit_config';
+    const sentinelBytes = new TextEncoder().encode(sentinel);
+
+    for (let i = 0; i < bytes.length - sentinelBytes.length - 10; i++) {
+        let match = true;
+        for (let j = 0; j < sentinelBytes.length; j++) {
+            if (bytes[i + j] !== sentinelBytes[j]) { match = false; break; }
+        }
+        if (!match) continue;
+
+        // Found the key. In protobuf, StringStringEntryProto has:
+        //   field 1 (key): tag=0x0a, then varint length, then string
+        //   field 2 (value): tag=0x12, then varint length, then string
+        // Search forward from the key for the value field tag (0x12)
+        const searchStart = i + sentinelBytes.length;
+        for (let k = searchStart; k < Math.min(searchStart + 20, bytes.length); k++) {
+            if (bytes[k] === 0x12) {
+                // Read varint length
+                let len = 0, shift = 0, pos = k + 1;
+                while (pos < bytes.length) {
+                    const b = bytes[pos++];
+                    len |= (b & 0x7f) << shift;
+                    shift += 7;
+                    if ((b & 0x80) === 0) break;
+                }
+                // Extract the JSON string
+                if (len > 0 && pos + len <= bytes.length) {
+                    const jsonStr = new TextDecoder().decode(bytes.slice(pos, pos + len));
+                    try {
+                        const config = JSON.parse(jsonStr);
+                        console.log('Extracted ONNX metadata (' + Object.keys(config).length + ' keys, ' +
+                            Math.round(len/1024) + 'KB)');
+                        return config;
+                    } catch(e) {
+                        console.log('Found sentinel but JSON parse failed:', e.message);
+                    }
+                }
+                break;
+            }
+        }
+    }
+    console.log('No mimickit_config found in ONNX binary');
+    return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1456,8 +1503,10 @@ async function mainLoop(timestamp) {
 // ---------------------------------------------------------------------------
 async function init() {
     try {
-        await loadHumanoidData();
+        // Load ONNX first (extracts baked metadata including MJCF + config)
+        // then load any missing data from external MJCF/JSON files
         await Promise.all([loadOnnxModel(), initPhysX()]);
+        await loadHumanoidData();
 
         setStatus('Building humanoid...');
         buildArticulation();
