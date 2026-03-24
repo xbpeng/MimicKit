@@ -94,8 +94,8 @@ canvas { display: block; }
     <span id="gravityVal">-9.81</span>
 
     <div>Substeps</div>
-    <input type="range" id="sliderSubsteps" min="1" max="16" step="1" value="4">
-    <span id="substepsVal">4</span>
+    <input type="range" id="sliderSubsteps" min="1" max="16" step="1" value="1">
+    <span id="substepsVal">1</span>
 
     <div class="separator"></div>
 
@@ -150,7 +150,7 @@ let SHAPE_FLAGS_VAL;
 let groundActor;  // ground plane actor (removable for state-setting)
 let groundRemoved = false;
 
-let numSubsteps = 4;
+let numSubsteps = 1;
 const DT = 1 / 120;
 
 // Debug state
@@ -339,7 +339,7 @@ function buildArticulation() {
     // Isaac Lab: USD articulation=32/1, but scene maxPositionIterationCount=4 caps it
     // The effective iterations in Isaac Lab are 4/0
     // PhysX WASM has no scene cap, so we set the effective value directly
-    articulation.setSolverIterationCounts(4, 0);
+    articulation.setSolverIterationCounts(16, 4);
     // Match Isaac Lab: sleep threshold and stabilization threshold
     if (typeof articulation.setSleepThreshold === 'function') {
         articulation.setSleepThreshold(5e-5);
@@ -466,7 +466,7 @@ function buildArticulation() {
         // Per-body solver iterations - scene caps at 4/0, so setting higher is no-op in Isaac Lab
         // Match effective iterations: 4 position, 0 velocity
         if (typeof link.setSolverIterationCounts === 'function') {
-            link.setSolverIterationCounts(4, 0);
+            link.setSolverIterationCounts(16, 4);
         }
         // Sleep threshold (Isaac Lab: 5e-5)
         if (typeof link.setSleepThreshold === 'function') {
