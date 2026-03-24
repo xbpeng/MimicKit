@@ -104,11 +104,13 @@ function L(msg, cls) { const s = document.createElement('span'); s.className = c
     for (let i = 0; i < Math.min(js.bodies.length, py.bodies.length); i++) {
         const jb = js.bodies[i], pb = py.bodies[i];
         if (pb.mass !== undefined) {
-            check('body['+i+'].mass ('+jb.name+')', jb.mass, pb.mass, pb.mass * 0.05); // 5% tolerance
+            check('body['+i+'].mass ('+jb.name+')', jb.mass, pb.mass, pb.mass * 0.001); // 0.1% tolerance
             if (pb.com) for (let k = 0; k < 3; k++)
-                check('body['+i+'].com['+k+']', jb.com[k], pb.com[k], 0.01);
-            if (pb.inertia) for (let k = 0; k < 3; k++)
-                check('body['+i+'].inertia['+k+']', jb.inertia[k], pb.inertia[k], pb.inertia[k] * 0.1);
+                check('body['+i+'].com['+k+']', jb.com[k], pb.com[k], 0.001);
+            if (pb.inertia) for (let k = 0; k < 3; k++) {
+                const tol = Math.max(pb.inertia[k] * 0.01, 1e-6); // 1% tolerance
+                check('body['+i+'].inertia['+k+'] ('+jb.name+')', jb.inertia[k], pb.inertia[k], tol);
+            }
         }
     }
     L('Mass/Inertia: ' + (pass-p4) + ' pass, ' + (fail-f4) + ' fail', (fail-f4) ? 'fail' : 'pass');

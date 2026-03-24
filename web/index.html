@@ -222,44 +222,14 @@ async function loadHumanoidData() {
         }
     } catch(e) { console.log('MJCF not available, will use JSON fallback'); }
 
-    // Always load JSON for model-specific data (normalizers, init pose, etc.)
-    // If MJCF was parsed, use its skeleton data; JSON fills in the rest.
-    try {
+    if (mjcfParsed) {
+        humanoidData = mjcfParsed;
+    } else {
+        // Fallback: try loading legacy humanoid_data.json
         const resp = await fetch('./humanoid_data.json?v=' + Date.now());
-        if (resp.ok) {
-            const jsonData = await resp.json();
-            if (mjcfParsed) {
-                // Use MJCF skeleton, merge model-specific fields from JSON
-                humanoidData = mjcfParsed;
-                const modelFields = ['obs_dim','act_dim','latent_dim','obs_mean','obs_std','a_mean','a_std',
-                    'init_dof_pos','init_root_pos','init_root_rot_quat','action_low','action_high',
-                    'key_body_ids','global_obs','pelvis_z','tpose_pelvis_z'];
-                for (const f of modelFields) {
-                    if (jsonData[f] !== undefined && humanoidData[f] === undefined)
-                        humanoidData[f] = jsonData[f];
-                }
-                // Override JS-computed mass/inertia/com with MuJoCo reference if available
-                // (MuJoCo computes these more accurately for rotated capsules)
-                if (jsonData.bodies) {
-                    for (let i = 0; i < Math.min(humanoidData.bodies.length, jsonData.bodies.length); i++) {
-                        const jb = jsonData.bodies[i], hb = humanoidData.bodies[i];
-                        if (jb.mass !== undefined) hb.mass = jb.mass;
-                        if (jb.inertia !== undefined) hb.inertia = jb.inertia;
-                        if (jb.com !== undefined) hb.com = jb.com;
-                    }
-                }
-                console.log('Merged model config from JSON');
-            } else {
-                humanoidData = jsonData;
-                console.log('Loaded from JSON:', humanoidData.bodies.length, 'bodies');
-            }
-        } else if (mjcfParsed) {
-            humanoidData = mjcfParsed;
-            console.log('Using MJCF only (no JSON available)');
-        }
-    } catch(e) {
-        if (mjcfParsed) humanoidData = mjcfParsed;
-        else throw new Error('No character data available');
+        if (!resp.ok) throw new Error('No MJCF or JSON character data available');
+        humanoidData = await resp.json();
+        console.log('Loaded from JSON fallback:', humanoidData.bodies.length, 'bodies');
     }
 
     // FIX: Force consecutive PhysX axis assignment for spherical joints.
