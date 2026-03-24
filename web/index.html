@@ -110,6 +110,8 @@ canvas { display: block; }
 
 <!-- ONNX Runtime (loaded globally) -->
 <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.21.0/dist/ort.min.js"></script>
+<!-- MJCF parser (converts MuJoCo XML to humanoidData at runtime) -->
+<script src="parseMJCF.js"></script>
 
 <!-- Import map for three.js -->
 <script type="importmap">
@@ -207,36 +209,67 @@ function gaussianRandom() {
 // Load humanoid JSON
 // ---------------------------------------------------------------------------
 async function loadHumanoidData() {
-    setStatus('Loading humanoid data...');
-    const resp = await fetch('./humanoid_data.json?v=' + Date.now());
-    humanoidData = await resp.json();
-    console.log('Humanoid data loaded:', humanoidData.bodies.length, 'bodies');
+    setStatus('Loading character data...');
+
+    // Try MJCF + ONNX metadata first, fall back to humanoid_data.json
+    let mjcfParsed = null;
+    try {
+        const xmlResp = await fetch('./humanoid_sword_shield.xml');
+        if (xmlResp.ok) {
+            const xmlText = await xmlResp.text();
+            mjcfParsed = parseMJCF(xmlText);
+            console.log('MJCF parsed:', mjcfParsed.bodies.length, 'bodies,', mjcfParsed.dofInfo.length, 'DOFs');
+        }
+    } catch(e) { console.log('MJCF not available, will use JSON fallback'); }
+
+    // Always load JSON for model-specific data (normalizers, init pose, etc.)
+    // If MJCF was parsed, use its skeleton data; JSON fills in the rest.
+    try {
+        const resp = await fetch('./humanoid_data.json?v=' + Date.now());
+        if (resp.ok) {
+            const jsonData = await resp.json();
+            if (mjcfParsed) {
+                // Use MJCF skeleton, merge model-specific fields from JSON
+                humanoidData = mjcfParsed;
+                const modelFields = ['obs_dim','act_dim','latent_dim','obs_mean','obs_std','a_mean','a_std',
+                    'init_dof_pos','init_root_pos','init_root_rot_quat','action_low','action_high',
+                    'key_body_ids','global_obs','pelvis_z','tpose_pelvis_z'];
+                for (const f of modelFields) {
+                    if (jsonData[f] !== undefined && humanoidData[f] === undefined)
+                        humanoidData[f] = jsonData[f];
+                }
+                console.log('Merged model config from JSON');
+            } else {
+                humanoidData = jsonData;
+                console.log('Loaded from JSON:', humanoidData.bodies.length, 'bodies');
+            }
+        } else if (mjcfParsed) {
+            humanoidData = mjcfParsed;
+            console.log('Using MJCF only (no JSON available)');
+        }
+    } catch(e) {
+        if (mjcfParsed) humanoidData = mjcfParsed;
+        else throw new Error('No character data available');
+    }
 
     // FIX: Force consecutive PhysX axis assignment for spherical joints.
     // PhysX WASM resolves spherical DOFs as expmap(TWIST, SWING1, SWING2).
-    // The expmap FK uses dof_pos[dof_idx], dof_pos[dof_idx+1], dof_pos[dof_idx+2].
-    // These must map to TWIST(0), SWING1(1), SWING2(2) in that order so PhysX's
-    // internal rotation matches the expmap. Some joints (e.g. hips) have dofInfo
-    // with physx_axis=[0,2,1] instead of [0,1,2], which breaks the correspondence.
-    // Fix: remap each spherical joint's DOFs to consecutive axis order [0,1,2].
-    for (const kj of humanoidData.kinematicJoints) {
-        if (kj.type !== 'SPHERICAL') continue;
-        // Find the 3 consecutive dofInfo entries for this joint
-        const startIdx = kj.dof_idx;
-        for (let d = 0; d < 3; d++) {
-            humanoidData.dofInfo[startIdx + d].physx_axis = d;  // 0=TWIST, 1=SWING1, 2=SWING2
+    // The dofInfo physx_axis must be [0,1,2] in consecutive order per joint.
+    if (humanoidData.kinematicJoints) {
+        for (const kj of humanoidData.kinematicJoints) {
+            if (kj.type !== 'SPHERICAL') continue;
+            for (let d = 0; d < 3; d++)
+                humanoidData.dofInfo[kj.dof_idx + d].physx_axis = d;
         }
-    }
-    // Also fix the joint axisMap entries to match
-    for (const jdata of humanoidData.joints) {
-        if (jdata.jointType === 'spherical' && jdata.axisMap) {
-            jdata.axisMap = [0, 1, 2];
+        for (const jdata of humanoidData.joints) {
+            if (jdata.jointType === 'spherical' && jdata.axisMap)
+                jdata.axisMap = [0, 1, 2];
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Load ONNX model
+// Load ONNX model + extract baked metadata
 // ---------------------------------------------------------------------------
 async function loadOnnxModel() {
     setStatus('Loading ONNX model...');
@@ -246,6 +279,27 @@ async function loadOnnxModel() {
         { executionProviders: ['wasm'] }
     );
     console.log('ONNX model loaded');
+
+    // Extract metadata baked into the ONNX file by export_onnx_v2.py.
+    // This provides normalizers, init pose, action bounds, etc.
+    // Falls back to humanoid_data.json values if metadata is absent.
+    const meta = {};
+    try {
+        const rawMeta = onnxSession.handler?.metadata || {};
+        for (const [k, v] of Object.entries(rawMeta)) {
+            try { meta[k] = JSON.parse(v); } catch { meta[k] = v; }
+        }
+        if (Object.keys(meta).length > 0)
+            console.log('ONNX metadata:', Object.keys(meta).join(', '));
+    } catch(e) { /* no metadata available */ }
+
+    // Merge metadata into humanoidData (metadata takes priority)
+    const fields = ['obs_dim','act_dim','latent_dim','obs_mean','obs_std','a_mean','a_std',
+                    'init_dof_pos','init_root_pos','init_root_rot_quat','action_low','action_high',
+                    'key_body_ids','global_obs','pelvis_z','tpose_pelvis_z'];
+    for (const f of fields) {
+        if (meta[f] !== undefined) humanoidData[f] = meta[f];
+    }
 }
 
 // ---------------------------------------------------------------------------

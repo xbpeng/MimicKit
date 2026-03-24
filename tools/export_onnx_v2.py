@@ -183,6 +183,66 @@ def main():
     print(f"Agent vs ONNX max_diff:    {np.max(np.abs(agent_np - ort_action2)):.2e}")
     print(f"Wrapper vs ONNX max_diff:  {np.max(np.abs(wrapper_np - ort_action2)):.2e}")
 
+    # Bake model metadata into ONNX for the web demo.
+    # This eliminates the need for a separate JSON config file.
+    import onnx
+    model = onnx.load(args.output)
+
+    # Collect metadata from agent
+    meta = {}
+    meta['obs_dim'] = int(obs_dim)
+    meta['act_dim'] = int(act_dim)
+    meta['latent_dim'] = int(latent_dim)
+    meta['obs_mean'] = wrapper.obs_mean.numpy().tolist()
+    meta['obs_std'] = wrapper.obs_std.numpy().tolist()
+    meta['a_mean'] = wrapper.a_mean.numpy().tolist()
+    meta['a_std'] = wrapper.a_std.numpy().tolist()
+
+    # Action bounds from agent config
+    if hasattr(agent, '_action_low') and agent._action_low is not None:
+        meta['action_low'] = agent._action_low.cpu().numpy().tolist()
+        meta['action_high'] = agent._action_high.cpu().numpy().tolist()
+
+    # Init pose from env
+    try:
+        init_dof = env._init_dof_pos[0].cpu().numpy().tolist() if hasattr(env, '_init_dof_pos') else None
+        init_root_pos = env._init_root_pos[0].cpu().numpy().tolist() if hasattr(env, '_init_root_pos') else None
+        init_root_rot = env._init_root_rot[0].cpu().numpy().tolist() if hasattr(env, '_init_root_rot') else None
+        if init_dof: meta['init_dof_pos'] = init_dof
+        if init_root_pos: meta['init_root_pos'] = init_root_pos
+        if init_root_rot: meta['init_root_rot_quat'] = init_root_rot  # xyzw
+    except Exception as e:
+        print(f"  Could not extract init pose: {e}")
+
+    # Key body IDs and settings from env
+    try:
+        if hasattr(env, '_key_body_ids'):
+            meta['key_body_ids'] = env._key_body_ids.cpu().numpy().tolist()
+        meta['global_obs'] = bool(getattr(env, '_global_obs', False))
+        meta['pelvis_z'] = float(getattr(env, '_pelvis_z', 0.703))
+        meta['tpose_pelvis_z'] = float(getattr(env, '_tpose_pelvis_z', 0.903))
+    except Exception as e:
+        print(f"  Could not extract env config: {e}")
+
+    # MJCF path (relative)
+    if hasattr(env, '_char_file'):
+        meta['mjcf_file'] = env._char_file
+
+    # Write metadata as JSON string key-value pairs
+    import json
+    for key, value in meta.items():
+        entry = onnx.StringStringEntryProto(key=key, value=json.dumps(value))
+        model.metadata_props.append(entry)
+
+    onnx.save(model, args.output, save_as_external_data=False)
+    print(f"\nBaked {len(meta)} metadata entries into ONNX:")
+    for k in sorted(meta.keys()):
+        v = meta[k]
+        if isinstance(v, list) and len(v) > 5:
+            print(f"  {k}: [{v[0]:.4f}, ... {len(v)} items]")
+        else:
+            print(f"  {k}: {v}")
+
     # Check file size
     size_mb = os.path.getsize(args.output) / (1024 * 1024)
     print(f"\nOutput file: {args.output} ({size_mb:.1f} MB)")
