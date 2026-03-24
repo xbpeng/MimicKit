@@ -1035,50 +1035,20 @@ function buildObservation() {
         } catch(e) { obs[idx++] = 0; }
     }
 
-    // [140..157] Key body positions via JS-side forward kinematics
-    // (matches Python kin_char_model.forward_kinematics exactly)
-    if (humanoidData.fk_parent_indices && humanoidData.fk_local_translations) {
-        const numBodies = humanoidData.fk_parent_indices.length;
-        const fkPos = new Array(numBodies);
-        const fkRot = new Array(numBodies);
-
-        // Body 0 = root
-        fkPos[0] = rootPos;
-        fkRot[0] = rootRot;
-
-        // jointRotQuats was built during joint rotation section above
-        for (let j = 1; j < numBodies; j++) {
-            const jRot = jointRotQuats[j - 1];  // quaternion for this joint
-            const localTrans = humanoidData.fk_local_translations[j];
-            const localRot = humanoidData.fk_local_rotations[j];
-            const parentIdx = humanoidData.fk_parent_indices[j];
-
-            const parentPos = fkPos[parentIdx];
-            const parentRot = fkRot[parentIdx];
-
-            // worldTrans = quat_rotate(parentRot, localTrans)
-            const worldTrans = quatRotateVec(parentRot, localTrans);
-            fkPos[j] = [parentPos[0] + worldTrans[0], parentPos[1] + worldTrans[1], parentPos[2] + worldTrans[2]];
-
-            // currRot = quat_mul(localRot, jRot) then quat_mul(parentRot, that)
-            // Python: curr_rot = torch_util.quat_mul(local_rot, j_rot)
-            //         curr_rot = torch_util.quat_mul(parent_rot, curr_rot)
-            const localCombined = quatMul(localRot, jRot);
-            fkRot[j] = quatMul(parentRot, localCombined);
-        }
-
-        // Key body positions relative to root, in heading frame
+    // [140..157] Key body positions from PhysX link global poses
+    // (Python uses engine.get_body_pos, NOT kin_char_model FK)
+    {
         const keyIds = humanoidData.key_body_ids || [2, 5, 10, 13, 16, 6];
         for (const bid of keyIds) {
-            const bp = fkPos[bid];
+            const linkPose = links[bid].link.getGlobalPose();
+            const lp = linkPose.get_p();
+            const bp = [lp.get_x(), lp.get_y(), lp.get_z()];
             const rel = [bp[0] - rootPos[0], bp[1] - rootPos[1], bp[2] - rootPos[2]];
             const localRel = quatRotateVec(headingInv, rel);
             obs[idx++] = localRel[0];
             obs[idx++] = localRel[1];
             obs[idx++] = localRel[2];
         }
-    } else {
-        idx += 18;  // fallback: zeros
     }
 
     // No normalization here - the ONNX model handles it internally
