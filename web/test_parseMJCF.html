@@ -98,6 +98,21 @@ function L(msg, cls) { const s = document.createElement('span'); s.className = c
     }
     L('kinematicJoints: ' + (pass-p3) + ' pass, ' + (fail-f3) + ' fail', (fail-f3) ? 'fail' : 'pass');
 
+    // Compare mass/inertia/com
+    const p4 = pass, f4 = fail;
+    L('\n=== Mass/Inertia/COM ===');
+    for (let i = 0; i < Math.min(js.bodies.length, py.bodies.length); i++) {
+        const jb = js.bodies[i], pb = py.bodies[i];
+        if (pb.mass !== undefined) {
+            check('body['+i+'].mass ('+jb.name+')', jb.mass, pb.mass, pb.mass * 0.05); // 5% tolerance
+            if (pb.com) for (let k = 0; k < 3; k++)
+                check('body['+i+'].com['+k+']', jb.com[k], pb.com[k], 0.01);
+            if (pb.inertia) for (let k = 0; k < 3; k++)
+                check('body['+i+'].inertia['+k+']', jb.inertia[k], pb.inertia[k], pb.inertia[k] * 0.1);
+        }
+    }
+    L('Mass/Inertia: ' + (pass-p4) + ' pass, ' + (fail-f4) + ' fail', (fail-f4) ? 'fail' : 'pass');
+
     L('\n=== TOTAL: ' + pass + ' pass, ' + fail + ' fail ===', fail ? 'fail' : 'pass');
 })();
 </script></body></html>

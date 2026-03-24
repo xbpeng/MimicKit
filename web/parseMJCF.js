@@ -187,7 +187,82 @@ function parseMJCF(xmlText, opts = {}) {
             geoms.push(g);
         }
 
-        bodies.push({ name, parent: parentName, pos: worldPos, localPos, geoms });
+        // Compute mass, COM, and inertia from geom shapes (matching MuJoCo)
+        let totalMass = 0;
+        let com = [0, 0, 0]; // weighted center of mass in body frame
+        for (const g of geoms) {
+            let volume = 0;
+            const PI = Math.PI;
+            if (g.type === 'sphere') {
+                volume = (4/3) * PI * g.radius ** 3;
+            } else if (g.type === 'capsule') {
+                if (g.fromto) {
+                    const ft = g.fromto;
+                    const dx = ft[3]-ft[0], dy = ft[4]-ft[1], dz = ft[5]-ft[2];
+                    const halfH = Math.sqrt(dx*dx+dy*dy+dz*dz) / 2;
+                    volume = PI * g.radius**2 * (2*halfH) + (4/3) * PI * g.radius**3;
+                } else {
+                    const halfH = g.size.length > 1 ? g.size[1] : 0.1;
+                    volume = PI * g.radius**2 * (2*halfH) + (4/3) * PI * g.radius**3;
+                }
+            } else if (g.type === 'box') {
+                const he = g.halfExtents || g.size.slice(0,3);
+                volume = 8 * he[0] * he[1] * he[2];
+            } else if (g.type === 'cylinder') {
+                const r = g.radius, hh = g.halfHeight || 0.1;
+                volume = PI * r**2 * (2*hh);
+            }
+            const gMass = volume * g.density;
+            com[0] += gMass * g.pos[0];
+            com[1] += gMass * g.pos[1];
+            com[2] += gMass * g.pos[2];
+            totalMass += gMass;
+        }
+        if (totalMass > 0) {
+            com = com.map(c => c / totalMass);
+        }
+
+        // Approximate diagonal inertia (sum of geom inertias about COM)
+        let inertia = [0, 0, 0];
+        for (const g of geoms) {
+            let Ixx = 0, Iyy = 0, Izz = 0;
+            let gVolume = 0;
+            const PI = Math.PI;
+            if (g.type === 'sphere') {
+                const r = g.radius;
+                gVolume = (4/3) * PI * r**3;
+                const I = (2/5) * g.density * gVolume * r**2;
+                Ixx = Iyy = Izz = I;
+            } else if (g.type === 'capsule' && g.fromto) {
+                const ft = g.fromto;
+                const dx = ft[3]-ft[0], dy = ft[4]-ft[1], dz = ft[5]-ft[2];
+                const halfH = Math.sqrt(dx*dx+dy*dy+dz*dz) / 2;
+                const r = g.radius;
+                gVolume = PI * r**2 * (2*halfH) + (4/3) * PI * r**3;
+                const m = gVolume * g.density;
+                // Capsule aligned along its axis; approximate as cylinder
+                Ixx = m * (3*r**2 + (2*halfH)**2) / 12;
+                Iyy = Ixx;
+                Izz = m * r**2 / 2;
+            } else if (g.type === 'box') {
+                const he = g.halfExtents || g.size.slice(0,3);
+                gVolume = 8 * he[0] * he[1] * he[2];
+                const m = gVolume * g.density;
+                const a = 2*he[0], b = 2*he[1], c = 2*he[2];
+                Ixx = m * (b*b + c*c) / 12;
+                Iyy = m * (a*a + c*c) / 12;
+                Izz = m * (a*a + b*b) / 12;
+            }
+            const gMass = gVolume * g.density;
+            // Parallel axis theorem: shift to body COM
+            const dx = g.pos[0]-com[0], dy = g.pos[1]-com[1], dz = g.pos[2]-com[2];
+            inertia[0] += Ixx + gMass*(dy*dy+dz*dz);
+            inertia[1] += Iyy + gMass*(dx*dx+dz*dz);
+            inertia[2] += Izz + gMass*(dx*dx+dy*dy);
+        }
+
+        bodies.push({ name, parent: parentName, pos: worldPos, localPos, geoms,
+                       mass: totalMass, inertia, com });
 
         // Joints
         const jointEls = [...el.querySelectorAll(':scope > joint')].filter(

@@ -238,6 +238,16 @@ async function loadHumanoidData() {
                     if (jsonData[f] !== undefined && humanoidData[f] === undefined)
                         humanoidData[f] = jsonData[f];
                 }
+                // Override JS-computed mass/inertia/com with MuJoCo reference if available
+                // (MuJoCo computes these more accurately for rotated capsules)
+                if (jsonData.bodies) {
+                    for (let i = 0; i < Math.min(humanoidData.bodies.length, jsonData.bodies.length); i++) {
+                        const jb = jsonData.bodies[i], hb = humanoidData.bodies[i];
+                        if (jb.mass !== undefined) hb.mass = jb.mass;
+                        if (jb.inertia !== undefined) hb.inertia = jb.inertia;
+                        if (jb.com !== undefined) hb.com = jb.com;
+                    }
+                }
                 console.log('Merged model config from JSON');
             } else {
                 humanoidData = jsonData;
