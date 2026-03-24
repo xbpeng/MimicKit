@@ -27,34 +27,6 @@ canvas { display: block; }
     font-size: 13px; line-height: 1.6; pointer-events: none; z-index: 5;
 }
 #hud .title { font-size: 15px; font-weight: 600; color: #d0d0ff; }
-#controls {
-    position: absolute; bottom: 16px; left: 50%; transform: translateX(-50%);
-    color: #b0b0d0; font-size: 12px; z-index: 5; text-align: center;
-    background: rgba(26,26,46,0.7); padding: 8px 16px; border-radius: 8px;
-}
-#controls button {
-    background: #3a3a5e; color: #d0d0ff; border: 1px solid #5a5a8e;
-    padding: 6px 14px; border-radius: 4px; cursor: pointer; margin: 0 4px;
-    font-size: 12px;
-}
-#controls button:hover { background: #4a4a7e; }
-#debugPanel {
-    position: absolute; top: 12px; right: 16px;
-    background: rgba(20,20,40,0.85); color: #b0b0d0;
-    padding: 12px 16px; border-radius: 8px; z-index: 5;
-    font-size: 12px; width: 200px; line-height: 2;
-    border: 1px solid rgba(100,100,160,0.3);
-}
-#debugPanel .panel-title {
-    font-weight: 600; color: #d0d0ff; margin-bottom: 8px;
-    font-size: 13px;
-}
-#debugPanel label { display: block; cursor: pointer; }
-#debugPanel input[type="range"] { width: 100%; }
-#debugPanel .separator {
-    border-top: 1px solid rgba(100,100,160,0.3);
-    margin: 8px 0;
-}
 </style>
 </head>
 <body>
@@ -71,42 +43,6 @@ canvas { display: block; }
     <div id="physInfo">PhysX WASM + ONNX Runtime</div>
 </div>
 
-<div id="controls">
-    <button id="btnReset">Reset</button>
-    <button id="btnNewLatent">New Skill (Random Latent)</button>
-    <span style="margin-left: 12px; opacity: 0.5;">Orbit: drag | Zoom: scroll | Pan: right-drag</span>
-</div>
-
-<div id="debugPanel">
-    <div class="panel-title" id="debugToggle" style="cursor: pointer; user-select: none;">Debug Controls <span id="debugArrow">&#9654;</span></div>
-    <div id="debugContent" style="display: none;">
-
-    <label><input type="checkbox" id="chkDrives" checked> Active Drives (muscles)</label>
-    <label><input type="checkbox" id="chkPolicy" checked> NN Policy</label>
-    <label><input type="checkbox" id="chkSelfCollision"> Self-Collision</label>
-    <label><input type="checkbox" id="chkGravity" checked> Gravity</label>
-
-    <div class="separator"></div>
-
-    <div>Gravity</div>
-    <input type="range" id="sliderGravity" min="-20" max="0" step="0.1" value="-9.81">
-    <span id="gravityVal">-9.81</span>
-
-    <div>Substeps</div>
-    <input type="range" id="sliderSubsteps" min="1" max="16" step="1" value="1">
-    <span id="substepsVal">1</span>
-
-    <div class="separator"></div>
-
-    <div id="debugInfo" style="font-size: 10px; line-height: 1.4; opacity: 0.7;">
-        root_z: --<br>
-        root_speed: --<br>
-        max_dof_vel: --
-    </div>
-
-    </div><!-- debugContent -->
-</div>
-
 <!-- ONNX Runtime (loaded globally) -->
 <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.21.0/dist/ort.min.js"></script>
 <!-- MJCF parser (converts MuJoCo XML to humanoidData at runtime) -->
@@ -117,7 +53,8 @@ canvas { display: block; }
 {
   "imports": {
     "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
-    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/",
+    "lil-gui": "https://cdn.jsdelivr.net/npm/lil-gui@0.19.2/dist/lil-gui.esm.min.js"
   }
 }
 </script>
@@ -125,6 +62,7 @@ canvas { display: block; }
 <script type="module">
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import GUI from 'lil-gui';
 
 // ---------------------------------------------------------------------------
 // Globals
@@ -776,12 +714,11 @@ function updateDebugInfo() {
             }
         } catch(e) { /* some joints may not support velocity query */ }
 
-        document.getElementById('debugInfo').innerHTML =
-            `root_z: ${rootZ.toFixed(3)}<br>` +
-            `root_speed: ${speed.toFixed(3)}<br>` +
-            `max_dof_vel: ${maxDofVel.toFixed(1)}<br>` +
-            `links: ${links.length} / DOFs: ${articulation.getDofs()}<br>` +
-            `ws_max_diff: ${wsInfo}`;
+        if (window._guiStats) {
+            window._guiStats.root_z = +rootZ.toFixed(3);
+            window._guiStats.root_speed = +speed.toFixed(3);
+            window._guiStats.max_dof_vel = +maxDofVel.toFixed(1);
+        }
     } catch(e) {
         // Silently skip if articulation not ready
     }
@@ -1422,6 +1359,7 @@ async function mainLoop(timestamp) {
     frameCount++;
     if (timestamp - lastFpsTime > 1000) {
         document.getElementById('fpsDisplay').textContent = `FPS: ${frameCount}`;
+        if (window._guiStats) window._guiStats.fps = frameCount;
         frameCount = 0;
         lastFpsTime = timestamp;
     }
@@ -1487,45 +1425,48 @@ async function init() {
         randomLatent();
 
         document.getElementById('overlay').style.display = 'none';
-        document.getElementById('btnReset').addEventListener('click', resetHumanoid);
-        document.getElementById('btnNewLatent').addEventListener('click', randomLatent);
 
-        document.getElementById('chkDrives').addEventListener('change', (e) => {
-            drivesEnabled = e.target.checked;
-            applyDriveParams();
-        });
-        document.getElementById('chkPolicy').addEventListener('change', (e) => {
-            policyEnabled = e.target.checked;
-        });
-        document.getElementById('chkSelfCollision').addEventListener('change', (e) => {
-            setSelfCollision(e.target.checked);
-        });
-        document.getElementById('chkGravity').addEventListener('change', (e) => {
-            setGravity(e.target.checked);
-        });
+        // Build lil-gui panel
+        const gui = new GUI({ title: 'MimicKit' });
 
-        document.getElementById('sliderGravity').addEventListener('input', (e) => {
-            const g = parseFloat(e.target.value);
-            document.getElementById('gravityVal').textContent = g.toFixed(2);
-            pxScene.setGravity(new PhysX.PxVec3(0, 0, g));
-        });
-        document.getElementById('sliderSubsteps').addEventListener('input', (e) => {
-            numSubsteps = parseInt(e.target.value);
-            document.getElementById('substepsVal').textContent = numSubsteps;
-        });
+        // Actions folder
+        const actionsFolder = gui.addFolder('Actions');
+        actionsFolder.add({ reset: resetHumanoid }, 'reset').name('Reset');
+        actionsFolder.add({ newSkill: randomLatent }, 'newSkill').name('New Skill (Random Latent)');
 
-        // Collapsible debug panel
-        document.getElementById('debugToggle').addEventListener('click', () => {
-            const content = document.getElementById('debugContent');
-            const arrow = document.getElementById('debugArrow');
-            if (content.style.display === 'none') {
-                content.style.display = '';
-                arrow.innerHTML = '&#9660;';
-            } else {
-                content.style.display = 'none';
-                arrow.innerHTML = '&#9654;';
-            }
+        // Simulation folder
+        const simFolder = gui.addFolder('Simulation');
+        const simParams = {
+            drives: drivesEnabled,
+            policy: policyEnabled,
+            selfCollision: selfCollisionEnabled,
+            gravity: gravityEnabled,
+            gravityStrength: -9.81,
+            substeps: numSubsteps,
+        };
+        simFolder.add(simParams, 'drives').name('Active Drives').onChange(v => { drivesEnabled = v; applyDriveParams(); });
+        simFolder.add(simParams, 'policy').name('NN Policy').onChange(v => { policyEnabled = v; });
+        simFolder.add(simParams, 'selfCollision').name('Self-Collision').onChange(v => { setSelfCollision(v); });
+        simFolder.add(simParams, 'gravity').name('Gravity').onChange(v => { setGravity(v); });
+        simFolder.add(simParams, 'gravityStrength', -20, 0, 0.1).name('Gravity Strength').onChange(v => {
+            pxScene.setGravity(new PhysX.PxVec3(0, 0, v));
         });
+        simFolder.add(simParams, 'substeps', 1, 16, 1).name('Substeps').onChange(v => { numSubsteps = v; });
+        simFolder.close();
+
+        // Stats folder (read-only, updated each frame)
+        const statsFolder = gui.addFolder('Stats');
+        const stats = { root_z: 0, root_speed: 0, max_dof_vel: 0, fps: 0 };
+        const statControllers = {
+            root_z: statsFolder.add(stats, 'root_z').name('Root Z').disable().listen(),
+            root_speed: statsFolder.add(stats, 'root_speed').name('Root Speed').disable().listen(),
+            max_dof_vel: statsFolder.add(stats, 'max_dof_vel').name('Max DOF Vel').disable().listen(),
+            fps: statsFolder.add(stats, 'fps').name('FPS').disable().listen(),
+        };
+        statsFolder.close();
+
+        // Make stats available to updateDebugInfo
+        window._guiStats = stats;
 
         running = true;
         lastFpsTime = performance.now();
