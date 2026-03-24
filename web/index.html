@@ -74,16 +74,12 @@ canvas { display: block; }
 <div id="controls">
     <button id="btnReset">Reset</button>
     <button id="btnNewLatent">New Skill (Random Latent)</button>
-    <button id="btnTestPose">Test Pose (raise right arm)</button>
-    <button id="btnDiag">Run Diagnostic</button>
-    <button id="btnReplay">Replay Newton Trace</button>
-    <button id="btnAudit">Audit Obs vs Isaac Lab</button>
-    <button id="btnPlayTrace">Playback Isaac Lab Trace</button>
-    <span style="margin-left: 12px;">Orbit: drag | Zoom: scroll | Pan: right-drag</span>
+    <span style="margin-left: 12px; opacity: 0.5;">Orbit: drag | Zoom: scroll | Pan: right-drag</span>
 </div>
 
 <div id="debugPanel">
-    <div class="panel-title">Debug Controls</div>
+    <div class="panel-title" id="debugToggle" style="cursor: pointer; user-select: none;">Debug Controls <span id="debugArrow">&#9660;</span></div>
+    <div id="debugContent">
 
     <label><input type="checkbox" id="chkDrives" checked> Active Drives (muscles)</label>
     <label><input type="checkbox" id="chkPolicy" checked> NN Policy</label>
@@ -106,10 +102,10 @@ canvas { display: block; }
     <div id="debugInfo" style="font-size: 10px; line-height: 1.4; opacity: 0.7;">
         root_z: --<br>
         root_speed: --<br>
-        max_dof_vel: --<br>
-        tracking_err: --<br>
-        ws_max_diff: --
+        max_dof_vel: --
     </div>
+
+    </div><!-- debugContent -->
 </div>
 
 <!-- ONNX Runtime (loaded globally) -->
@@ -1464,6 +1460,9 @@ let currentAction = null;
 let resetGraceFrames = 60;  // grace period after reset before checking fall
 const RESET_GRACE = 90;    // ~3 seconds of grace
 
+// Simulation: one policy step per render frame, with numSubsteps physics substeps.
+// Isaac Lab uses 30Hz policy / 120Hz physics (4 substeps).
+// Web runs at browser frame rate (~20-60fps) with adjustable substeps.
 async function mainLoop(timestamp) {
     if (!running) return;
 
@@ -1474,100 +1473,46 @@ async function mainLoop(timestamp) {
         lastFpsTime = timestamp;
     }
 
-    // Run policy (or rest pose if policy disabled)
+    // Run policy
     if (policyEnabled) {
         try {
             const obs = buildObservation();
 
-            // WebSocket inference mode: send obs+latent to server, use pytorch_action
             if (wsEnabled && ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({
-                    obs: Array.from(obs),
-                    latent: Array.from(latentVec)
-                }));
-                // Use the latest action received from the server (if any)
-                if (wsAction) {
-                    currentAction = new Float32Array(wsAction);
-                }
+                ws.send(JSON.stringify({ obs: Array.from(obs), latent: Array.from(latentVec) }));
+                if (wsAction) currentAction = new Float32Array(wsAction);
             } else {
-                // Local ONNX inference
                 currentAction = await runPolicy(obs);
             }
 
-            // Broadcast obs to visualizer via localStorage
-            try { localStorage.setItem('mimickit-obs', JSON.stringify(Array.from(obs))); } catch(e) {}
-
-            // One-time diagnostic log
-            if (!window._policyLogCount) window._policyLogCount = 0;
-            window._policyLogCount++;
-            if (window._policyLogCount === 1) {
-                // Dump full obs on first frame for Python comparison
-                console.log('FULL_OBS_JSON:' + JSON.stringify(Array.from(obs).map(v => Math.round(v * 10000) / 10000)));
-                console.log('FULL_LATENT_JSON:' + JSON.stringify(Array.from(latentVec).map(v => Math.round(v * 10000) / 10000)));
-            }
-            if (window._policyLogCount <= 3 || window._policyLogCount % 60 === 0) {
-                const obsArr = Array.from(obs);
-                console.log('OBS[0:13]:', obsArr.slice(0, 13).map(v => v.toFixed(3)).join(', '));
-                console.log('OBS[13:19] (first joint rot):', obsArr.slice(13, 19).map(v => v.toFixed(3)).join(', '));
-                console.log('OBS non-zero count:', obsArr.filter(v => Math.abs(v) > 0.001).length, '/ 158');
-                console.log('ACTION[0:8]:', Array.from(currentAction).slice(0, 8).map(v => v.toFixed(3)).join(', '));
-                console.log('ACTION range:', Math.min(...currentAction).toFixed(3), Math.max(...currentAction).toFixed(3));
-                console.log('LATENT[0:4]:', Array.from(latentVec).slice(0, 4).map(v => v.toFixed(3)).join(', '));
-            }
-            if (currentAction) {
-                applyActions(currentAction);  // applyActions clips to action_low/high
-            }
+            if (currentAction) applyActions(currentAction);
         } catch (e) {
             if (!window._policyErrCount) window._policyErrCount = 0;
-            window._policyErrCount++;
-            if (window._policyErrCount <= 5) console.error('Policy error #' + window._policyErrCount + ':', e.message, e.stack);
+            if (++window._policyErrCount <= 3) console.error('Policy error:', e.message);
             if (!currentAction) currentAction = new Float32Array(humanoidData.act_dim);
         }
     } else {
-        // Drive to init_pose when policy is off (combat stance, not T-pose)
-        if (humanoidData.init_dof_pos) {
-            applyActions(new Float32Array(humanoidData.init_dof_pos));
-        } else {
-            applyActions(new Float32Array(humanoidData.act_dim));
-        }
+        applyActions(new Float32Array(humanoidData.init_dof_pos || humanoidData.act_dim));
     }
 
-    // Step physics
-    const scaledDT = DT * timeScale;
-    if (scaledDT > 0) {
-        for (let i = 0; i < numSubsteps; i++) {
-            pxScene.simulate(scaledDT);
-            pxScene.fetchResults(true);
-        }
-        // Restore ground after first sim step (deferred from init/reset)
-        if (restoreGroundAfterStep) {
-            restoreGround();
-            restoreGroundAfterStep = false;
-        }
+    // Step physics (numSubsteps × DT per control step)
+    for (let i = 0; i < numSubsteps; i++) {
+        pxScene.simulate(DT);
+        pxScene.fetchResults(true);
     }
+    if (restoreGroundAfterStep) { restoreGround(); restoreGroundAfterStep = false; }
 
-    // Auto-reset if physics explodes (NaN or extreme)
+    // Auto-reset if physics explodes
     try {
-        const rootPose = links[0].link.getGlobalPose();
-        const rz = rootPose.get_p().get_z();
-        if (resetGraceFrames > 0) {
-            resetGraceFrames--;
-        } else if (isNaN(rz) || Math.abs(rz) > 50) {
-            resetHumanoid();
-            resetGraceFrames = RESET_GRACE;
-        }
-    } catch(e) { /* skip if not ready */ }
+        const rz = links[0].link.getGlobalPose().get_p().get_z();
+        if (resetGraceFrames > 0) resetGraceFrames--;
+        else if (isNaN(rz) || Math.abs(rz) > 50) { resetHumanoid(); resetGraceFrames = RESET_GRACE; }
+    } catch(e) {}
 
-    // Smoothly track camera to character root position
-    // Root pos is Z-up: [x, y, z]. Three.js is Y-up after worldGroup rotation.
-    // worldGroup rotation maps: Z-up (x,y,z) -> Y-up (x,z,-y)
+    // Camera tracking
     {
-        const rootPose = links[0].link.getGlobalPose();
-        const rp = rootPose.get_p();
-        const tx = rp.get_x();
-        const ty = Math.max(rp.get_z(), 0.5);   // Z-up Z -> Y-up Y
-        const tz = -rp.get_y();                  // Z-up Y -> Y-up -Z
-        controls.target.lerp(new THREE.Vector3(tx, ty, tz), 0.05);
+        const rp = links[0].link.getGlobalPose().get_p();
+        controls.target.lerp(new THREE.Vector3(rp.get_x(), Math.max(rp.get_z(), 0.5), -rp.get_y()), 0.05);
     }
 
     updateMeshes();
@@ -1594,7 +1539,7 @@ async function init() {
         document.getElementById('overlay').style.display = 'none';
         document.getElementById('btnReset').addEventListener('click', resetHumanoid);
         document.getElementById('btnNewLatent').addEventListener('click', randomLatent);
-        document.getElementById('btnTestPose').addEventListener('click', () => {
+        document.getElementById('btnTestPose')?.addEventListener('click', () => {
             // Disable policy and apply a known test pose
             document.getElementById('chkPolicy').checked = false;
             policyEnabled = false;
@@ -1609,7 +1554,7 @@ async function init() {
 
         // Debug panel event listeners
         
-        document.getElementById('btnDiag').addEventListener('click', async () => {
+        document.getElementById('btnDiag')?.addEventListener('click', async () => {
             // === PRINCIPLED DIAGNOSTIC ===
             // 1. Pause simulation
             running = false;
@@ -1718,7 +1663,7 @@ async function init() {
         });
 
         
-        document.getElementById('btnReplay').addEventListener('click', async () => {
+        document.getElementById('btnReplay')?.addEventListener('click', async () => {
             running = false;
             await new Promise(r => setTimeout(r, 200));
 
@@ -1900,7 +1845,7 @@ async function init() {
             requestAnimationFrame(mainLoop);
         });
 
-        document.getElementById('btnAudit').addEventListener('click', async () => {
+        document.getElementById('btnAudit')?.addEventListener('click', async () => {
             running = false;
             await new Promise(r => setTimeout(r, 200));
 
@@ -2557,7 +2502,7 @@ async function init() {
         });
 
         // Playback Isaac Lab trace — step through frames visually
-        document.getElementById('btnPlayTrace').addEventListener('click', async () => {
+        document.getElementById('btnPlayTrace')?.addEventListener('click', async () => {
             running = false;
             console.log('=== PLAYBACK: Loading obs trace ===');
             let traceFrames;
@@ -2842,6 +2787,19 @@ async function init() {
         document.getElementById('sliderSubsteps').addEventListener('input', (e) => {
             numSubsteps = parseInt(e.target.value);
             document.getElementById('substepsVal').textContent = numSubsteps;
+        });
+
+        // Collapsible debug panel
+        document.getElementById('debugToggle').addEventListener('click', () => {
+            const content = document.getElementById('debugContent');
+            const arrow = document.getElementById('debugArrow');
+            if (content.style.display === 'none') {
+                content.style.display = '';
+                arrow.innerHTML = '&#9660;';
+            } else {
+                content.style.display = 'none';
+                arrow.innerHTML = '&#9654;';
+            }
         });
 
         running = true;
