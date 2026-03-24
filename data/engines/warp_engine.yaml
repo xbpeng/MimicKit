@@ -1,9 +1,0 @@
-engine_name: "warp"
-
-control_mode: "pos"
-control_freq: 30
-sim_freq: 120
-env_spacing: 5
-
-# XPBD solver iterations — matches Isaac Lab's max_position_iteration_count
-xpbd_iterations: 4

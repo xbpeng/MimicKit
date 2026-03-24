@@ -1,6 +1,0 @@
-engine_name: "ovphysx"
-control_mode: "pos"
-control_freq: 30
-sim_freq: 120
-env_spacing: 5
-usd_file: "data/assets/sword_shield/humanoid_sword_shield_physx.usda"

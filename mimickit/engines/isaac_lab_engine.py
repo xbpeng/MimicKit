@@ -718,16 +718,6 @@ class IsaacLabEngine(engine.Engine):
         # disable delays during rendering
         carb_settings = carb.settings.get_settings()
         carb_settings.set_bool("/app/runLoops/main/rateLimitEnabled", False)
-
-        # suppress carb interface-acquisition performance warning (internal Omniverse issue)
-        carb_settings.set_string("/log/channels/carb/level", "error")
-
-        # disable expensive RTX features for better rendering performance
-        carb_settings.set_bool("/rtx/shadows/enabled", False)
-        carb_settings.set_bool("/rtx/ambientOcclusion/enabled", False)
-        carb_settings.set_bool("/rtx/reflections/enabled", False)
-        carb_settings.set_bool("/rtx/translucency/enabled", False)
-        carb_settings.set_int("/rtx/post/aa/op", 0)
         return
     
     def _get_env_spacing(self):
