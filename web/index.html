@@ -212,19 +212,25 @@ async function loadHumanoidData() {
     humanoidData = await resp.json();
     console.log('Humanoid data loaded:', humanoidData.bodies.length, 'bodies');
 
-    // FIX: Swap SWING1 ↔ SWING2 axis mapping for spherical joints.
-    // PhysX WASM's spherical joint resolves DOFs with swing axes swapped
-    // relative to the convention used by Isaac Lab / MimicKit's export.
-    // This affects setJointPosition, getJointPosition, setDriveTarget, etc.
-    for (const dof of humanoidData.dofInfo) {
-        if (dof.physx_axis === 1) dof.physx_axis = 2;       // SWING1 → SWING2
-        else if (dof.physx_axis === 2) dof.physx_axis = 1;  // SWING2 → SWING1
+    // FIX: Force consecutive PhysX axis assignment for spherical joints.
+    // PhysX WASM resolves spherical DOFs as expmap(TWIST, SWING1, SWING2).
+    // The expmap FK uses dof_pos[dof_idx], dof_pos[dof_idx+1], dof_pos[dof_idx+2].
+    // These must map to TWIST(0), SWING1(1), SWING2(2) in that order so PhysX's
+    // internal rotation matches the expmap. Some joints (e.g. hips) have dofInfo
+    // with physx_axis=[0,2,1] instead of [0,1,2], which breaks the correspondence.
+    // Fix: remap each spherical joint's DOFs to consecutive axis order [0,1,2].
+    for (const kj of humanoidData.kinematicJoints) {
+        if (kj.type !== 'SPHERICAL') continue;
+        // Find the 3 consecutive dofInfo entries for this joint
+        const startIdx = kj.dof_idx;
+        for (let d = 0; d < 3; d++) {
+            humanoidData.dofInfo[startIdx + d].physx_axis = d;  // 0=TWIST, 1=SWING1, 2=SWING2
+        }
     }
-
-    // Also fix the joint axisMap entries
+    // Also fix the joint axisMap entries to match
     for (const jdata of humanoidData.joints) {
         if (jdata.jointType === 'spherical' && jdata.axisMap) {
-            jdata.axisMap = jdata.axisMap.map(a => a === 1 ? 2 : a === 2 ? 1 : a);
+            jdata.axisMap = [0, 1, 2];
         }
     }
 }
