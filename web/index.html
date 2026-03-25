@@ -1278,6 +1278,7 @@ let latentTarget = null;   // next latent to interpolate toward
 let latentStepsLeft = 0;   // frames until next latent change
 let latentBlendRate = 0.05; // SLERP speed per frame
 let autoLatent = false;    // auto-cycle latents (off by default)
+let activeSequence = null; // latent trajectory playback state
 
 // Latent presets — discovered empirically or saved by user.
 // Stored in localStorage for persistence across sessions.
@@ -1475,22 +1476,15 @@ async function mainLoop(timestamp) {
             // Advance latent sequence playback or auto-cycle
             if (activeSequence) {
                 const seq = activeSequence;
-                seq.accumulator += DT * numSubsteps;
+                seq.accumulator += DT;
                 const frameDt = 1.0 / seq.fps;
                 while (seq.accumulator >= frameDt) {
                     seq.accumulator -= frameDt;
                     seq.frame = (seq.frame + 1) % seq.latents.length;
                 }
-                // Interpolate toward current keyframe for smoothness
-                const target = seq.latents[seq.frame];
-                const t = 0.3;
-                for (let i = 0; i < latentVec.length; i++)
-                    latentVec[i] = latentVec[i] * (1 - t) + target[i] * t;
-                // Normalize
-                let norm = 0;
-                for (let i = 0; i < latentVec.length; i++) norm += latentVec[i] * latentVec[i];
-                norm = Math.sqrt(norm);
-                if (norm > 0) for (let i = 0; i < latentVec.length; i++) latentVec[i] /= norm;
+                // Set keyframe directly (no interpolation — play at native speed)
+                const kf = seq.latents[seq.frame];
+                for (let i = 0; i < latentVec.length; i++) latentVec[i] = kf[i];
             } else {
                 slerpLatent();
             }
@@ -1579,7 +1573,7 @@ async function init() {
         }).catch(() => {});
 
         // Latent sequence playback state
-        let activeSequence = null;  // { latents: [...], fps, duration, frame, name }
+        // activeSequence is declared at module scope
 
         const presetController = skillFolder.add(skillParams, 'preset', presetNames).name('Skill Preset').onChange(v => {
             if (v === 'Random') {
