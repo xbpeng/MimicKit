@@ -6,7 +6,7 @@ This guarantees exact equivalence with PyTorch inference.
 
 Usage:
     cd MimicKit
-    python tools/export_onnx_v2.py \
+    python tools/export_onnx.py \
         --arg_file args/ase_humanoid_sword_shield_args.txt \
         --model_file data/models/ase_humanoid_sword_shield_model.pt \
         --output web/ase_humanoid_sword_shield_actor.onnx
