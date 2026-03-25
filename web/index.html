@@ -668,12 +668,14 @@ async function initPhysX() {
     sceneDesc.set_cpuDispatcher(cpuDispatcher);
     sceneDesc.set_filterShader(tlf.DefaultFilterShader());
     sceneDesc.set_bounceThresholdVelocity(0.2);  // Match Isaac Lab
-    // Use TGS solver to match Isaac Lab (default is PGS)
-    if (PhysX.PxSolverTypeEnum && PhysX.PxSolverTypeEnum.eTGS !== undefined) {
-        sceneDesc.set_solverType(PhysX.PxSolverTypeEnum.eTGS);
-        console.log('Using TGS solver (matching Isaac Lab)');
+    // Isaac Lab uses PGS solver (PhysX 5.4 default — SimulationCfg doesn't set TGS).
+    // PhysX WASM 5.6 defaults to PGS too, so we just leave it as-is.
+    // Do NOT set TGS — it produces different contact resolution than PGS.
+    if (PhysX.PxSolverTypeEnum && PhysX.PxSolverTypeEnum.ePGS !== undefined) {
+        sceneDesc.set_solverType(PhysX.PxSolverTypeEnum.ePGS);
+        console.log('Using PGS solver (matching Isaac Lab)');
     } else {
-        console.log('TGS solver not available, using default PGS');
+        console.log('PGS solver enum not found, using default (should be PGS)');
     }
     // Match Isaac Lab scene-level friction settings
     if (typeof sceneDesc.set_frictionType === 'function') {
@@ -685,9 +687,13 @@ async function initPhysX() {
     if (typeof sceneDesc.set_frictionOffsetThreshold === 'function') {
         sceneDesc.set_frictionOffsetThreshold(0.04);
     }
+    // Match Isaac Lab scene-level solver iteration caps
+    if (typeof sceneDesc.set_maxBiasCoefficient === 'function') {
+        sceneDesc.set_maxBiasCoefficient(100);  // PhysX default
+    }
     pxScene = physics.createScene(sceneDesc);
 
-    // Material
+    // Material (static_friction=1.0, dynamic_friction=1.0, restitution=0.0)
     material = physics.createMaterial(1.0, 1.0, 0.0);
 
     // Ground plane as a large static box
@@ -720,10 +726,13 @@ function buildArticulation() {
     const rbext = PhysX.PxRigidBodyExt.prototype;
 
     articulation = physics.createArticulationReducedCoordinate();
-    // Isaac Lab: USD articulation=32/1, but scene maxPositionIterationCount=4 caps it
-    // The effective iterations in Isaac Lab are 4/0
-    // PhysX WASM has no scene cap, so we set the effective value directly
-    articulation.setSolverIterationCounts(16, 4);
+    // Isaac Lab: scene maxPositionIterationCount=4, maxVelocityIterationCount=0
+    // These scene-level caps override per-articulation requests.
+    // PhysX WASM has no scene cap, so we set the effective value directly.
+    // PhysX requires minVelocityIters=1 when set on articulation, but Isaac Lab
+    // effectively runs 0 velocity iterations via the scene cap.
+    // Set 4/1 — the closest we can get (PhysX WASM enforces min 1 vel iter).
+    articulation.setSolverIterationCounts(4, 1);
     // Match Isaac Lab: sleep threshold and stabilization threshold
     if (typeof articulation.setSleepThreshold === 'function') {
         articulation.setSleepThreshold(5e-5);
@@ -847,11 +856,8 @@ function buildArticulation() {
         link.setMaxDepenetrationVelocity(10.0);
         link.setMaxLinearVelocity(1000.0);
         link.setMaxAngularVelocity(1000.0);
-        // Per-body solver iterations - scene caps at 4/0, so setting higher is no-op in Isaac Lab
-        // Match effective iterations: 4 position, 0 velocity
-        if (typeof link.setSolverIterationCounts === 'function') {
-            link.setSolverIterationCounts(16, 4);
-        }
+        // Per-link solver iterations — Isaac Lab scene caps at 4/0.
+        // Don't override on individual links; the articulation-level setting handles this.
         // Sleep threshold (Isaac Lab: 5e-5)
         if (typeof link.setSleepThreshold === 'function') {
             link.setSleepThreshold(5e-5);
@@ -1550,49 +1556,22 @@ function buildObservation() {
         } catch(e) { obs[idx++] = 0; }
     }
 
-    // [140..157] Key body positions via JS-side forward kinematics
-    // (Python uses kin_char_model.forward_kinematics via get_body_pos)
-    if (humanoidData.fk_parent_indices && humanoidData.fk_local_translations) {
-        const numBodies = humanoidData.fk_parent_indices.length;
-        const fkPos = new Array(numBodies);
-        const fkRot = new Array(numBodies);
-
-        // Body 0 = root
-        fkPos[0] = rootPos;
-        fkRot[0] = rootRot;
-
-        // jointRotQuats was built during joint rotation section above
-        for (let j = 1; j < numBodies; j++) {
-            const jRot = jointRotQuats[j - 1];
-            const localTrans = humanoidData.fk_local_translations[j];
-            const localRot = humanoidData.fk_local_rotations[j];
-            const parentIdx = humanoidData.fk_parent_indices[j];
-
-            const parentPos = fkPos[parentIdx];
-            const parentRot = fkRot[parentIdx];
-
-            const worldTrans = quatRotateVec(parentRot, localTrans);
-            fkPos[j] = [parentPos[0] + worldTrans[0], parentPos[1] + worldTrans[1], parentPos[2] + worldTrans[2]];
-
-            const localCombined = quatMul(localRot, jRot);
-            fkRot[j] = quatMul(parentRot, localCombined);
-        }
-
-        // Key body positions from JS-side FK (matches Python kin_char_model)
-        // Note: Isaac Lab's get_body_pos returns PhysX link positions which differ
-        // from FK, but the policy was trained with the kin_char_model FK positions
-        // passed through compute_char_obs.
+    // [140..157] Key body positions from PhysX link world positions.
+    // Isaac Lab's _compute_obs uses engine.get_body_pos() which reads PhysX link
+    // poses directly — NOT forward kinematics from DOF positions.
+    // We must do the same here to match training observations exactly.
+    {
         const keyIds = humanoidData.key_body_ids || [2, 5, 10, 13, 16, 6];
         for (const bid of keyIds) {
-            const bp = fkPos[bid];
+            const linkPose = links[bid].link.getGlobalPose();
+            const lp = linkPose.get_p();
+            const bp = [lp.get_x(), lp.get_y(), lp.get_z()];
             const rel = [bp[0] - rootPos[0], bp[1] - rootPos[1], bp[2] - rootPos[2]];
             const localRel = quatRotateVec(headingInv, rel);
             obs[idx++] = localRel[0];
             obs[idx++] = localRel[1];
             obs[idx++] = localRel[2];
         }
-    } else {
-        idx += 18;
     }
 
     // No normalization here - the ONNX model handles it internally
@@ -1857,19 +1836,25 @@ async function mainLoop(timestamp) {
 
             slerpLatent();
 
-            // Run policy
-            if (policyEnabled) {
-                try {
-                    const obs = buildObservation();
-                    currentAction = await runPolicy(obs);
-                    if (currentAction) applyActions(currentAction);
-                } catch (e) {
-                    if (!window._policyErrCount) window._policyErrCount = 0;
-                    if (++window._policyErrCount <= 3) console.error('Policy error:', e.message);
-                    if (!currentAction) currentAction = new Float32Array(humanoidData.act_dim);
+            // Trajectory playback mode: use recorded actions and show ghost
+            if (window._trajStepCallback) window._trajStepCallback();
+
+            // Run policy (skip if trajectory playback is driving actions)
+            const trajDriving = !!window._trajPlaying;
+            if (!trajDriving) {
+                if (policyEnabled) {
+                    try {
+                        const obs = buildObservation();
+                        currentAction = await runPolicy(obs);
+                        if (currentAction) applyActions(currentAction);
+                    } catch (e) {
+                        if (!window._policyErrCount) window._policyErrCount = 0;
+                        if (++window._policyErrCount <= 3) console.error('Policy error:', e.message);
+                        if (!currentAction) currentAction = new Float32Array(humanoidData.act_dim);
+                    }
+                } else {
+                    applyActions(new Float32Array(humanoidData.init_dof_pos || humanoidData.act_dim));
                 }
-            } else {
-                applyActions(new Float32Array(humanoidData.init_dof_pos || humanoidData.act_dim));
             }
         }
 
@@ -1983,6 +1968,281 @@ async function init() {
                 }
             } catch(e) { console.error('Invalid JSON:', e.message); }
         });
+
+        // Trajectory comparison folder
+        const trajFolder = gui.addFolder('Trajectory Comparison');
+        const trajParams = { loaded: false, playing: false, step: 0, maxError: 0 };
+        let trajectoryData = null;
+        let trajGhostLinks = [];  // Ghost meshes for Isaac Lab reference
+        let trajGhostGroup = null;
+
+        function createGhostMeshes() {
+            if (trajGhostGroup) { worldGroup.remove(trajGhostGroup); }
+            trajGhostGroup = new THREE.Group();
+            trajGhostLinks = [];
+            for (let bi = 0; bi < humanoidData.bodies.length; bi++) {
+                const body = humanoidData.bodies[bi];
+                const group = new THREE.Group();
+                for (const geom of body.geoms) {
+                    const mat = new THREE.MeshStandardMaterial({
+                        color: 0x44ff44, roughness: 0.6, metalness: 0.2,
+                        transparent: true, opacity: 0.4
+                    });
+                    let mesh = null;
+                    if (geom.type === 'sphere') {
+                        mesh = new THREE.Mesh(new THREE.SphereGeometry(geom.radius, 16, 12), mat);
+                        mesh.position.set(geom.pos[0], geom.pos[1], geom.pos[2]);
+                    } else if (geom.type === 'capsule' && geom.fromto) {
+                        const ft = geom.fromto;
+                        const p0 = new THREE.Vector3(ft[0], ft[1], ft[2]);
+                        const p1 = new THREE.Vector3(ft[3], ft[4], ft[5]);
+                        const dir = new THREE.Vector3().subVectors(p1, p0);
+                        const len = dir.length();
+                        mesh = new THREE.Mesh(new THREE.CapsuleGeometry(geom.radius, len, 8, 12), mat);
+                        mesh.position.addVectors(p0, p1).multiplyScalar(0.5);
+                        if (len > 0.001) mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0), dir.normalize());
+                    } else if (geom.type === 'box') {
+                        const he = geom.halfExtents;
+                        mesh = new THREE.Mesh(new THREE.BoxGeometry(he[0]*2, he[1]*2, he[2]*2), mat);
+                        mesh.position.set(geom.pos[0], geom.pos[1], geom.pos[2]);
+                    }
+                    if (mesh) group.add(mesh);
+                }
+                trajGhostGroup.add(group);
+                trajGhostLinks.push(group);
+            }
+            worldGroup.add(trajGhostGroup);
+        }
+
+        function updateGhostFromState(state) {
+            if (!trajGhostLinks.length || !state.body_pos) return;
+            // body_pos is array of [numBodies][3] world positions
+            // We use FK from the recorded state to position the ghost
+            const rootPos = state.root_pos;
+            const rootRot = state.root_rot; // xyzw
+            const dofPos = state.dof_pos;
+
+            // Compute FK
+            const numBodies = humanoidData.fk_parent_indices.length;
+            const fkPos = new Array(numBodies);
+            const fkRot = new Array(numBodies);
+            fkPos[0] = rootPos;
+            fkRot[0] = rootRot;
+
+            const jointRotQuats = [];
+            for (const kj of humanoidData.kinematicJoints) {
+                let q;
+                if (kj.type === 'SPHERICAL') {
+                    q = expMapToQuat(dofPos[kj.dof_idx], dofPos[kj.dof_idx+1], dofPos[kj.dof_idx+2]);
+                } else if (kj.type === 'HINGE') {
+                    q = axisAngleToQuat(kj.axis, dofPos[kj.dof_idx]);
+                } else {
+                    q = [0, 0, 0, 1];
+                }
+                jointRotQuats.push(q);
+            }
+
+            for (let j = 1; j < numBodies; j++) {
+                const jRot = jointRotQuats[j - 1];
+                const localTrans = humanoidData.fk_local_translations[j];
+                const localRot = humanoidData.fk_local_rotations[j];
+                const parentIdx = humanoidData.fk_parent_indices[j];
+                const parentPos = fkPos[parentIdx];
+                const parentRot = fkRot[parentIdx];
+                const worldTrans = quatRotateVec(parentRot, localTrans);
+                fkPos[j] = [parentPos[0]+worldTrans[0], parentPos[1]+worldTrans[1], parentPos[2]+worldTrans[2]];
+                const localCombined = quatMul(localRot, jRot);
+                fkRot[j] = quatMul(parentRot, localCombined);
+            }
+
+            // Offset ghost 2m to the right (Y+) so they're side-by-side
+            const offset = [0, 2, 0];
+            for (let bi = 0; bi < numBodies && bi < trajGhostLinks.length; bi++) {
+                const pos = fkPos[bi];
+                const rot = fkRot[bi];
+                trajGhostLinks[bi].position.set(pos[0] + offset[0], pos[1] + offset[1], pos[2] + offset[2]);
+                trajGhostLinks[bi].quaternion.set(rot[0], rot[1], rot[2], rot[3]);
+            }
+        }
+
+        function computeTrajectoryError(state) {
+            // Compare live PhysX state vs recorded Isaac Lab state
+            const axisEnums = [E_TWIST, E_SWING1, E_SWING2];
+            const bodyLinkMap = {};
+            for (const l of links) bodyLinkMap[l.name] = l.link;
+
+            let maxPosErr = 0, maxVelErr = 0, maxDofPosErr = 0, maxDofVelErr = 0;
+            let sumPosErr = 0, sumDofErr = 0;
+
+            // Root position error
+            const rootPose = links[0].link.getGlobalPose().get_p();
+            const dx = rootPose.get_x() - state.root_pos[0];
+            const dy = rootPose.get_y() - state.root_pos[1];
+            const dz = rootPose.get_z() - state.root_pos[2];
+            maxPosErr = Math.sqrt(dx*dx + dy*dy + dz*dz);
+
+            // DOF position error
+            for (let i = 0; i < humanoidData.dofInfo.length; i++) {
+                const dof = humanoidData.dofInfo[i];
+                const cl = bodyLinkMap[dof.child_body];
+                if (!cl) continue;
+                try {
+                    const joint = cl.getInboundJoint();
+                    const webVal = joint.getJointPosition(axisEnums[dof.physx_axis]);
+                    const refVal = state.dof_pos[i];
+                    const err = Math.abs(webVal - refVal);
+                    if (err > maxDofPosErr) maxDofPosErr = err;
+                    sumDofErr += err;
+                } catch(e) {}
+            }
+
+            // DOF velocity error
+            for (let i = 0; i < humanoidData.dofInfo.length; i++) {
+                const dof = humanoidData.dofInfo[i];
+                const cl = bodyLinkMap[dof.child_body];
+                if (!cl) continue;
+                try {
+                    const joint = cl.getInboundJoint();
+                    const webVal = joint.getJointVelocity(axisEnums[dof.physx_axis]);
+                    const refVal = state.dof_vel[i];
+                    const err = Math.abs(webVal - refVal);
+                    if (err > maxDofVelErr) maxDofVelErr = err;
+                } catch(e) {}
+            }
+
+            return {
+                root_pos_err: maxPosErr,
+                max_dof_pos_err: maxDofPosErr,
+                mean_dof_pos_err: sumDofErr / humanoidData.dofInfo.length,
+                max_dof_vel_err: maxDofVelErr,
+            };
+        }
+
+        // Trajectory playback state
+        let trajPlayStep = 0;
+        window._trajPlaying = false;
+        let trajReplayArticulation = false;  // true = replay actions through PhysX
+
+        async function loadTrajectory() {
+            try {
+                const resp = await fetch('./trajectory.json');
+                if (!resp.ok) { console.error('No trajectory.json found'); return; }
+                trajectoryData = await resp.json();
+                trajParams.loaded = true;
+                console.log('Loaded trajectory:', trajectoryData.steps.length, 'steps');
+
+                // Set latent to match recorded trajectory
+                if (trajectoryData.config.latent) {
+                    latentVec = new Float32Array(trajectoryData.config.latent);
+                    latentTarget = new Float32Array(trajectoryData.config.latent);
+                    autoLatent = false;
+                }
+
+                createGhostMeshes();
+                trajPlayBtn.name('Play Trajectory (' + trajectoryData.steps.length + ' steps)');
+            } catch(e) {
+                console.error('Failed to load trajectory:', e);
+            }
+        }
+
+        async function playTrajectory() {
+            if (!trajectoryData) { await loadTrajectory(); }
+            if (!trajectoryData) return;
+
+            window._trajPlaying = !window._trajPlaying;
+            if (window._trajPlaying) {
+                trajPlayStep = 0;
+                // Reset the live humanoid to match the initial trajectory state
+                const initState = trajectoryData.steps[0];
+                resetToState(initState);
+                trajPlayBtn.name('Stop Playback');
+            } else {
+                trajPlayBtn.name('Play Trajectory');
+                if (trajGhostGroup) trajGhostGroup.visible = false;
+            }
+        }
+
+        function resetToState(state) {
+            // Reset PhysX articulation to match a recorded state
+            removeGround();
+            const rp = state.root_pos;
+            const rq = state.root_rot; // xyzw
+            articulation.setRootGlobalPose(new PhysX.PxTransform(
+                new PhysX.PxVec3(rp[0], rp[1], rp[2]),
+                new PhysX.PxQuat(rq[0], rq[1], rq[2], rq[3])), true);
+
+            // Set DOF positions
+            const axisEnumsInit = [E_TWIST, E_SWING1, E_SWING2];
+            const bodyLinkMapInit = {};
+            for (const l of links) bodyLinkMapInit[l.name] = l.link;
+            for (let i = 0; i < humanoidData.dofInfo.length; i++) {
+                const dof = humanoidData.dofInfo[i];
+                const cl = bodyLinkMapInit[dof.child_body];
+                if (!cl) continue;
+                try {
+                    cl.getInboundJoint().setJointPosition(axisEnumsInit[dof.physx_axis], state.dof_pos[i]);
+                    cl.getInboundJoint().setJointVelocity(axisEnumsInit[dof.physx_axis], state.dof_vel[i]);
+                } catch(e) {}
+            }
+
+            // Zero root velocity
+            const initCache = articulation.createCache();
+            const initFlags = new PhysX.PxArticulationCacheFlags(PhysX.PxArticulationCacheFlagEnum.eALL);
+            articulation.copyInternalStateToCache(initCache, initFlags);
+            // Set root velocities in cache if possible
+            articulation.applyCache(initCache, initFlags, true);
+            restoreGround();
+        }
+
+        // Override main loop to support trajectory playback mode
+        const origMainLoop = mainLoop;
+
+        // Trajectory step handler - called from within mainLoop
+        window._trajStepCallback = function() {
+            if (!window._trajPlaying || !trajectoryData) return;
+
+            const step = trajectoryData.steps[trajPlayStep];
+            if (!step) { window._trajPlaying = false; trajPlayBtn.name('Play Trajectory'); return; }
+
+            // Show ghost at Isaac Lab recorded position
+            if (trajGhostGroup) trajGhostGroup.visible = true;
+            updateGhostFromState(step);
+
+            // Apply the SAME action that Isaac Lab applied
+            if (step.action_clipped) {
+                applyActions(step.action_clipped);
+            }
+
+            // Compute error metrics
+            const errors = computeTrajectoryError(step);
+            trajParams.maxError = errors.root_pos_err;
+            if (window._guiStats) {
+                window._guiStats.traj_step = trajPlayStep;
+                window._guiStats.root_pos_err = +errors.root_pos_err.toFixed(4);
+                window._guiStats.max_dof_pos_err = +errors.max_dof_pos_err.toFixed(4);
+                window._guiStats.max_dof_vel_err = +errors.max_dof_vel_err.toFixed(1);
+            }
+
+            trajPlayStep++;
+            if (trajPlayStep >= trajectoryData.steps.length) {
+                window._trajPlaying = false;
+                trajPlayBtn.name('Play Trajectory (done)');
+                console.log('Trajectory playback complete. Final root pos error:', errors.root_pos_err.toFixed(4));
+            }
+        };
+
+        const trajPlayBtn = trajFolder.add({ play: playTrajectory }, 'play').name('Load & Play Trajectory');
+        trajFolder.add(trajParams, 'maxError').name('Root Pos Error').disable().listen();
+
+        // Add trajectory error stats
+        const trajStatsFolder = trajFolder.addFolder('Error Stats');
+        const trajStats = { traj_step: 0, root_pos_err: 0, max_dof_pos_err: 0, max_dof_vel_err: 0 };
+        trajStatsFolder.add(trajStats, 'traj_step').name('Step').disable().listen();
+        trajStatsFolder.add(trajStats, 'root_pos_err').name('Root Pos Err (m)').disable().listen();
+        trajStatsFolder.add(trajStats, 'max_dof_pos_err').name('Max DOF Pos Err (rad)').disable().listen();
+        trajStatsFolder.add(trajStats, 'max_dof_vel_err').name('Max DOF Vel Err (rad/s)').disable().listen();
+        window._guiStats = Object.assign(window._guiStats || {}, trajStats);
+        trajFolder.close();
 
         // Simulation folder
         const simFolder = gui.addFolder('Simulation');
