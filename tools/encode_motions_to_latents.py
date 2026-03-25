@@ -52,33 +52,43 @@ with torch.no_grad():
         if duration < 0.1:
             continue
 
-        # Sample disc_obs at multiple time points and average
+        # Dense sliding window: encode every ~1/30s across the entire clip
         latents = []
-        n_samples = min(10, max(1, int(duration * 30)))  # ~1 per frame at 30fps
+        n_samples = max(1, int(duration * 30))  # one per frame at 30fps
+        motion_id = torch.tensor([mi])
 
         for si in range(n_samples):
             t0 = torch.tensor([duration * (si + 0.5) / n_samples])
-            motion_id = torch.tensor([mi])
-
             try:
                 disc_obs = env._compute_disc_obs_demo(motion_id, t0)
-                # Normalize and encode
                 norm_obs = agent._disc_obs_norm.normalize(disc_obs)
                 enc_out = agent._model._enc_layers(norm_obs)
                 z = agent._model._enc_out(enc_out)
                 z = torch.nn.functional.normalize(z, dim=-1)
                 latents.append(z[0].numpy())
             except Exception as e:
-                if si == 0:
-                    print(f"  {name}: Error: {e}")
+                if si == 0: print(f"  {name}: Error: {e}")
                 break
 
         if latents:
-            # Average and re-normalize
-            avg = np.mean(latents, axis=0)
-            avg = avg / np.linalg.norm(avg)
-            presets[name] = [round(float(v), 4) for v in avg]
-            print(f"  {name}: encoded ({len(latents)} samples, duration={duration:.1f}s)")
+            latents = np.array(latents)
+
+            # Element-wise signed max: for each dimension, take the value with
+            # the largest absolute value across all frames. This captures the
+            # peak/most characteristic activation in each latent dimension,
+            # then normalizes to the unit sphere.
+            abs_vals = np.abs(latents)
+            max_indices = np.argmax(abs_vals, axis=0)
+            peak_z = np.array([latents[max_indices[d], d] for d in range(latents.shape[1])])
+            peak_z = peak_z / np.linalg.norm(peak_z)
+
+            # Spread metric for logging
+            mean_z = np.mean(latents, axis=0)
+            mean_z = mean_z / (np.linalg.norm(mean_z) + 1e-8)
+            spread = 1.0 - np.mean(latents @ mean_z)
+
+            presets[name] = [round(float(v), 4) for v in peak_z]
+            print(f"  {name}: {len(latents)} frames, spread={spread:.3f}, duration={duration:.1f}s")
         else:
             print(f"  {name}: no samples (duration={duration:.1f}s)")
 
