@@ -114,6 +114,8 @@ class HRLAgent(ppo_agent.PPOAgent):
         info = {}
         llc_obs_dim = self._llc_agent._obs_norm._mean.shape[0]
 
+        import time as _time
+        _t0 = _time.time()
         for t in range(self._llc_steps):
             # Get current obs for LLC (strip task obs)
             if obs is None:
@@ -138,6 +140,17 @@ class HRLAgent(ppo_agent.PPOAgent):
 
         # Average rewards over LLC steps
         total_reward /= self._llc_steps
+
+        if not hasattr(self, '_step_count'):
+            self._step_count = 0
+            self._step_time = 0
+        self._step_count += 1
+        self._step_time += _time.time() - _t0
+        if self._step_count % 32 == 0:
+            avg = self._step_time / self._step_count * 1000
+            print(f"  HRL _step_env: {avg:.1f}ms avg ({self._llc_steps} LLC steps × {action.shape[0]} envs)")
+            self._step_count = 0
+            self._step_time = 0
 
         return obs, total_reward, done_any, info
 
