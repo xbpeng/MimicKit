@@ -80,7 +80,8 @@ with torch.no_grad():
             abs_vals = np.abs(latents)
             max_indices = np.argmax(abs_vals, axis=0)
             peak_z = np.array([latents[max_indices[d], d] for d in range(latents.shape[1])])
-            peak_z = peak_z / np.linalg.norm(peak_z)
+            # Skip normalization — let the raw peak magnitudes through
+            # peak_z = peak_z / np.linalg.norm(peak_z)
 
             # Spread metric for logging
             mean_z = np.mean(latents, axis=0)
