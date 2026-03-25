@@ -729,10 +729,7 @@ function buildArticulation() {
     // Isaac Lab: scene maxPositionIterationCount=4, maxVelocityIterationCount=0
     // These scene-level caps override per-articulation requests.
     // PhysX WASM has no scene cap, so we set the effective value directly.
-    // PhysX requires minVelocityIters=1 when set on articulation, but Isaac Lab
-    // effectively runs 0 velocity iterations via the scene cap.
-    // Set 4/1 — the closest we can get (PhysX WASM enforces min 1 vel iter).
-    articulation.setSolverIterationCounts(4, 1);
+    articulation.setSolverIterationCounts(4, 0);
     // Match Isaac Lab: sleep threshold and stabilization threshold
     if (typeof articulation.setSleepThreshold === 'function') {
         articulation.setSleepThreshold(5e-5);
@@ -912,6 +909,9 @@ function buildArticulation() {
     // Configure joints
     const axisEnums = [E_TWIST, E_SWING1, E_SWING2];
     origDrives.length = 0;
+    // TEST: Scale drives by 180/pi to test if USD importer divides stiffness/damping.
+    // Set to 1.0 for no scaling, 57.296 (=180/pi) to test USD parity hypothesis.
+    const driveScale = 1.0;
 
     for (const jdata of humanoidData.joints) {
         const childLink = bodyLinkMap[jdata.child_body];
@@ -954,12 +954,12 @@ function buildArticulation() {
                 const limit = new PhysX.PxArticulationLimit(ax.range[0], ax.range[1]);
                 joint.setLimitParams(axE, limit);
                 const drive = new PhysX.PxArticulationDrive(
-                    ax.stiffness, ax.damping, ax.maxForce, E_FORCE
+                    ax.stiffness * driveScale, ax.damping * driveScale, ax.maxForce, E_FORCE
                 );
                 joint.setDriveParams(axE, drive);
                 // Set joint armature (adds virtual inertia for stability)
                 if (ax.armature !== undefined) joint.setArmature(axE, ax.armature);
-                origDrives.push({joint, axisEnum: axE, stiffness: ax.stiffness, damping: ax.damping, maxForce: ax.maxForce});
+                origDrives.push({joint, axisEnum: axE, stiffness: ax.stiffness * driveScale, damping: ax.damping * driveScale, maxForce: ax.maxForce});
             }
             // Lock unused axes
             for (let i = jdata.axes.length; i < 3; i++) {
@@ -971,12 +971,12 @@ function buildArticulation() {
             const ax = jdata.axes[0];
             joint.setLimitParams(E_TWIST, new PhysX.PxArticulationLimit(ax.range[0], ax.range[1]));
             const revDrive = new PhysX.PxArticulationDrive(
-                ax.stiffness, ax.damping, ax.maxForce, E_FORCE
+                ax.stiffness * driveScale, ax.damping * driveScale, ax.maxForce, E_FORCE
             );
             joint.setDriveParams(E_TWIST, revDrive);
             // Set joint armature
             if (ax.armature !== undefined) joint.setArmature(E_TWIST, ax.armature);
-            origDrives.push({joint, axisEnum: E_TWIST, stiffness: ax.stiffness, damping: ax.damping, maxForce: ax.maxForce});
+            origDrives.push({joint, axisEnum: E_TWIST, stiffness: ax.stiffness * driveScale, damping: ax.damping * driveScale, maxForce: ax.maxForce});
             joint.setMotion(E_SWING1, E_LOCKED);
             joint.setMotion(E_SWING2, E_LOCKED);
         }
