@@ -1,7 +1,7 @@
 agent_name: "HRL"
 
 # LLC config (frozen ASE agent)
-llc_config: "data/agents/ase_humanoid_sword_shield_agent.yaml"
+llc_config: "data/agents/ase_humanoid_agent.yaml"
 llc_checkpoint: "data/models/ase_humanoid_sword_shield_model.pt"
 llc_steps: 5  # LLC steps per HLC decision
 
@@ -40,6 +40,7 @@ ppo_clip_ratio: 0.2
 norm_adv_clip: 4.0
 action_bound_weight: 10.0
 action_entropy_weight: 0.0
+action_reg_weight: 0.0
 
 # Latent dim (must match LLC)
 latent_dim: 64

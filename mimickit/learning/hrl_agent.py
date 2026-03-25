@@ -38,7 +38,10 @@ class HRLAgent(ppo_agent.PPOAgent):
         self._llc_config_path = config["llc_config"]
         with open(self._llc_config_path, 'r') as f:
             self._llc_config = yaml.safe_load(f)
-        self._latent_dim = self._llc_config["latent_dim"]
+        # latent_dim may be at top level or under model
+        self._latent_dim = (self._llc_config.get("latent_dim")
+                           or self._llc_config.get("model", {}).get("latent_dim")
+                           or config.get("latent_dim", 64))
 
         super().__init__(config, env, device)
 
@@ -69,8 +72,31 @@ class HRLAgent(ppo_agent.PPOAgent):
     # Override action space: HLC outputs latent vectors, not motor torques
     # ------------------------------------------------------------------
 
-    def _get_action_size(self):
+    def get_action_size(self):
         return self._latent_dim
+
+    def _patch_env_action_space(self):
+        """Temporarily replace env action space with latent dim."""
+        try:
+            import gymnasium.spaces as spaces
+        except ImportError:
+            import gym.spaces as spaces
+        self._orig_get_action_space = self._env.get_action_space
+        latent_space = spaces.Box(low=-1, high=1, shape=(self._latent_dim,), dtype=np.float32)
+        self._env.get_action_space = lambda: latent_space
+
+    def _unpatch_env_action_space(self):
+        self._env.get_action_space = self._orig_get_action_space
+
+    def _build_model(self, config):
+        self._patch_env_action_space()
+        super()._build_model(config)
+        self._unpatch_env_action_space()
+
+    def _build_normalizers(self):
+        self._patch_env_action_space()
+        super()._build_normalizers()
+        self._unpatch_env_action_space()
 
     # ------------------------------------------------------------------
     # Override env stepping: run LLC for llc_steps per HLC step
@@ -82,15 +108,26 @@ class HRLAgent(ppo_agent.PPOAgent):
         z = torch.nn.functional.normalize(action, dim=-1)
 
         total_reward = torch.zeros(action.shape[0], device=self._device)
-        total_disc_reward = torch.zeros(action.shape[0], device=self._device)
         done_any = torch.zeros(action.shape[0], dtype=torch.bool, device=self._device)
 
         obs = None
         info = {}
+        llc_obs_dim = self._llc_agent._obs_norm._mean.shape[0]
 
         for t in range(self._llc_steps):
-            # Compute LLC action from current obs + latent
-            llc_obs = self._get_llc_obs()
+            # Get current obs for LLC (strip task obs)
+            if obs is None:
+                # First step: use the obs from the rollout loop
+                full_obs = self._curr_obs
+            else:
+                full_obs = obs
+            llc_obs = full_obs[..., :llc_obs_dim]
+
+            if t == 0 and not hasattr(self, '_llc_debug_printed'):
+                self._llc_debug_printed = True
+                print(f"HRL DEBUG: full_obs.shape={full_obs.shape}, llc_obs_dim={llc_obs_dim}, llc_obs.shape={llc_obs.shape}, z.shape={z.shape}")
+
+            # Compute LLC action
             llc_action = self._compute_llc_action(llc_obs, z)
 
             # Step environment with LLC action
@@ -99,31 +136,21 @@ class HRLAgent(ppo_agent.PPOAgent):
             total_reward += r
             done_any = done_any | done
 
-            # Compute discriminator reward for style preservation
-            if hasattr(self._env, 'fetch_disc_obs') and hasattr(self._llc_agent, '_calc_disc_rewards'):
-                try:
-                    disc_obs = self._env.fetch_disc_obs(num_samples=1)
-                    disc_r = self._llc_agent._calc_disc_rewards(disc_obs)
-                    total_disc_reward += disc_r.squeeze(-1)
-                except:
-                    pass
-
         # Average rewards over LLC steps
         total_reward /= self._llc_steps
-        total_disc_reward /= self._llc_steps
 
-        # Combine task + disc rewards
-        combined_reward = self._task_reward_w * total_reward + self._disc_reward_w * total_disc_reward
-
-        return obs, combined_reward, done_any, info
+        return obs, total_reward, done_any, info
 
     def _get_llc_obs(self):
-        """Get the LLC portion of the observation (without task obs)."""
-        full_obs = self._env._compute_obs()
-        if self._task_obs_size > 0:
-            llc_obs = full_obs[..., :-self._task_obs_size]
-        else:
-            llc_obs = full_obs
+        """Get the LLC portion of the observation (without task obs).
+
+        The task env appends task_obs to the regular obs. The LLC
+        only needs the first `llc_obs_dim` dimensions.
+        """
+        # Use the last observation from the env (set by step/reset)
+        full_obs = self._env.get_obs()
+        llc_obs_dim = self._llc_agent._obs_norm._mean.shape[0]
+        llc_obs = full_obs[..., :llc_obs_dim]
         return llc_obs
 
     def _compute_llc_action(self, llc_obs, z):
@@ -158,8 +185,41 @@ class HRLAgent(ppo_agent.PPOAgent):
 
 
 def _load_frozen_llc(config, checkpoint_path, env, device):
-    """Load an ASE agent from checkpoint and freeze all parameters."""
-    agent = ase_agent.ASEAgent(config=config, env=env, device=device)
+    """Load an ASE agent from checkpoint and freeze all parameters.
+
+    The LLC was trained without task obs, so we wrap the env to hide
+    the task obs dimensions during LLC construction.
+    """
+    import torch
+
+    # Load checkpoint to get the LLC's obs dim
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    llc_obs_dim = ckpt["_obs_norm._mean"].shape[0]
+    total_obs_dim = env.get_obs_space().shape[0]
+    task_obs_size = total_obs_dim - llc_obs_dim
+
+    # Create a wrapper env that reports the LLC's obs space (without task obs)
+    class LLCEnvWrapper:
+        """Thin wrapper that hides task obs from the LLC during construction."""
+        def __init__(self, env, llc_obs_dim):
+            self._env = env
+            self._llc_obs_dim = llc_obs_dim
+        def __getattr__(self, name):
+            if name in ('_env', '_llc_obs_dim'):
+                return object.__getattribute__(self, name)
+            return getattr(self._env, name)
+        def get_obs_space(self):
+            try:
+                import gym.spaces as spaces
+            except ImportError:
+                import gymnasium.spaces as spaces
+            orig = self._env.get_obs_space()
+            return spaces.Box(low=orig.low[:self._llc_obs_dim],
+                              high=orig.high[:self._llc_obs_dim],
+                              dtype=orig.dtype)
+
+    wrapped_env = LLCEnvWrapper(env, llc_obs_dim)
+    agent = ase_agent.ASEAgent(config=config, env=wrapped_env, device=device)
     agent.load(checkpoint_path)
     agent.eval()
 
@@ -168,4 +228,5 @@ def _load_frozen_llc(config, checkpoint_path, env, device):
         param.requires_grad = False
     agent._model.eval()
 
+    print(f"  LLC obs_dim={llc_obs_dim}, task_obs_size={task_obs_size}")
     return agent
