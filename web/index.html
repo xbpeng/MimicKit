@@ -1277,7 +1277,7 @@ function applyActions(action) {
 let latentTarget = null;   // next latent to interpolate toward
 let latentStepsLeft = 0;   // frames until next latent change
 let latentBlendRate = 0.05; // SLERP speed per frame
-let autoLatent = true;     // auto-cycle latents
+let autoLatent = false;    // auto-cycle latents (off by default)
 
 function sampleUnitLatent() {
     const z = new Float32Array(humanoidData.latent_dim);
@@ -1291,7 +1291,8 @@ function sampleUnitLatent() {
 function randomLatent() {
     latentVec = sampleUnitLatent();
     latentTarget = sampleUnitLatent();
-    latentStepsLeft = 30 + Math.floor(Math.random() * 120); // 30-150 steps (like ASE)
+    latentStepsLeft = 30 + Math.floor(Math.random() * 120);
+    console.log('LATENT:', JSON.stringify(Array.from(latentVec).map(v => Math.round(v * 10000) / 10000)));
 }
 
 function slerpLatent() {
