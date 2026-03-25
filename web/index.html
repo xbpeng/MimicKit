@@ -2278,6 +2278,22 @@ async function init() {
         // Make stats available to updateDebugInfo
         window._guiStats = stats;
 
+        // Expose module-scoped variables for external tooling (Playwright, devtools).
+        // Use getters for mutable references (links, articulation change on reset).
+        window._mk = {
+            get links() { return links; },
+            get humanoidData() { return humanoidData; },
+            get articulation() { return articulation; },
+            pxScene, PhysX,
+            resetHumanoid, buildObservation, applyActions, runPolicy,
+            get currentAction() { return currentAction; },
+            get latentVec() { return latentVec; },
+            set latentVec(v) { latentVec = v; },
+            set latentTarget(v) { latentTarget = v; },
+            get autoLatent() { return autoLatent; },
+            set autoLatent(v) { autoLatent = v; },
+        };
+
         running = true;
         lastFpsTime = performance.now();
         requestAnimationFrame(mainLoop);
