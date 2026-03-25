@@ -1476,7 +1476,7 @@ async function mainLoop(timestamp) {
             // Advance latent sequence playback or auto-cycle
             if (activeSequence) {
                 const seq = activeSequence;
-                seq.accumulator += DT;
+                seq.accumulator += numSubsteps * DT;
                 const frameDt = 1.0 / seq.fps;
                 while (seq.accumulator >= frameDt) {
                     seq.accumulator -= frameDt;
