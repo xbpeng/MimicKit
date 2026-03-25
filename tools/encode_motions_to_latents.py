@@ -44,7 +44,13 @@ print(f"Encoder: disc_obs → 64-dim latent")
 presets = {}
 
 with torch.no_grad():
-    for mi in range(motion_lib.get_num_motions()):
+    try:
+    from tqdm import tqdm
+    motion_iter = tqdm(range(motion_lib.get_num_motions()), desc='Encoding motions')
+except ImportError:
+    motion_iter = range(motion_lib.get_num_motions())
+
+for mi in motion_iter:
         fname = os.path.basename(motion_lib._motion_files[mi])
         name = fname.replace('RL_Avatar_', '').replace('_Motion.pkl', '').replace('(0)', '')
 
@@ -73,23 +79,20 @@ with torch.no_grad():
         if latents:
             latents = np.array(latents)
 
-            # Element-wise signed max: for each dimension, take the value with
-            # the largest absolute value across all frames. This captures the
-            # peak/most characteristic activation in each latent dimension,
-            # then normalizes to the unit sphere.
-            abs_vals = np.abs(latents)
-            max_indices = np.argmax(abs_vals, axis=0)
-            peak_z = np.array([latents[max_indices[d], d] for d in range(latents.shape[1])])
-            # Skip normalization — let the raw peak magnitudes through
-            # peak_z = peak_z / np.linalg.norm(peak_z)
+            # Store the full latent trajectory (one per ~1/30s) plus duration.
+            # The web demo plays these back as timed sequences, cycling through
+            # the latent at each timestep to reproduce the full motion.
+            # Subsample to ~10Hz to keep file size reasonable
+            step = max(1, len(latents) // int(duration * 10))
+            subsampled = latents[::step]
+            trajectory = [[round(float(v), 4) for v in z] for z in subsampled]
 
-            # Spread metric for logging
-            mean_z = np.mean(latents, axis=0)
-            mean_z = mean_z / (np.linalg.norm(mean_z) + 1e-8)
-            spread = 1.0 - np.mean(latents @ mean_z)
-
-            presets[name] = [round(float(v), 4) for v in peak_z]
-            print(f"  {name}: {len(latents)} frames, spread={spread:.3f}, duration={duration:.1f}s")
+            presets[name] = {
+                'duration': round(duration, 2),
+                'fps': round(len(subsampled) / duration, 1),
+                'latents': trajectory,
+            }
+            print(f"  {name}: {len(latents)} frames → {len(trajectory)} keyframes, duration={duration:.1f}s")
         else:
             print(f"  {name}: no samples (duration={duration:.1f}s)")
 

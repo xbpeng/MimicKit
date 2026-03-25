@@ -1472,8 +1472,28 @@ async function mainLoop(timestamp) {
         if (window._physStepCount >= numSubsteps) {
             window._physStepCount = 0;
 
-            // Smoothly cycle latent skills
-            slerpLatent();
+            // Advance latent sequence playback or auto-cycle
+            if (activeSequence) {
+                const seq = activeSequence;
+                seq.accumulator += DT * numSubsteps;
+                const frameDt = 1.0 / seq.fps;
+                while (seq.accumulator >= frameDt) {
+                    seq.accumulator -= frameDt;
+                    seq.frame = (seq.frame + 1) % seq.latents.length;
+                }
+                // Interpolate toward current keyframe for smoothness
+                const target = seq.latents[seq.frame];
+                const t = 0.3;
+                for (let i = 0; i < latentVec.length; i++)
+                    latentVec[i] = latentVec[i] * (1 - t) + target[i] * t;
+                // Normalize
+                let norm = 0;
+                for (let i = 0; i < latentVec.length; i++) norm += latentVec[i] * latentVec[i];
+                norm = Math.sqrt(norm);
+                if (norm > 0) for (let i = 0; i < latentVec.length; i++) latentVec[i] /= norm;
+            } else {
+                slerpLatent();
+            }
 
             // Run policy
             if (policyEnabled) {
@@ -1558,16 +1578,41 @@ async function init() {
             console.log(`Loaded ${Object.keys(presetData).length} latent presets`);
         }).catch(() => {});
 
+        // Latent sequence playback state
+        let activeSequence = null;  // { latents: [...], fps, duration, frame, name }
+
         const presetController = skillFolder.add(skillParams, 'preset', presetNames).name('Skill Preset').onChange(v => {
             if (v === 'Random') {
+                activeSequence = null;
                 randomLatent();
             } else if (presetData[v]) {
-                latentVec = new Float32Array(presetData[v]);
-                latentTarget = new Float32Array(presetData[v]);
-                autoLatent = false;
-                skillParams.autoLatent = false;
-                for (const c of skillFolder.controllers) { if (c.property === 'autoLatent') c.updateDisplay(); }
-                console.log('Loaded preset:', v, '\nLATENT:', JSON.stringify(presetData[v]));
+                const p = presetData[v];
+                if (p.latents && p.latents.length > 1) {
+                    // Sequence preset: play back the latent trajectory
+                    activeSequence = {
+                        name: v,
+                        latents: p.latents,
+                        fps: p.fps || 10,
+                        duration: p.duration || 1,
+                        frame: 0,
+                        accumulator: 0,
+                    };
+                    latentVec = new Float32Array(p.latents[0]);
+                    autoLatent = false;
+                    skillParams.autoLatent = false;
+                    for (const c of skillFolder.controllers) { if (c.property === 'autoLatent') c.updateDisplay(); }
+                    console.log('Playing sequence:', v, `(${p.latents.length} keyframes, ${p.duration}s)`);
+                } else {
+                    // Single latent (legacy format)
+                    const arr = Array.isArray(p) ? p : p.latents[0];
+                    activeSequence = null;
+                    latentVec = new Float32Array(arr);
+                    latentTarget = new Float32Array(arr);
+                    autoLatent = false;
+                    skillParams.autoLatent = false;
+                    for (const c of skillFolder.controllers) { if (c.property === 'autoLatent') c.updateDisplay(); }
+                    console.log('Loaded preset:', v);
+                }
             }
         });
 
