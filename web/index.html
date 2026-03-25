@@ -1628,6 +1628,7 @@ function randomLatent() {
     latentTarget = sampleUnitLatent();
     latentStepsLeft = 30 + Math.floor(Math.random() * 120);
     console.log('LATENT:', JSON.stringify(Array.from(latentVec).map(v => Math.round(v * 10000) / 10000)));
+    if (window._updateLatentDisplay) window._updateLatentDisplay();
 }
 
 function slerpLatent() {
@@ -1650,6 +1651,7 @@ function slerpLatent() {
     if (latentStepsLeft <= 0) {
         // Log current latent before switching (copy-pasteable JSON array)
         console.log('LATENT:', JSON.stringify(Array.from(latentVec).map(v => Math.round(v * 10000) / 10000)));
+    if (window._updateLatentDisplay) window._updateLatentDisplay();
         latentTarget = sampleUnitLatent();
         latentStepsLeft = 30 + Math.floor(Math.random() * 120);
     }
@@ -1658,6 +1660,9 @@ function slerpLatent() {
 // ---------------------------------------------------------------------------
 // Reset
 // ---------------------------------------------------------------------------
+// Post-reset hooks — populated by init() to re-apply GUI state after rebuild
+let _postResetHooks = [];
+
 function resetHumanoid() {
     prevAction = null;  // Reset action smoothing
     pxScene.removeArticulation(articulation);
@@ -1716,7 +1721,8 @@ function resetHumanoid() {
         worldGroup.add(group);
         links[bi].meshGroup = group;
     }
-    randomLatent();
+    // Run post-reset hooks (re-apply simulation settings, Y constraint, etc.)
+    for (const hook of _postResetHooks) hook();
 }
 
 // ---------------------------------------------------------------------------
@@ -1825,13 +1831,12 @@ async function init() {
         // Build lil-gui panel
         const gui = new GUI({ title: 'MimicKit' });
 
-        // Actions folder
-        const actionsFolder = gui.addFolder('Actions');
-        actionsFolder.add({ reset: resetHumanoid }, 'reset').name('Reset');
+        // Reset button (top-level, no folder)
+        gui.add({ reset: resetHumanoid }, 'reset').name('Reset');
 
         // Skills folder — hand-derived latent presets
         const skillFolder = gui.addFolder('Skills');
-        const skillParams = { preset: 'Random', autoLatent, blendRate: latentBlendRate };
+        const skillParams = { preset: 'Random' };
 
         // Hand-derived latent presets (64-dim vectors on unit hypersphere)
         const presetData = {
@@ -1863,31 +1868,32 @@ async function init() {
                 latentVec = new Float32Array(arr);
                 latentTarget = new Float32Array(arr);
                 autoLatent = false;
-                skillParams.autoLatent = false;
-                for (const c of skillFolder.controllers) { if (c.property === 'autoLatent') c.updateDisplay(); }
                 console.log('Loaded preset:', v);
+                if (window._updateLatentDisplay) window._updateLatentDisplay();
             }
         });
 
-        skillFolder.add(skillParams, 'autoLatent').name('Auto-Cycle').onChange(v => { autoLatent = v; });
-        skillFolder.add(skillParams, 'blendRate', 0.01, 0.3, 0.01).name('Blend Speed').onChange(v => { latentBlendRate = v; });
         skillFolder.add({ newSkill: randomLatent }, 'newSkill').name('Random Skill');
         const latentInput = { paste: '' };
-        skillFolder.add(latentInput, 'paste').name('Paste Latent').onFinishChange(v => {
+        const pasteController = skillFolder.add(latentInput, 'paste').name('Latent').onFinishChange(v => {
             try {
                 const arr = JSON.parse(v);
                 if (Array.isArray(arr) && arr.length === humanoidData.latent_dim) {
                     latentVec = new Float32Array(arr);
                     latentTarget = new Float32Array(arr);
                     autoLatent = false;
-                    skillParams.autoLatent = false;
-                    for (const c of skillFolder.controllers) { if (c.property === 'autoLatent') c.updateDisplay(); }
                     console.log('Loaded latent from paste');
                 } else {
                     console.error('Latent must be array of length', humanoidData.latent_dim);
                 }
             } catch(e) { console.error('Invalid JSON:', e.message); }
         });
+        // Auto-populate paste field whenever latent is printed
+        window._updateLatentDisplay = function() {
+            const str = JSON.stringify(Array.from(latentVec).map(v => Math.round(v * 10000) / 10000));
+            latentInput.paste = str;
+            pasteController.updateDisplay();
+        };
 
         // Simulation folder
         const simFolder = gui.addFolder('Simulation');
@@ -1907,21 +1913,75 @@ async function init() {
             pxScene.setGravity(new PhysX.PxVec3(0, 0, v));
         });
         simFolder.add(simParams, 'substeps', 1, 16, 1).name('Substeps').onChange(v => { numSubsteps = v; });
+
         simFolder.close();
 
-        // Stats folder (read-only, updated each frame)
-        const statsFolder = gui.addFolder('Stats');
+        // Make stats available to updateDebugInfo (no GUI folder, just internal)
         const stats = { root_z: 0, root_speed: 0, max_dof_vel: 0, fps: 0 };
-        const statControllers = {
-            root_z: statsFolder.add(stats, 'root_z').name('Root Z').disable().listen(),
-            root_speed: statsFolder.add(stats, 'root_speed').name('Root Speed').disable().listen(),
-            max_dof_vel: statsFolder.add(stats, 'max_dof_vel').name('Max DOF Vel').disable().listen(),
-            fps: statsFolder.add(stats, 'fps').name('FPS').disable().listen(),
-        };
-        statsFolder.close();
-
-        // Make stats available to updateDebugInfo
         window._guiStats = stats;
+
+        // Y-axis constraint: use a D6 joint between a static actor and the root link.
+        // PhysX articulations only support fixed or free root — no per-axis locking.
+        // A D6 joint can lock specific translational axes while leaving others free.
+        let yConstraintJoint = null;
+        let yConstraintActor = null;
+        function enableYConstraint() {
+            if (yConstraintJoint) return;
+            // Create a static anchor at the root's current position (but Y=0)
+            const rootPose = links[0].link.getGlobalPose();
+            const rp = rootPose.get_p();
+            const anchorPose = new PhysX.PxTransform(
+                new PhysX.PxVec3(rp.get_x(), 0, rp.get_z()),
+                new PhysX.PxQuat(0, 0, 0, 1)
+            );
+            yConstraintActor = physics.createRigidStatic(anchorPose);
+            pxScene.addActor(yConstraintActor);
+
+            // Create D6 joint: static anchor <-> root link
+            const localFrame0 = new PhysX.PxTransform(new PhysX.PxVec3(0,0,0), new PhysX.PxQuat(0,0,0,1));
+            // Frame1 offset = root's position relative to anchor
+            const localFrame1 = new PhysX.PxTransform(
+                new PhysX.PxVec3(0, rp.get_y(), 0),
+                new PhysX.PxQuat(0, 0, 0, 1)
+            );
+            yConstraintJoint = PhysX.PxTopLevelFunctions.prototype.D6JointCreate(
+                physics, yConstraintActor, localFrame0, links[0].link, localFrame1
+            );
+            if (yConstraintJoint) {
+                // Lock Y translation, free everything else
+                yConstraintJoint.setMotion(PhysX.PxD6AxisEnum.eX, PhysX.PxD6MotionEnum.eFREE);
+                yConstraintJoint.setMotion(PhysX.PxD6AxisEnum.eY, PhysX.PxD6MotionEnum.eLOCKED);
+                yConstraintJoint.setMotion(PhysX.PxD6AxisEnum.eZ, PhysX.PxD6MotionEnum.eFREE);
+                yConstraintJoint.setMotion(PhysX.PxD6AxisEnum.eTWIST, PhysX.PxD6MotionEnum.eFREE);
+                yConstraintJoint.setMotion(PhysX.PxD6AxisEnum.eSWING1, PhysX.PxD6MotionEnum.eFREE);
+                yConstraintJoint.setMotion(PhysX.PxD6AxisEnum.eSWING2, PhysX.PxD6MotionEnum.eFREE);
+                console.log('Y constraint enabled via D6 joint');
+            } else {
+                console.error('Failed to create D6 joint for Y constraint');
+            }
+        }
+        function disableYConstraint() {
+            if (yConstraintJoint) { yConstraintJoint.release(); yConstraintJoint = null; }
+            if (yConstraintActor) { pxScene.removeActor(yConstraintActor); yConstraintActor.release(); yConstraintActor = null; }
+            console.log('Y constraint disabled');
+        }
+        // Wire up the GUI toggle
+        simParams.lockY = false;
+        simFolder.add(simParams, 'lockY').name('Lock Y Axis').onChange(v => {
+            if (v) enableYConstraint(); else disableYConstraint();
+        });
+
+        // Register post-reset hooks to re-apply GUI state after articulation rebuild
+        _postResetHooks.push(() => {
+            // Re-apply simulation settings
+            setSelfCollision(simParams.selfCollision);
+            setGravity(simParams.gravity);
+            if (simParams.gravity) pxScene.setGravity(new PhysX.PxVec3(0, 0, simParams.gravityStrength));
+            applyDriveParams();
+            // Re-create Y constraint if it was active (old joint was destroyed with articulation)
+            yConstraintJoint = null; yConstraintActor = null;  // clear stale refs
+            if (simParams.lockY) enableYConstraint();
+        });
 
         running = true;
         lastFpsTime = performance.now();
