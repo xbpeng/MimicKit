@@ -1279,6 +1279,53 @@ let latentStepsLeft = 0;   // frames until next latent change
 let latentBlendRate = 0.05; // SLERP speed per frame
 let autoLatent = false;    // auto-cycle latents (off by default)
 
+// Latent presets — discovered empirically or saved by user.
+// Stored in localStorage for persistence across sessions.
+let latentPresets = {};
+function loadPresets() {
+    try {
+        const saved = localStorage.getItem('mimickit_presets');
+        if (saved) latentPresets = JSON.parse(saved);
+    } catch(e) {}
+}
+function savePresets() {
+    try { localStorage.setItem('mimickit_presets', JSON.stringify(latentPresets)); } catch(e) {}
+}
+function saveCurrentLatent(name) {
+    latentPresets[name] = Array.from(latentVec).map(v => Math.round(v * 10000) / 10000);
+    savePresets();
+    console.log('Saved preset:', name);
+}
+function loadLatentPreset(name) {
+    const arr = latentPresets[name];
+    if (!arr) return;
+    latentVec = new Float32Array(arr);
+    latentTarget = new Float32Array(arr);
+    autoLatent = false;
+    console.log('Loaded preset:', name, '\nLATENT:', JSON.stringify(arr));
+}
+
+// 2D latent pad: bilinear interpolation between 4 random anchor latents.
+// Moving the mouse across the pad smoothly explores a 2D slice of the 64D sphere.
+let padAnchors = [null, null, null, null]; // TL, TR, BL, BR
+function initPadAnchors() {
+    for (let i = 0; i < 4; i++) padAnchors[i] = sampleUnitLatent();
+}
+function padToLatent(x, y) {
+    // x,y in [0,1]. Bilinear interpolation then normalize.
+    const dim = padAnchors[0].length;
+    const z = new Float32Array(dim);
+    const w = [(1-x)*(1-y), x*(1-y), (1-x)*y, x*y]; // TL TR BL BR
+    for (let i = 0; i < dim; i++) {
+        z[i] = w[0]*padAnchors[0][i] + w[1]*padAnchors[1][i] + w[2]*padAnchors[2][i] + w[3]*padAnchors[3][i];
+    }
+    let norm = 0;
+    for (let i = 0; i < dim; i++) norm += z[i]*z[i];
+    norm = Math.sqrt(norm);
+    if (norm > 0) for (let i = 0; i < dim; i++) z[i] /= norm;
+    return z;
+}
+
 function sampleUnitLatent() {
     const z = new Float32Array(humanoidData.latent_dim);
     let norm = 0;
@@ -1495,18 +1542,35 @@ async function init() {
         const actionsFolder = gui.addFolder('Actions');
         actionsFolder.add({ reset: resetHumanoid }, 'reset').name('Reset');
 
-        // Skills folder
+        // Skills folder — load presets from latent_presets.json (encoded from motion clips)
         const skillFolder = gui.addFolder('Skills');
-        const modes = ['Free', 'Heading (Coming Soon)', 'Location (Coming Soon)', 'Strike (Coming Soon)'];
-        const skillParams = { mode: 'Free', autoLatent, blendRate: latentBlendRate };
-        skillFolder.add(skillParams, 'mode', modes).name('Mode').onChange(v => {
-            if (v === 'Free') {
-                // Free mode: manual/random latent control
-            } else {
-                // HLC modes: not yet available (obs format incompatibility)
-                console.log(`${v} mode requires HLC retrained for MimicKit obs format`);
+        const skillParams = { preset: 'Random', autoLatent, blendRate: latentBlendRate };
+
+        // Load latent presets (async, populates dropdown when ready)
+        let presetNames = ['Random'];
+        let presetData = {};
+        fetch('./latent_presets.json').then(r => r.ok ? r.json() : null).then(data => {
+            if (!data || !data.presets) return;
+            presetData = data.presets;
+            presetNames = ['Random', ...Object.keys(presetData).sort()];
+            // Rebuild the dropdown
+            presetController.options(presetNames);
+            console.log(`Loaded ${Object.keys(presetData).length} latent presets`);
+        }).catch(() => {});
+
+        const presetController = skillFolder.add(skillParams, 'preset', presetNames).name('Skill Preset').onChange(v => {
+            if (v === 'Random') {
+                randomLatent();
+            } else if (presetData[v]) {
+                latentVec = new Float32Array(presetData[v]);
+                latentTarget = new Float32Array(presetData[v]);
+                autoLatent = false;
+                skillParams.autoLatent = false;
+                for (const c of skillFolder.controllers) { if (c.property === 'autoLatent') c.updateDisplay(); }
+                console.log('Loaded preset:', v, '\nLATENT:', JSON.stringify(presetData[v]));
             }
         });
+
         skillFolder.add(skillParams, 'autoLatent').name('Auto-Cycle').onChange(v => { autoLatent = v; });
         skillFolder.add(skillParams, 'blendRate', 0.01, 0.3, 0.01).name('Blend Speed').onChange(v => { latentBlendRate = v; });
         skillFolder.add({ newSkill: randomLatent }, 'newSkill').name('Random Skill');
