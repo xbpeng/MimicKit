@@ -1,9 +1,7 @@
 *.pyc
-*.png
 
 .vs/
 __pycache__/
 output/
 .vscode/
 wandb/
-.playwright-mcp/
