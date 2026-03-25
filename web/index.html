@@ -1497,8 +1497,17 @@ async function init() {
 
         // Skills folder
         const skillFolder = gui.addFolder('Skills');
-        const skillParams = { autoLatent, blendRate: latentBlendRate };
-        skillFolder.add(skillParams, 'autoLatent').name('Auto-Cycle Skills').onChange(v => { autoLatent = v; });
+        const modes = ['Free', 'Heading (Coming Soon)', 'Location (Coming Soon)', 'Strike (Coming Soon)'];
+        const skillParams = { mode: 'Free', autoLatent, blendRate: latentBlendRate };
+        skillFolder.add(skillParams, 'mode', modes).name('Mode').onChange(v => {
+            if (v === 'Free') {
+                // Free mode: manual/random latent control
+            } else {
+                // HLC modes: not yet available (obs format incompatibility)
+                console.log(`${v} mode requires HLC retrained for MimicKit obs format`);
+            }
+        });
+        skillFolder.add(skillParams, 'autoLatent').name('Auto-Cycle').onChange(v => { autoLatent = v; });
         skillFolder.add(skillParams, 'blendRate', 0.01, 0.3, 0.01).name('Blend Speed').onChange(v => { latentBlendRate = v; });
         skillFolder.add({ newSkill: randomLatent }, 'newSkill').name('Random Skill');
         const latentInput = { paste: '' };
@@ -1507,10 +1516,9 @@ async function init() {
                 const arr = JSON.parse(v);
                 if (Array.isArray(arr) && arr.length === humanoidData.latent_dim) {
                     latentVec = new Float32Array(arr);
-                    latentTarget = new Float32Array(arr); // hold this latent
+                    latentTarget = new Float32Array(arr);
                     autoLatent = false;
                     skillParams.autoLatent = false;
-                    // Update the GUI checkbox
                     for (const c of skillFolder.controllers) { if (c.property === 'autoLatent') c.updateDisplay(); }
                     console.log('Loaded latent from paste');
                 } else {
