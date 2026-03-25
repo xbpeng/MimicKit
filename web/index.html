@@ -797,31 +797,61 @@ function buildArticulation() {
                     new PhysX.PxQuat(0, 0, 0, 1)
                 ));
             } else if (geom.type === 'cylinder') {
-                // Approximate cylinder with capsule
+                // Use a convex mesh for cylinders — PhysX has no analytic cylinder.
+                // A capsule approximation is terrible for thin discs (e.g. the shield
+                // with radius=0.3, halfHeight=0.015 becomes a sphere).
                 const r = geom.radius;
-                if (geom.fromto) {
-                    const ft = geom.fromto;  // already Z-up
-                    const p0 = [ft[0], ft[1], ft[2]];
-                    const p1 = [ft[3], ft[4], ft[5]];
-                    const dx = p1[0]-p0[0], dy = p1[1]-p0[1], dz = p1[2]-p0[2];
-                    const len = Math.sqrt(dx*dx+dy*dy+dz*dz);
-                    const halfH = Math.max(len / 2, 0.001);
-                    const g = new PhysX.PxCapsuleGeometry(r, halfH);
+                const hh = geom.halfHeight || 0.015;
+                const nSides = 16;
+
+                // Build disc vertices: two rings along local Z axis
+                const vec = new PhysX.Vector_PxVec3();
+                for (let ring = 0; ring < 2; ring++) {
+                    const z = ring === 0 ? -hh : hh;
+                    for (let i = 0; i < nSides; i++) {
+                        const a = (2 * Math.PI * i) / nSides;
+                        vec.push_back(new PhysX.PxVec3(r * Math.cos(a), r * Math.sin(a), z));
+                    }
+                }
+                const desc = new PhysX.PxConvexMeshDesc();
+                const bd = new PhysX.PxBoundedData();
+                bd.set_count(vec.size());
+                bd.set_stride(12);
+                bd.set_data(vec.data());
+                desc.set_points(bd);
+                desc.set_flags(new PhysX.PxConvexFlags(PhysX.PxConvexFlagEnum.eCOMPUTE_CONVEX));
+                const cookParams = new PhysX.PxCookingParams(new PhysX.PxTolerancesScale());
+                const convexMesh = PhysX.PxTopLevelFunctions.prototype.CreateConvexMesh(cookParams, desc);
+
+                if (convexMesh) {
+                    const g = new PhysX.PxConvexMeshGeometry(convexMesh);
                     shape = physics.createShape(g, material, true, shapeFlags);
-                    const mid = [(p0[0]+p1[0])/2, (p0[1]+p1[1])/2, (p0[2]+p1[2])/2];
-                    const dir = len > 0.001 ? [dx/len, dy/len, dz/len] : [0,0,1];
-                    const q = quatFromTwoVec([1,0,0], dir);
-                    shape.setLocalPose(new PhysX.PxTransform(
-                        new PhysX.PxVec3(mid[0], mid[1], mid[2]),
-                        new PhysX.PxQuat(q[0], q[1], q[2], q[3])
-                    ));
+
+                    if (geom.fromto) {
+                        const ft = geom.fromto;
+                        const p0 = [ft[0], ft[1], ft[2]], p1 = [ft[3], ft[4], ft[5]];
+                        const mid = [(p0[0]+p1[0])/2, (p0[1]+p1[1])/2, (p0[2]+p1[2])/2];
+                        const dx = p1[0]-p0[0], dy = p1[1]-p0[1], dz = p1[2]-p0[2];
+                        const len = Math.sqrt(dx*dx+dy*dy+dz*dz);
+                        const dir = len > 0.001 ? [dx/len, dy/len, dz/len] : [0,0,1];
+                        const q = quatFromTwoVec([0,0,1], dir);
+                        shape.setLocalPose(new PhysX.PxTransform(
+                            new PhysX.PxVec3(mid[0], mid[1], mid[2]),
+                            new PhysX.PxQuat(q[0], q[1], q[2], q[3])
+                        ));
+                    } else {
+                        const lp = geom.pos || [0,0,0];
+                        shape.setLocalPose(new PhysX.PxTransform(
+                            new PhysX.PxVec3(lp[0], lp[1], lp[2]),
+                            new PhysX.PxQuat(0, 0, 0, 1)
+                        ));
+                    }
                 } else {
-                    // Default cylinder along Z in MJCF
-                    const hh = geom.halfHeight || 0.015;
+                    // Fallback to capsule if convex cooking fails
+                    console.warn('Convex mesh cooking failed for cylinder, falling back to capsule');
                     const g = new PhysX.PxCapsuleGeometry(r, hh);
                     shape = physics.createShape(g, material, true, shapeFlags);
-                    const lp = geom.pos || [0,0,0];  // already Z-up
-                    // Rotate capsule X-axis to Z-axis
+                    const lp = geom.pos || [0,0,0];
                     const q = quatFromTwoVec([1,0,0], [0,0,1]);
                     shape.setLocalPose(new PhysX.PxTransform(
                         new PhysX.PxVec3(lp[0], lp[1], lp[2]),
