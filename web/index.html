@@ -1400,10 +1400,9 @@ async function mainLoop(timestamp) {
         lastFpsTime = timestamp;
     }
 
-    // Fixed-rate policy + physics: accumulate real time and step at 30Hz.
-    // Training: 30Hz policy with 4 substeps × 1/120s = 1/30s per policy step.
-    // We run at most ONE policy+physics step per render frame to avoid
-    // the "fast forward" effect when frame rate < 30fps.
+    // Timing: policy at 30Hz (matching training), physics substeps spread
+    // across render frames so visuals update smoothly at the render rate.
+    // Training: 30Hz policy, 4 substeps × 1/120s = 1/30s per policy step.
     if (!window._lastSimTimestamp) window._lastSimTimestamp = timestamp;
     const realDT = Math.min((timestamp - window._lastSimTimestamp) / 1000, 0.1);
     window._lastSimTimestamp = timestamp;
@@ -1411,35 +1410,42 @@ async function mainLoop(timestamp) {
     if (!window._simAccum) window._simAccum = 0;
     window._simAccum += realDT * timeScale;
 
-    // Step at most once per frame (prevents spiral of death on slow machines)
-    if (window._simAccum >= CONTROL_DT) {
-        window._simAccum -= CONTROL_DT;
-        // Clamp accumulator to prevent catching up after lag
-        if (window._simAccum > CONTROL_DT) window._simAccum = 0;
+    // Run as many physics substeps as real time allows (at 120Hz sim rate)
+    const maxSubstepsPerFrame = 8; // cap to prevent spiral of death
+    let stepsThisFrame = 0;
+    while (window._simAccum >= DT && stepsThisFrame < maxSubstepsPerFrame) {
+        window._simAccum -= DT;
+        stepsThisFrame++;
 
-        // Smoothly cycle latent skills
-        slerpLatent();
+        // Every numSubsteps physics steps = one policy step (default 4 = 30Hz)
+        if (!window._physStepCount) window._physStepCount = 0;
+        window._physStepCount++;
 
-        // Run policy
-        if (policyEnabled) {
-            try {
-                const obs = buildObservation();
-                currentAction = await runPolicy(obs);
-                if (currentAction) applyActions(currentAction);
-            } catch (e) {
-                if (!window._policyErrCount) window._policyErrCount = 0;
-                if (++window._policyErrCount <= 3) console.error('Policy error:', e.message);
-                if (!currentAction) currentAction = new Float32Array(humanoidData.act_dim);
+        if (window._physStepCount >= numSubsteps) {
+            window._physStepCount = 0;
+
+            // Smoothly cycle latent skills
+            slerpLatent();
+
+            // Run policy
+            if (policyEnabled) {
+                try {
+                    const obs = buildObservation();
+                    currentAction = await runPolicy(obs);
+                    if (currentAction) applyActions(currentAction);
+                } catch (e) {
+                    if (!window._policyErrCount) window._policyErrCount = 0;
+                    if (++window._policyErrCount <= 3) console.error('Policy error:', e.message);
+                    if (!currentAction) currentAction = new Float32Array(humanoidData.act_dim);
+                }
+            } else {
+                applyActions(new Float32Array(humanoidData.init_dof_pos || humanoidData.act_dim));
             }
-        } else {
-            applyActions(new Float32Array(humanoidData.init_dof_pos || humanoidData.act_dim));
         }
 
-        // Step physics: always 4 substeps (matching training)
-        for (let i = 0; i < numSubsteps; i++) {
-            pxScene.simulate(DT);
-            pxScene.fetchResults(true);
-        }
+        // Physics substep
+        pxScene.simulate(DT);
+        pxScene.fetchResults(true);
         if (restoreGroundAfterStep) { restoreGround(); restoreGroundAfterStep = false; }
     }
 
@@ -1494,6 +1500,23 @@ async function init() {
         skillFolder.add(skillParams, 'autoLatent').name('Auto-Cycle Skills').onChange(v => { autoLatent = v; });
         skillFolder.add(skillParams, 'blendRate', 0.01, 0.3, 0.01).name('Blend Speed').onChange(v => { latentBlendRate = v; });
         skillFolder.add({ newSkill: randomLatent }, 'newSkill').name('Random Skill');
+        const latentInput = { paste: '' };
+        skillFolder.add(latentInput, 'paste').name('Paste Latent').onFinishChange(v => {
+            try {
+                const arr = JSON.parse(v);
+                if (Array.isArray(arr) && arr.length === humanoidData.latent_dim) {
+                    latentVec = new Float32Array(arr);
+                    latentTarget = new Float32Array(arr); // hold this latent
+                    autoLatent = false;
+                    skillParams.autoLatent = false;
+                    // Update the GUI checkbox
+                    for (const c of skillFolder.controllers) { if (c.property === 'autoLatent') c.updateDisplay(); }
+                    console.log('Loaded latent from paste');
+                } else {
+                    console.error('Latent must be array of length', humanoidData.latent_dim);
+                }
+            } catch(e) { console.error('Invalid JSON:', e.message); }
+        });
 
         // Simulation folder
         const simFolder = gui.addFolder('Simulation');
