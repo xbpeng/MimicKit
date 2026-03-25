@@ -1311,6 +1311,8 @@ function slerpLatent() {
     // Cycle to new target
     latentStepsLeft--;
     if (latentStepsLeft <= 0) {
+        // Log current latent before switching (copy-pasteable JSON array)
+        console.log('LATENT:', JSON.stringify(Array.from(latentVec).map(v => Math.round(v * 10000) / 10000)));
         latentTarget = sampleUnitLatent();
         latentStepsLeft = 30 + Math.floor(Math.random() * 120);
     }
