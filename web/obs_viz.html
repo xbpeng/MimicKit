@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>MimicKit - Observation Visualizer</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #1a1a2e; color: #d0d0ff; font-family: 'Segoe UI', monospace; font-size: 12px; padding: 12px; overflow-y: auto; }
+h1 { font-size: 16px; margin-bottom: 8px; color: #e0e0ff; }
+.group { margin-bottom: 12px; border: 1px solid rgba(100,100,180,0.3); border-radius: 6px; padding: 8px; background: rgba(30,30,60,0.5); }
+.group-title { font-weight: bold; font-size: 13px; color: #aab0ff; margin-bottom: 4px; cursor: pointer; }
+.group-title:hover { color: #fff; }
+.bar-row { display: flex; align-items: center; height: 18px; margin: 1px 0; }
+.bar-label { width: 160px; text-align: right; padding-right: 6px; color: #8888bb; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bar-container { flex: 1; height: 14px; background: rgba(40,40,80,0.6); border-radius: 2px; position: relative; overflow: hidden; }
+.bar-fill { position: absolute; top: 0; height: 100%; border-radius: 2px; transition: width 0.05s, left 0.05s; }
+.bar-fill.positive { background: #4466cc; }
+.bar-fill.negative { background: #cc4466; }
+.bar-zero { position: absolute; top: 0; bottom: 0; width: 1px; background: rgba(255,255,255,0.2); }
+.bar-value { width: 65px; text-align: right; padding-left: 4px; font-size: 11px; color: #9999cc; }
+.bar-row.error .bar-label { color: #ff6666; }
+.bar-row.error .bar-value { color: #ff6666; }
+.controls { margin-bottom: 10px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.controls button { background: #3a3a5e; color: #d0d0ff; border: 1px solid #5a5a8e; padding: 5px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; }
+.controls button:hover { background: #4a4a7e; }
+.controls button.active { background: #5a5acc; border-color: #7a7aee; }
+.controls label { display: flex; align-items: center; gap: 4px; cursor: pointer; }
+.controls input[type=checkbox] { cursor: pointer; }
+#status { color: #88cc88; margin-bottom: 8px; }
+.summary { color: #aab0ff; font-size: 11px; margin-bottom: 4px; }
+</style>
+</head>
+<body>
+<h1>Observation Vector Visualizer</h1>
+<div class="controls">
+    <button id="btnConnect" onclick="toggleConnect()">Connect to Demo</button>
+    <button id="btnFreeze" onclick="toggleFreeze()">Freeze</button>
+    <label><input type="checkbox" id="chkRef" onchange="toggleRef()"> Show Isaac Lab Reference</label>
+    <label><input type="checkbox" id="chkDiff" onchange="toggleDiff()"> Show Diff</label>
+    <span id="status">Disconnected</span>
+</div>
+<div id="vizContainer"></div>
+
+<script>
+// =====================================================================
+// ASE Humanoid Sword & Shield observation layout (158 dims)
+// global_obs=False, root_height_obs=True
+// =====================================================================
+const OBS_GROUPS = [
+    {
+        name: 'Root Height',
+        start: 0, count: 1,
+        labels: ['root_z'],
+        range: [0, 1.5],
+        desc: 'Pelvis Z position in world frame (standing ~0.7m)',
+    },
+    {
+        name: 'Root Rotation (tan_norm, heading-local)',
+        start: 1, count: 6,
+        labels: ['tan_x', 'tan_y', 'tan_z', 'norm_x', 'norm_y', 'norm_z'],
+        range: [-1.5, 1.5],
+        desc: 'Heading-removed root rotation. tan=rotated X-axis, norm=rotated Z-axis. Upright: tan=[1,0,0] norm=[0,0,1]',
+    },
+    {
+        name: 'Root Linear Velocity (heading frame)',
+        start: 7, count: 3,
+        labels: ['vel_fwd', 'vel_lat', 'vel_up'],
+        range: [-5, 5],
+        desc: 'Root velocity in heading frame: forward, lateral, vertical (m/s)',
+    },
+    {
+        name: 'Root Angular Velocity (heading frame)',
+        start: 10, count: 3,
+        labels: ['angvel_roll', 'angvel_pitch', 'angvel_yaw'],
+        range: [-10, 10],
+        desc: 'Root angular velocity in heading frame (rad/s)',
+    },
+    {
+        name: 'Abdomen (torso) — Spherical',
+        start: 13, count: 6,
+        labels: ['tan_x', 'tan_y', 'tan_z', 'norm_x', 'norm_y', 'norm_z'],
+        range: [-1.5, 1.5],
+        desc: 'Torso joint rotation (3 DOF spherical)',
+    },
+    {
+        name: 'Neck (head) — Spherical',
+        start: 19, count: 6,
+        labels: ['tan_x', 'tan_y', 'tan_z', 'norm_x', 'norm_y', 'norm_z'],
+        range: [-1.5, 1.5],
+        desc: 'Neck joint rotation',
+    },
+    {
+        name: 'Right Shoulder — Spherical',
+        start: 25, count: 6,
+        labels: ['tan_x', 'tan_y', 'tan_z', 'norm_x', 'norm_y', 'norm_z'],
+        range: [-1.5, 1.5],
+        desc: 'Right shoulder joint rotation',
+    },
+    {
+        name: 'Right Elbow — Hinge',
+        start: 31, count: 6,
+        labels: ['tan_x', 'tan_y', 'tan_z', 'norm_x', 'norm_y', 'norm_z'],
+        range: [-1.5, 1.5],
+        desc: 'Right elbow (1 DOF hinge, but encoded as 6D tan_norm)',
+    },
+    {
+        name: 'Right Hand — Spherical',
+        start: 37, count: 6,
+        labels: ['tan_x', 'tan_y', 'tan_z', 'norm_x', 'norm_y', 'norm_z'],
+        range: [-1.5, 1.5],
+        desc: 'Right hand/wrist joint rotation',
+    },
+    {
+        name: 'Sword — Fixed',
+        start: 43, count: 6,
+        labels: ['tan_x', 'tan_y', 'tan_z', 'norm_x', 'norm_y', 'norm_z'],
+        range: [-1.5, 1.5],
+        desc: 'Sword joint (FIXED — should always be identity: tan=[1,0,0] norm=[0,0,1])',
+    },
+    {
+        name: 'Left Shoulder — Spherical',
+        start: 49, count: 6,
+        labels: ['tan_x', 'tan_y', 'tan_z', 'norm_x', 'norm_y', 'norm_z'],
+        range: [-1.5, 1.5],
+        desc: 'Left shoulder joint rotation',
+    },
+    {
+        name: 'Left Elbow — Hinge',
+        start: 55, count: 6,
+        labels: ['tan_x', 'tan_y', 'tan_z', 'norm_x', 'norm_y', 'norm_z'],
+        range: [-1.5, 1.5],
+        desc: 'Left elbow (1 DOF hinge)',
+    },
+    {
+        name: 'Shield — Fixed',
+        start: 61, count: 6,
+        labels: ['tan_x', 'tan_y', 'tan_z', 'norm_x', 'norm_y', 'norm_z'],
+        range: [-1.5, 1.5],
+        desc: 'Shield joint (FIXED — identity)',
+    },
+    {
+        name: 'Left Hand — Fixed',
+        start: 67, count: 6,
+        labels: ['tan_x', 'tan_y', 'tan_z', 'norm_x', 'norm_y', 'norm_z'],
+        range: [-1.5, 1.5],
+        desc: 'Left hand joint (FIXED — identity)',
+    },
+    {
+        name: 'Right Hip — Spherical',
+        start: 73, count: 6,
+        labels: ['tan_x', 'tan_y', 'tan_z', 'norm_x', 'norm_y', 'norm_z'],
+        range: [-1.5, 1.5],
+        desc: 'Right hip joint rotation',
+    },
+    {
+        name: 'Right Knee — Hinge',
+        start: 79, count: 6,
+        labels: ['tan_x', 'tan_y', 'tan_z', 'norm_x', 'norm_y', 'norm_z'],
+        range: [-1.5, 1.5],
+        desc: 'Right knee (1 DOF hinge)',
+    },
+    {
+        name: 'Right Ankle — Spherical',
+        start: 85, count: 6,
+        labels: ['tan_x', 'tan_y', 'tan_z', 'norm_x', 'norm_y', 'norm_z'],
+        range: [-1.5, 1.5],
+        desc: 'Right ankle joint rotation',
+    },
+    {
+        name: 'Left Hip — Spherical',
+        start: 91, count: 6,
+        labels: ['tan_x', 'tan_y', 'tan_z', 'norm_x', 'norm_y', 'norm_z'],
+        range: [-1.5, 1.5],
+        desc: 'Left hip joint rotation',
+    },
+    {
+        name: 'Left Knee — Hinge',
+        start: 97, count: 6,
+        labels: ['tan_x', 'tan_y', 'tan_z', 'norm_x', 'norm_y', 'norm_z'],
+        range: [-1.5, 1.5],
+        desc: 'Left knee (1 DOF hinge)',
+    },
+    {
+        name: 'Left Ankle — Spherical',
+        start: 103, count: 6,
+        labels: ['tan_x', 'tan_y', 'tan_z', 'norm_x', 'norm_y', 'norm_z'],
+        range: [-1.5, 1.5],
+        desc: 'Left ankle joint rotation',
+    },
+    {
+        name: 'DOF Velocities (31)',
+        start: 109, count: 31,
+        labels: [
+            'abd_x','abd_y','abd_z',
+            'neck_x','neck_y','neck_z',
+            'r_sh_x','r_sh_y','r_sh_z','r_elbow',
+            'r_hand_x','r_hand_y','r_hand_z',
+            'l_sh_x','l_sh_y','l_sh_z','l_elbow',
+            'r_hip_x','r_hip_z','r_hip_y','r_knee',
+            'r_ank_x','r_ank_y','r_ank_z',
+            'l_hip_x','l_hip_z','l_hip_y','l_knee',
+            'l_ank_x','l_ank_y','l_ank_z',
+        ],
+        range: [-20, 20],
+        desc: 'Joint velocities in rad/s (common MJCF order)',
+    },
+    {
+        name: 'Key Body Positions (6 bodies, root-relative, heading frame)',
+        start: 140, count: 18,
+        labels: [
+            'head_x','head_y','head_z',
+            'r_hand_x','r_hand_y','r_hand_z',
+            'l_hand_x','l_hand_y','l_hand_z',
+            'r_foot_x','r_foot_y','r_foot_z',
+            'l_foot_x','l_foot_y','l_foot_z',
+            'sword_x','sword_y','sword_z',
+        ],
+        range: [-2, 2],
+        desc: 'Key body positions relative to root, in heading frame (m)',
+    },
+];
+
+let obs = null;
+let refObs = null;
+let frozen = false;
+let showRef = false;
+let showDiff = false;
+let connected = false;
+let pollInterval = null;
+
+// Build the DOM
+const container = document.getElementById('vizContainer');
+const groupElements = [];
+
+for (const g of OBS_GROUPS) {
+    const div = document.createElement('div');
+    div.className = 'group';
+
+    const title = document.createElement('div');
+    title.className = 'group-title';
+    title.textContent = `[${g.start}-${g.start + g.count - 1}] ${g.name}`;
+    title.title = g.desc;
+    div.appendChild(title);
+
+    const summary = document.createElement('div');
+    summary.className = 'summary';
+    summary.textContent = g.desc;
+    div.appendChild(summary);
+
+    const bars = [];
+    for (let i = 0; i < g.count; i++) {
+        const row = document.createElement('div');
+        row.className = 'bar-row';
+
+        const label = document.createElement('div');
+        label.className = 'bar-label';
+        label.textContent = `[${g.start + i}] ${g.labels[i] || 'd' + i}`;
+        row.appendChild(label);
+
+        const barCont = document.createElement('div');
+        barCont.className = 'bar-container';
+
+        // Zero line
+        const zeroLine = document.createElement('div');
+        zeroLine.className = 'bar-zero';
+        const zeroFrac = (0 - g.range[0]) / (g.range[1] - g.range[0]);
+        zeroLine.style.left = (zeroFrac * 100) + '%';
+        barCont.appendChild(zeroLine);
+
+        // Fill bar
+        const fill = document.createElement('div');
+        fill.className = 'bar-fill positive';
+        barCont.appendChild(fill);
+
+        // Reference fill (overlay)
+        const refFill = document.createElement('div');
+        refFill.className = 'bar-fill';
+        refFill.style.background = 'rgba(0,255,100,0.4)';
+        refFill.style.height = '4px';
+        refFill.style.top = '5px';
+        refFill.style.display = 'none';
+        barCont.appendChild(refFill);
+
+        row.appendChild(barCont);
+
+        const value = document.createElement('div');
+        value.className = 'bar-value';
+        value.textContent = '--';
+        row.appendChild(value);
+
+        div.appendChild(row);
+        bars.push({ row, fill, refFill, value, range: g.range });
+    }
+
+    container.appendChild(div);
+    groupElements.push({ div, bars, group: g });
+}
+
+function updateBars() {
+    if (!obs) return;
+    for (const ge of groupElements) {
+        for (let i = 0; i < ge.bars.length; i++) {
+            const idx = ge.group.start + i;
+            const val = obs[idx] || 0;
+            const b = ge.bars[i];
+            const [lo, hi] = b.range;
+            const span = hi - lo;
+            const zeroFrac = (0 - lo) / span;
+            const valFrac = (val - lo) / span;
+            const clampedFrac = Math.max(0, Math.min(1, valFrac));
+
+            if (val >= 0) {
+                b.fill.className = 'bar-fill positive';
+                b.fill.style.left = (zeroFrac * 100) + '%';
+                b.fill.style.width = ((clampedFrac - zeroFrac) * 100) + '%';
+            } else {
+                b.fill.className = 'bar-fill negative';
+                b.fill.style.left = (clampedFrac * 100) + '%';
+                b.fill.style.width = ((zeroFrac - clampedFrac) * 100) + '%';
+            }
+
+            b.value.textContent = val.toFixed(3);
+
+            // Reference
+            if (showRef && refObs) {
+                const rval = refObs[idx] || 0;
+                const rFrac = Math.max(0, Math.min(1, (rval - lo) / span));
+                b.refFill.style.display = '';
+                b.refFill.style.left = (rFrac * 100 - 0.5) + '%';
+                b.refFill.style.width = '1%';
+
+                // Highlight diffs
+                const diff = Math.abs(val - rval);
+                if (diff > 0.1) {
+                    b.row.className = 'bar-row error';
+                    b.value.textContent = val.toFixed(3) + ' (d:' + diff.toFixed(2) + ')';
+                } else {
+                    b.row.className = 'bar-row';
+                }
+            } else {
+                b.refFill.style.display = 'none';
+                b.row.className = 'bar-row';
+            }
+        }
+    }
+}
+
+// Connect to the main demo via BroadcastChannel or polling
+let bc = null;
+
+function toggleConnect() {
+    if (connected) {
+        if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
+        if (bc) { bc.close(); bc = null; }
+        connected = false;
+        document.getElementById('btnConnect').classList.remove('active');
+        document.getElementById('status').textContent = 'Disconnected';
+    } else {
+        // Try BroadcastChannel first
+        try {
+            bc = new BroadcastChannel('mimickit-obs');
+            bc.onmessage = (e) => {
+                if (!frozen && e.data && e.data.obs) {
+                    obs = e.data.obs;
+                    updateBars();
+                }
+            };
+            document.getElementById('status').textContent = 'Listening via BroadcastChannel...';
+        } catch(e) {
+            document.getElementById('status').textContent = 'BroadcastChannel not available';
+        }
+
+        // Also poll localStorage as fallback
+        pollInterval = setInterval(() => {
+            try {
+                const raw = localStorage.getItem('mimickit-obs');
+                if (raw && !frozen) {
+                    obs = JSON.parse(raw);
+                    updateBars();
+                }
+                const rawRef = localStorage.getItem('mimickit-ref-obs');
+                if (rawRef) {
+                    refObs = JSON.parse(rawRef);
+                }
+            } catch(e) {}
+        }, 50);
+
+        connected = true;
+        document.getElementById('btnConnect').classList.add('active');
+        document.getElementById('status').textContent = 'Connected (polling localStorage)';
+    }
+}
+
+function toggleFreeze() {
+    frozen = !frozen;
+    document.getElementById('btnFreeze').classList.toggle('active', frozen);
+}
+function toggleRef() { showRef = document.getElementById('chkRef').checked; updateBars(); }
+function toggleDiff() { showDiff = document.getElementById('chkDiff').checked; updateBars(); }
+
+// Also support loading a reference from JSON file
+async function loadRef() {
+    try {
+        const resp = await fetch('./detailed_trace.json?' + Date.now());
+        const data = await resp.json();
+        if (data.steps && data.steps[0]) {
+            refObs = data.steps[0].obs;
+            document.getElementById('status').textContent += ' | Ref loaded (step 0)';
+            document.getElementById('chkRef').checked = true;
+            showRef = true;
+            updateBars();
+        }
+    } catch(e) {}
+}
+loadRef();
+
+// Auto-connect on load
+toggleConnect();
+</script>
+</body>
+</html>

@@ -252,20 +252,14 @@ class BaseAgent(torch.nn.Module):
         return
 
     def _rollout_train(self, num_steps):
-        try:
-            from tqdm import tqdm
-            step_iter = tqdm(range(num_steps), desc='Rollout', leave=False)
-        except ImportError:
-            step_iter = range(num_steps)
-
-        for i in step_iter:
+        for i in range(num_steps):
             action, action_info = self._decide_action(self._curr_obs, self._curr_info)
             self._record_data_pre_step(self._curr_obs, self._curr_info, action, action_info)
 
             next_obs, r, done, next_info = self._step_env(action)
             self._train_return_tracker.update(r, done)
             self._record_data_post_step(next_obs, r, done, next_info)
-
+            
             self._curr_obs, self._curr_info = self._reset_done_envs(done)
             self._exp_buffer.inc()
         return

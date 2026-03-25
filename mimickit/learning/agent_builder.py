@@ -32,9 +32,6 @@ def build_agent(agent_file, env, device):
     elif (agent_name == "LCP"):
         import learning.lcp_agent as lcp_agent
         agent = lcp_agent.LCPAgent(config=agent_config, env=env, device=device)
-    elif (agent_name == "HRL"):
-        import learning.hrl_agent as hrl_agent
-        agent = hrl_agent.HRLAgent(config=agent_config, env=env, device=device)
     else:
         assert(False), "Unsupported agent: {}".format(agent_name)
 

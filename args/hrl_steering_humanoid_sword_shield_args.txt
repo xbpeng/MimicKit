@@ -1,7 +1,0 @@
---num_envs 4096
-
---engine_config data/engines/isaac_lab_engine.yaml
---env_config data/envs/amp_steering_humanoid_sword_shield_env.yaml
---agent_config data/agents/hrl_humanoid_sword_shield_agent.yaml
-
---out_dir output/
