@@ -676,17 +676,21 @@ function setSelfCollision(enabled) {
     );
     // Also update filter data on all articulation link shapes
     for (const entry of links) {
-        const nbShapes = entry.link.getNbShapes();
-        for (let si = 0; si < nbShapes; si++) {
-            const shape = entry.link.getShape(si);
-            if (enabled) {
-                // group 2, collide with group 1 and 2
-                shape.setSimulationFilterData(new PhysX.PxFilterData(2, 3, 0, 0));
-            } else {
-                // group 2, collide with group 1 only (ground only)
-                shape.setSimulationFilterData(new PhysX.PxFilterData(2, 1, 0, 0));
+        try {
+            const nbShapes = entry.link.getNbShapes();
+            for (let si = 0; si < nbShapes; si++) {
+                // physx-js-webidl may use getShape(i) or require different API
+                const shape = (typeof entry.link.getShape === 'function')
+                    ? entry.link.getShape(si)
+                    : entry.link.getShapeAt ? entry.link.getShapeAt(si) : null;
+                if (!shape) continue;
+                if (enabled) {
+                    shape.setSimulationFilterData(new PhysX.PxFilterData(2, 3, 0, 0));
+                } else {
+                    shape.setSimulationFilterData(new PhysX.PxFilterData(2, 1, 0, 0));
+                }
             }
-        }
+        } catch(e) { /* skip if shape API not available */ }
     }
 }
 
