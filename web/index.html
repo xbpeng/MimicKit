@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>MimicKit - ASE Humanoid Sword &amp; Shield</title>
+<title>MimicKit - ASE Humanoid Locomotion</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { background: #1a1a2e; overflow: hidden; font-family: 'Segoe UI', sans-serif; }
@@ -38,7 +38,7 @@ canvas { display: block; }
 </div>
 
 <div id="hud">
-    <div class="title">ASE Humanoid - Sword &amp; Shield</div>
+    <div class="title">ASE Humanoid - Locomotion</div>
     <div id="fpsDisplay">FPS: --</div>
     <div id="physInfo">PhysX WASM + ONNX Runtime</div>
 </div>
@@ -374,7 +374,7 @@ function parseMJCF(xmlText, opts = {}) {
     const worldbody = root.querySelector('worldbody');
     const pelvis = worldbody.querySelector(':scope > body');
     const pelvisPos = _parseVec(pelvis.getAttribute('pos'), 3) || [0,0,0];
-    processBody(pelvis, null, pelvisPos);
+    processBody(pelvis, null, [0,0,0]);
 
     const dofInfo = [];
     for (const actName of actuatorOrder) {
@@ -546,7 +546,7 @@ async function loadOnnxModel() {
     ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.21.0/dist/';
 
     // Fetch as ArrayBuffer so we can both create the session AND scan for metadata
-    const resp = await fetch('./ase_humanoid_sword_shield_actor.onnx');
+    const resp = await fetch('./ase_humanoid_locomotion_actor.onnx');
     onnxBuffer = await resp.arrayBuffer();
     onnxSession = await ort.InferenceSession.create(onnxBuffer, { executionProviders: ['wasm'] });
     console.log('ONNX model loaded (' + (onnxBuffer.byteLength / 1024 / 1024).toFixed(1) + ' MB)');
@@ -716,6 +716,9 @@ async function initPhysX() {
     console.log('PhysX scene created');
 }
 
+// Cache for cooked convex cylinder meshes, keyed by "radius_halfHeight_nSides"
+const cylinderMeshCache = {};
+
 // ---------------------------------------------------------------------------
 // Build PhysX articulation from humanoid data
 // ---------------------------------------------------------------------------
@@ -801,24 +804,34 @@ function buildArticulation() {
                 const hh = geom.halfHeight || 0.015;
                 const nSides = 16;
 
-                // Build disc vertices: two rings along local Z axis
-                const vec = new PhysX.Vector_PxVec3();
-                for (let ring = 0; ring < 2; ring++) {
-                    const z = ring === 0 ? -hh : hh;
-                    for (let i = 0; i < nSides; i++) {
-                        const a = (2 * Math.PI * i) / nSides;
-                        vec.push_back(new PhysX.PxVec3(r * Math.cos(a), r * Math.sin(a), z));
+                // Use cached convex mesh or cook a new one
+                const cacheKey = `${r}_${hh}_${nSides}`;
+                let convexMesh = cylinderMeshCache[cacheKey];
+                if (!convexMesh) {
+                    const vec = new PhysX.Vector_PxVec3();
+                    for (let ring = 0; ring < 2; ring++) {
+                        const z = ring === 0 ? -hh : hh;
+                        for (let i = 0; i < nSides; i++) {
+                            const a = (2 * Math.PI * i) / nSides;
+                            vec.push_back(new PhysX.PxVec3(r * Math.cos(a), r * Math.sin(a), z));
+                        }
                     }
+                    const desc = new PhysX.PxConvexMeshDesc();
+                    const bd = new PhysX.PxBoundedData();
+                    bd.set_count(vec.size());
+                    bd.set_stride(12);
+                    bd.set_data(vec.data());
+                    desc.set_points(bd);
+                    desc.set_flags(new PhysX.PxConvexFlags(PhysX.PxConvexFlagEnum.eCOMPUTE_CONVEX));
+                    const cookParams = new PhysX.PxCookingParams(new PhysX.PxTolerancesScale());
+                    convexMesh = PhysX.PxTopLevelFunctions.prototype.CreateConvexMesh(cookParams, desc);
+                    if (convexMesh) cylinderMeshCache[cacheKey] = convexMesh;
+                    // Release temporary cooking objects
+                    PhysX.destroy(vec);
+                    PhysX.destroy(desc);
+                    PhysX.destroy(bd);
+                    PhysX.destroy(cookParams);
                 }
-                const desc = new PhysX.PxConvexMeshDesc();
-                const bd = new PhysX.PxBoundedData();
-                bd.set_count(vec.size());
-                bd.set_stride(12);
-                bd.set_data(vec.data());
-                desc.set_points(bd);
-                desc.set_flags(new PhysX.PxConvexFlags(PhysX.PxConvexFlagEnum.eCOMPUTE_CONVEX));
-                const cookParams = new PhysX.PxCookingParams(new PhysX.PxTolerancesScale());
-                const convexMesh = PhysX.PxTopLevelFunctions.prototype.CreateConvexMesh(cookParams, desc);
 
                 if (convexMesh) {
                     const g = new PhysX.PxConvexMeshGeometry(convexMesh);
@@ -1438,7 +1451,7 @@ function buildObservation() {
 
     // [13..108] Joint rotations as tan_norm (16 joints x 6 = 96)
     // Read all 31 DOF positions using dofInfo to match Python kinematic model order
-    const dofPositions = new Float32Array(31);
+    const dofPositions = new Float32Array(humanoidData.dofInfo.length);
     for (let i = 0; i < humanoidData.dofInfo.length; i++) {
         const dof = humanoidData.dofInfo[i];
         const childLink = bodyLinkMap[dof.child_body];
@@ -1498,6 +1511,11 @@ function buildObservation() {
             obs[idx++] = localRel[1];
             obs[idx++] = localRel[2];
         }
+    }
+
+    // Validate observation size matches expected dimension
+    if (idx !== humanoidData.obs_dim) {
+        console.error(`Observation size mismatch: produced ${idx}, expected ${humanoidData.obs_dim}`);
     }
 
     // No normalization here - the ONNX model handles it internally

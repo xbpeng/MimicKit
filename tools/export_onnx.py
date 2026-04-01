@@ -14,6 +14,12 @@ Usage:
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'mimickit'))
 
+# Isaac Gym requires being imported before torch
+try:
+    import isaacgym
+except ImportError:
+    pass
+
 import argparse
 import numpy as np
 import torch
@@ -87,9 +93,10 @@ def main():
         mk_args._table['mode'] = ['test']
         mk_args._table['visualize'] = ['false']
 
-        mp_util.init(0, 1, 'cpu', None)
+        device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+        mp_util.init(0, 1, device, None)
 
-        env = mimickit_run.build_env(mk_args, 1, 'cpu', False)
+        env = mimickit_run.build_env(mk_args, 1, device, False)
         agent = mimickit_run.build_agent(mk_args, env, 'cpu')
         agent.load(args.model_file)
         agent.eval()
@@ -101,11 +108,7 @@ def main():
 
     except Exception as e:
         print(f"Failed to build via full pipeline: {e}")
-        print("Falling back to checkpoint-only export (same as export_onnx.py v1)")
-        # Fall back to v1 approach
-        from export_onnx import export_onnx
-        export_onnx(args.model_file, args.output)
-        return
+        raise
 
     # Create wrapper
     wrapper = ASEActorWrapper(agent)
@@ -250,15 +253,15 @@ def main():
         try:
             mjcf_path = mk_args.parse_string('char_file')
         except: pass
-    # Try common locations
+    # Try env_config's char_file
     if not mjcf_path or not os.path.isfile(mjcf_path):
-        for candidate in [
-            'data/assets/sword_shield/humanoid_sword_shield.xml',
-            os.path.join(os.path.dirname(args.output), 'humanoid_sword_shield.xml'),
-        ]:
-            if os.path.isfile(candidate):
-                mjcf_path = candidate
-                break
+        try:
+            import yaml
+            with open(mk_args.parse_string('env_config')) as f:
+                env_cfg = yaml.safe_load(f)
+            if 'char_file' in env_cfg and os.path.isfile(env_cfg['char_file']):
+                mjcf_path = env_cfg['char_file']
+        except: pass
     if mjcf_path and os.path.isfile(mjcf_path):
         with open(mjcf_path) as f:
             meta['mjcf_xml'] = f.read()
