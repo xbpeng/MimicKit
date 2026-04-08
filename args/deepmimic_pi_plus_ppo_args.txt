@@ -5,5 +5,3 @@
 --agent_config data/agents/deepmimic_pi_plus_ppo_agent.yaml
 
 --out_dir output/
-
---max_samples 150000000

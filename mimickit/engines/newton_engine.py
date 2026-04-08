@@ -373,7 +373,6 @@ class NewtonEngine(engine.Engine):
         num_envs = self.get_num_envs()
         self._sim_state = SimState(self._sim_model, num_envs)
         self._state_swap_buffer = self._sim_model.state()
-        self._contacts = self._sim_model.collide(self._sim_state.raw_state)
 
         self._apply_start_xform()
 
@@ -383,6 +382,8 @@ class NewtonEngine(engine.Engine):
 
         self._build_sim_tensors()
         self._build_dof_force_tensors()
+
+        self._contacts = self._sim_model.contacts()
 
         if (self._visualize()):
             self.init_viewer(self._viewer)
@@ -404,6 +405,7 @@ class NewtonEngine(engine.Engine):
         else:
             self._simulate()
 
+        self._solver.update_contacts(self._contacts, self._sim_state.raw_state)
         self._update_contact_sensors()
         self._sim_step_count += 1
         return
@@ -673,6 +675,23 @@ class NewtonEngine(engine.Engine):
 
         return dof_low, dof_high
     
+    def get_obj_pd_gains(self, env_id, obj_id):
+        objs_per_env = self.get_objs_per_env()
+        obj_idx = env_id * objs_per_env + obj_id
+
+        articulation_start = self._sim_model.articulation_start.numpy()
+        joint_qd_start = self._sim_model.joint_qd_start.numpy()
+
+        body_start = articulation_start[obj_idx]
+        body_end = articulation_start[obj_idx + 1]
+        qd_start = joint_qd_start[body_start + 1]
+        qd_end = joint_qd_start[body_end]
+
+        kp = self._sim_model.joint_target_ke.numpy()[qd_start:qd_end]
+        kd = self._sim_model.joint_target_kd.numpy()[qd_start:qd_end]
+        
+        return kp, kd
+    
     def find_obj_body_id(self, obj_id, body_name):
         body_names = self.get_obj_body_names(obj_id)
         body_id = body_names.index(body_name)
@@ -694,7 +713,8 @@ class NewtonEngine(engine.Engine):
         articulation_start = self._sim_model.articulation_start.numpy()
         body_start = articulation_start[obj_id]
         body_end = articulation_start[obj_id + 1]
-        body_names = self._sim_model.body_key[body_start:body_end]
+        body_labels = self._sim_model.body_label[body_start:body_end]
+        body_names = [os.path.basename(l) for l in body_labels]
         return body_names
     
     def calc_obj_mass(self, env_id, obj_id):
@@ -708,7 +728,6 @@ class NewtonEngine(engine.Engine):
         body_end = int(articulation_start[obj_idx + 1])
         masses = body_masses[body_start:body_end]
         total_mass = float(masses.sum())
-
         return total_mass
     
     def get_control_mode(self):
@@ -818,18 +837,22 @@ class NewtonEngine(engine.Engine):
         if (self._control_mode == engine.ControlMode.none):
             self._sim_model.joint_target_ke.fill_(0.0)
             self._sim_model.joint_target_kd.fill_(0.0)
+            self._sim_model.joint_target_mode.fill_(int(newton.JointTargetMode.NONE))
 
         elif (self._control_mode == engine.ControlMode.pos):
             wp.copy(self._sim_model.joint_target_ke, kp)
             wp.copy(self._sim_model.joint_target_kd, kd)
+            self._sim_model.joint_target_mode.fill_(int(newton.JointTargetMode.POSITION))
 
         elif (self._control_mode == engine.ControlMode.vel):
             self._sim_model.joint_target_ke.fill_(0.0)
             wp.copy(self._sim_model.joint_target_kd, kd)
+            self._sim_model.joint_target_mode.fill_(int(newton.JointTargetMode.VELOCITY))
 
         elif (self._control_mode == engine.ControlMode.torque):
             self._sim_model.joint_target_ke.fill_(0.0)
             self._sim_model.joint_target_kd.fill_(0.0)
+            self._sim_model.joint_target_mode.fill_(int(newton.JointTargetMode.EFFORT))
 
         elif (self._control_mode == engine.ControlMode.pd_explicit):
             self._sim_model.joint_target_ke.fill_(0.0)
@@ -837,6 +860,7 @@ class NewtonEngine(engine.Engine):
             self._kp_raw = wp.clone(kp)
             self._kd_raw = wp.clone(kd)
             self._torque_lim_raw = wp.clone(self._sim_model.joint_effort_limit)
+            self._sim_model.joint_target_mode.fill_(int(newton.JointTargetMode.EFFORT))
 
         else:
             assert(False), "Unsupported control mode: {}".format(self._control_mode)
@@ -948,7 +972,7 @@ class NewtonEngine(engine.Engine):
                 assert(False), "Unsupported asset format: {:s}".format(asset_ext)
 
             if (is_visual):
-                for i in range(len(obj_builder.shape_key)):
+                for i in range(len(obj_builder.shape_flags)):
                     obj_builder.shape_flags[i] &= ~newton.ShapeFlags.COLLIDE_SHAPES
             
             self._builder_cache[obj_cfg] = obj_builder
@@ -1053,8 +1077,7 @@ class NewtonEngine(engine.Engine):
         return
     
     def _update_contact_sensors(self):
-        newton.sensors.populate_contacts(self._contacts, self._solver)
-        self._ground_contact_sensor.eval(self._contacts)
+        self._ground_contact_sensor.update(self._sim_state.raw_state, self._contacts)
         return
     
     def _visualize(self):

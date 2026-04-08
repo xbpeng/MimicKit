@@ -435,6 +435,11 @@ class IsaacGymEngine(engine.Engine):
                 raise ValueError(f"Env {env_id} Obj {obj_id} DoF {i}: invalid bound detected (lower={l}, upper={h}).")
 
         return dof_low, dof_high
+
+    def get_obj_pd_gains(self, env_id, obj_id):
+        kp = self._obj_kp[obj_id][env_id].cpu().numpy()
+        kd = self._obj_kd[obj_id][env_id].cpu().numpy()
+        return kp, kd
     
     def find_obj_body_id(self, obj_id, body_name):
         env_ptr = self.get_env(0)

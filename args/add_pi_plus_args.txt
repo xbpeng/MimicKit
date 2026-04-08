@@ -5,5 +5,3 @@
 --agent_config data/agents/add_pi_plus_agent.yaml
 
 --out_dir output/
-
---max_samples 120000000

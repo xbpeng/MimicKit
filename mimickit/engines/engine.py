@@ -193,6 +193,10 @@ class Engine:
         return
     
     @abc.abstractmethod
+    def get_obj_pd_gains(self, env_id, obj_id):
+        return
+    
+    @abc.abstractmethod
     def calc_obj_mass(self, env_id, obj_id):
         return
     

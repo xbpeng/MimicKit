@@ -87,8 +87,8 @@ class IsaacLabEngine(engine.Engine):
         else:
             self._control_mode = engine.ControlMode.none
 
-        self._build_ground()
         self._env_offsets = self._compute_env_offsets(num_envs)
+        self._build_ground()
         
         if (visualize or record_video):
             self._build_lights()
@@ -509,6 +509,20 @@ class IsaacLabEngine(engine.Engine):
 
         return dof_low.numpy(), dof_high.numpy()
     
+    def get_obj_pd_gains(self, env_id, obj_id):
+        obj = self._objs[obj_id]
+        actuator = obj.actuators["actuators"]
+        kp = actuator.stiffness[env_id]
+        kd = actuator.damping[env_id]
+
+        dof_order_sim2common = self._dof_order_sim2common[obj_id]
+        kp = kp[dof_order_sim2common]
+        kd = kd[dof_order_sim2common]
+        kp = kp.cpu().numpy()
+        kd = kd.cpu().numpy()
+
+        return kp, kd
+    
     def find_obj_body_id(self, obj_id, body_name):
         obj = self._objs[obj_id]
         meta_data = obj.root_physx_view.shared_metatype
@@ -599,9 +613,13 @@ class IsaacLabEngine(engine.Engine):
         ground_col *= 0.017
         ground_path = GROUND_PATH
 
+        env_offset_max = torch.max(torch.abs(self._env_offsets)).item()
+        texture_width = 2.0 * env_offset_max + 100.0
+
         physics_material = sim_utils.RigidBodyMaterialCfg(static_friction=1.0, dynamic_friction=1.0,
                                                           restitution=0.0)
-        plane_cfg = GroundPlaneCfg(physics_material=physics_material, color=ground_col)
+        plane_cfg = GroundPlaneCfg(physics_material=physics_material, color=ground_col,
+                                    size=(texture_width, texture_width))
         self._ground = spawn_ground_plane(prim_path=ground_path, cfg=plane_cfg)
 
         # add rigid body schema to terrain to enable contact sensors

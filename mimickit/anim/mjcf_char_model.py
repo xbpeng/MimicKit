@@ -81,6 +81,8 @@ class MJCFCharModel(kin_char_model.KinCharModel):
      
     def save(self, output_file):
         xml_template = """<mujoco model="character">
+    <compiler angle="radian"/>
+  
     <default>
         <motor ctrlrange="-1 1" ctrllimited="true"/>
         <default class="body">
@@ -256,9 +258,9 @@ class MJCFCharModel(kin_char_model.KinCharModel):
 			<freejoint name="{:s}"/>'''
 
         joint_template = '''
-            <joint name="{:s}_x" type="hinge" axis="1 0 0" range="-180 180" actuatorfrcrange="-100 100" stiffness="100" damping="10" armature=".01"/>
-            <joint name="{:s}_y" type="hinge" axis="0 1 0" range="-180 180" actuatorfrcrange="-100 100" stiffness="100" damping="10" armature=".01"/>
-            <joint name="{:s}_z" type="hinge" axis="0 0 1" range="-180 180" actuatorfrcrange="-100 100" stiffness="100" damping="10" armature=".01"/>'''
+            <joint name="{:s}_x" type="hinge" axis="1 0 0" range="-3.14 3.14" actuatorfrcrange="-100 100" stiffness="100" damping="10" armature=".01"/>
+            <joint name="{:s}_y" type="hinge" axis="0 1 0" range="-3.14 3.14" actuatorfrcrange="-100 100" stiffness="100" damping="10" armature=".01"/>
+            <joint name="{:s}_z" type="hinge" axis="0 0 1" range="-3.14 3.14" actuatorfrcrange="-100 100" stiffness="100" damping="10" armature=".01"/>'''
             
         body_name = self._body_names[body_id]
         
@@ -272,13 +274,13 @@ class MJCFCharModel(kin_char_model.KinCharModel):
             if (joint_type == kin_char_model.JointType.HINGE):
                 j_axis = joint.axis
                 joint_template = '''
-            <joint name="{:s}" type="hinge" axis="{:.4f} {:.4f} {:.4f}" range="-180 180" stiffness="100" damping="10" armature=".01"/>'''
+            <joint name="{:s}" type="hinge" axis="{:.4f} {:.4f} {:.4f}" range="-3.14 3.14" stiffness="100" damping="10" armature=".01"/>'''
                 joint_xml = joint_template.format(body_name, j_axis[0], j_axis[1], j_axis[2])
             elif (joint_type == kin_char_model.JointType.SPHERICAL):
                 joint_template = '''
-            <joint name="{:s}_x" type="hinge" axis="1 0 0" range="-180 180" stiffness="100" damping="10" armature=".01"/>
-            <joint name="{:s}_y" type="hinge" axis="0 1 0" range="-180 180" stiffness="100" damping="10" armature=".01"/>
-            <joint name="{:s}_z" type="hinge" axis="0 0 1" range="-180 180" stiffness="100" damping="10" armature=".01"/>'''
+            <joint name="{:s}_x" type="hinge" axis="1 0 0" range="-3.14 3.14" stiffness="100" damping="10" armature=".01"/>
+            <joint name="{:s}_y" type="hinge" axis="0 1 0" range="-3.14 3.14" stiffness="100" damping="10" armature=".01"/>
+            <joint name="{:s}_z" type="hinge" axis="0 0 1" range="-3.14 3.14" stiffness="100" damping="10" armature=".01"/>'''
                 joint_xml = joint_template.format(body_name, body_name, body_name)
             elif (joint_type == kin_char_model.JointType.FIXED):
                 joint_xml = ""
