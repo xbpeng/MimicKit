@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mimickit"
+version = "0.1.0"
+description = "A Reinforcement Learning Framework for Motion Imitation and Control"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.8"
+authors = [
+    { name = "Xue Bin Peng" },
+]
+
+dependencies = [
+    "gymnasium",
+    "moviepy",
+    "matplotlib",
+    "numpy",
+    "pyyaml",
+    "pyglet",
+    "tensorboardX",
+    "torch>=1.9.1",
+    "wandb>=0.17.4",
+]
+
+[project.urls]
+Homepage = "https://github.com/xbpeng/MimicKit"
+
+[tool.setuptools.packages.find]
+include = ["mimickit*"]
