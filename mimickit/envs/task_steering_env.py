@@ -157,11 +157,6 @@ class TaskSteeringEnv(smp_env.SMPEnv):
 
         if len(rest_env_ids) > 0:
             self._reset_task(rest_env_ids)
-
-        if (self._visualize) and self._engine.get_name() != "mujoco":
-            num_envs = self._engine.get_num_envs()
-            env_ids = torch.arange(num_envs, device=self._device, dtype=torch.long)
-            self._update_marker(env_ids)
         return
     
     def _reset_envs(self, env_ids):
@@ -299,13 +294,5 @@ def compute_steering_reward(root_pos, prev_root_pos, root_rot, tar_dir, tar_spee
     face_reward = torch.clamp_min(face_err, 0.0)
 
     reward = tar_reward_w * tar_reward + face_reward_w * face_reward
-
-    if root_pos.shape[0] == 1:
-        print("*****Latest rewards*****")
-        print("target speed:", tar_speed.item())
-        print("vel err:", tar_vel_err.item())
-        print("tar reward:", tar_reward.item())
-        print("reward:", reward.item())
-        print("************************")
 
     return reward
