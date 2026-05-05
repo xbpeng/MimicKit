@@ -157,6 +157,9 @@ class TaskSteeringEnv(smp_env.SMPEnv):
 
         if len(rest_env_ids) > 0:
             self._reset_task(rest_env_ids)
+
+        if (self._visualize):
+            self._update_marker(self._env_ids)
         return
     
     def _reset_envs(self, env_ids):
