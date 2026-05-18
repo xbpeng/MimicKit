@@ -48,6 +48,17 @@ Install [Newton](https://newton-physics.github.io/newton/guide/installation.html
 To use Newton, specify the argument `--engine_config data/engines/newton_engine.yaml` when running the code.
 </details>
 
+<details>
+<summary>MuJoCo MJWarp</summary>
+
+Install MuJoCo, MuJoCo Warp, and Warp:
+```
+pip install "mujoco>=3.8.0" "mujoco-warp>=3.8.0" "warp-lang>=1.12.0"
+```
+
+To use MuJoCo MJWarp, specify the argument `--engine_config data/engines/mujoco_engine.yaml` when running the code.
+</details>
+
 2. Install the requirements.
 ```
 pip install -r requirements.txt
@@ -72,7 +83,7 @@ python mimickit/run.py --mode train --num_envs 4096 --engine_config data/engines
 - `--visualize` enables visualization. Rendering should be disabled for faster training.
 - `--out_dir` the output directory where the models and logs will be saved.
 - `--logger` the logger used to record training stats. The options are text `txt`, TensorBoard `tb`, or `wandb`.
-- `--video` either `true` or `false` to enable headless video recording, which are then recorded by the logger. Only Isaac Gym and Isaac Lab currently support video logging.
+- `--video` either `true` or `false` to enable headless video recording, which are then recorded by the logger. Only Isaac and Mujoco currently support video logging.
 
 Instead of specifying all arguments through the command line, arguments can also be loaded from an `arg_file`:
 ```

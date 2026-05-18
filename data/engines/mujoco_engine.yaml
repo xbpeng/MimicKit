@@ -1,0 +1,11 @@
+engine_name: "mujoco"
+control_mode: "pos"
+control_freq: 30
+sim_freq: 240
+env_spacing: 5
+integrator: "implicitfast"
+solver: "newton"
+iterations: 100
+ls_iterations: 50
+nconmax: 150
+njmax: 450
