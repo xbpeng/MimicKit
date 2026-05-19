@@ -4,45 +4,22 @@ from dataclasses import dataclass
 import math
 import os
 
+import mujoco
+import mujoco_warp as mjwarp
 import numpy as np
 import torch
+import warp as wp
+from mujoco_warp._src import support as mjwarp_support
 
 import engines.engine as engine
 from util.logger import Logger
 import util.torch_util as torch_util
 
 
-_mujoco = None
-_mjwarp = None
-_mjwarp_support = None
-_wp = None
 _warp_kernels = None
 
 
-def _load_mujoco_modules():
-    global _mujoco, _mjwarp, _mjwarp_support, _wp
-
-    if (_mujoco is not None):
-        return _mujoco, _mjwarp, _mjwarp_support, _wp
-
-    try:
-        import mujoco
-        import mujoco_warp as mjwarp
-        import warp as wp
-        from mujoco_warp._src import support as mjwarp_support
-    except ImportError as e:
-        raise ImportError(
-            "MuJoCo engine requires mujoco, mujoco-warp, and warp-lang. "
-            "Install them with: pip install \"mujoco>=3.8.0\" "
-            "\"mujoco-warp>=3.8.0\" \"warp-lang>=1.12.0\""
-        ) from e
-
-    wp.config.enable_backward = False
-    _mujoco = mujoco
-    _mjwarp = mjwarp
-    _mjwarp_support = mjwarp_support
-    _wp = wp
-    return _mujoco, _mjwarp, _mjwarp_support, _wp
+wp.config.enable_backward = False
 
 
 def _build_warp_kernels():
@@ -50,8 +27,6 @@ def _build_warp_kernels():
 
     if (_warp_kernels is not None):
         return _warp_kernels
-
-    _, _, _, wp = _load_mujoco_modules()
 
     @wp.func
     def quat_wxyz_to_exp_map(q: wp.quat):
@@ -424,6 +399,17 @@ def _build_warp_kernels():
     return _warp_kernels
 
 
+_WARP_KERNELS = _build_warp_kernels()
+clear_qfrc_kernel = _WARP_KERNELS["clear_qfrc"]
+update_dof_state_kernel = _WARP_KERNELS["update_dof_state"]
+write_dof_pos_kernel = _WARP_KERNELS["write_dof_pos"]
+write_root_rot_kernel = _WARP_KERNELS["write_root_rot"]
+update_root_state_kernel = _WARP_KERNELS["update_root_state"]
+update_body_state_kernel = _WARP_KERNELS["update_body_state"]
+apply_control_kernel = _WARP_KERNELS["apply_control"]
+accumulate_contact_kernel = _WARP_KERNELS["accumulate_contact"]
+
+
 @dataclass(frozen=True)
 class ObjDef:
     asset_file: str
@@ -463,25 +449,23 @@ class ObjMeta:
 class SimState:
     def __init__(self, eng):
         self._engine = eng
-        self._wp = eng._wp
         self._wp_device = eng._wp_device
         self._wp_data = eng._wp_data
-        self._kernels = eng._kernels
 
         num_envs = eng.get_num_envs()
         num_objs = len(eng._obj_metas)
 
-        self._torch_qpos = self._wp.to_torch(self._wp_data.qpos)
-        self._torch_qvel = self._wp.to_torch(self._wp_data.qvel)
-        self._torch_qfrc_applied = self._wp.to_torch(self._wp_data.qfrc_applied)
-        self._torch_xfrc_applied = self._wp.to_torch(self._wp_data.xfrc_applied)
-        self._torch_ctrl = self._wp.to_torch(self._wp_data.ctrl)
-        self._torch_mocap_pos = self._wp.to_torch(self._wp_data.mocap_pos)
-        self._torch_mocap_quat = self._wp.to_torch(self._wp_data.mocap_quat)
-        self._torch_xpos = self._wp.to_torch(self._wp_data.xpos)
-        self._torch_xquat = self._wp.to_torch(self._wp_data.xquat)
-        self._torch_cvel = self._wp.to_torch(self._wp_data.cvel)
-        self._torch_subtree_com = self._wp.to_torch(self._wp_data.subtree_com)
+        self._torch_qpos = wp.to_torch(self._wp_data.qpos)
+        self._torch_qvel = wp.to_torch(self._wp_data.qvel)
+        self._torch_qfrc_applied = wp.to_torch(self._wp_data.qfrc_applied)
+        self._torch_xfrc_applied = wp.to_torch(self._wp_data.xfrc_applied)
+        self._torch_ctrl = wp.to_torch(self._wp_data.ctrl)
+        self._torch_mocap_pos = wp.to_torch(self._wp_data.mocap_pos)
+        self._torch_mocap_quat = wp.to_torch(self._wp_data.mocap_quat)
+        self._torch_xpos = wp.to_torch(self._wp_data.xpos)
+        self._torch_xquat = wp.to_torch(self._wp_data.xquat)
+        self._torch_cvel = wp.to_torch(self._wp_data.cvel)
+        self._torch_subtree_com = wp.to_torch(self._wp_data.subtree_com)
 
         total_bodies = sum(len(meta.body_ids) for meta in eng._obj_metas)
         total_dofs = sum(len(meta.qvel_ids) for meta in eng._obj_metas)
@@ -491,34 +475,34 @@ class SimState:
         self._num_bodies = total_bodies
         self._num_dofs = total_dofs
 
-        self._wp_root_rot = self._wp.zeros((num_envs, num_objs, 4), device=self._wp_device, dtype=float)
-        self._wp_root_vel = self._wp.zeros((num_envs, num_objs, 3), device=self._wp_device, dtype=float)
-        self._wp_root_ang_vel = self._wp.zeros((num_envs, num_objs, 3), device=self._wp_device, dtype=float)
+        self._wp_root_rot = wp.zeros((num_envs, num_objs, 4), device=self._wp_device, dtype=float)
+        self._wp_root_vel = wp.zeros((num_envs, num_objs, 3), device=self._wp_device, dtype=float)
+        self._wp_root_ang_vel = wp.zeros((num_envs, num_objs, 3), device=self._wp_device, dtype=float)
 
-        self._torch_root_rot = self._wp.to_torch(self._wp_root_rot)
-        self._torch_root_vel = self._wp.to_torch(self._wp_root_vel)
-        self._torch_root_ang_vel = self._wp.to_torch(self._wp_root_ang_vel)
+        self._torch_root_rot = wp.to_torch(self._wp_root_rot)
+        self._torch_root_vel = wp.to_torch(self._wp_root_vel)
+        self._torch_root_ang_vel = wp.to_torch(self._wp_root_ang_vel)
 
-        self._wp_body_pos = self._wp.zeros((num_envs, total_bodies, 3), device=self._wp_device, dtype=float)
-        self._wp_body_rot = self._wp.zeros((num_envs, total_bodies, 4), device=self._wp_device, dtype=float)
-        self._wp_body_vel = self._wp.zeros((num_envs, total_bodies, 3), device=self._wp_device, dtype=float)
-        self._wp_body_ang_vel = self._wp.zeros((num_envs, total_bodies, 3), device=self._wp_device, dtype=float)
+        self._wp_body_pos = wp.zeros((num_envs, total_bodies, 3), device=self._wp_device, dtype=float)
+        self._wp_body_rot = wp.zeros((num_envs, total_bodies, 4), device=self._wp_device, dtype=float)
+        self._wp_body_vel = wp.zeros((num_envs, total_bodies, 3), device=self._wp_device, dtype=float)
+        self._wp_body_ang_vel = wp.zeros((num_envs, total_bodies, 3), device=self._wp_device, dtype=float)
 
-        self._torch_body_pos = self._wp.to_torch(self._wp_body_pos)
-        self._torch_body_rot = self._wp.to_torch(self._wp_body_rot)
-        self._torch_body_vel = self._wp.to_torch(self._wp_body_vel)
-        self._torch_body_ang_vel = self._wp.to_torch(self._wp_body_ang_vel)
+        self._torch_body_pos = wp.to_torch(self._wp_body_pos)
+        self._torch_body_rot = wp.to_torch(self._wp_body_rot)
+        self._torch_body_vel = wp.to_torch(self._wp_body_vel)
+        self._torch_body_ang_vel = wp.to_torch(self._wp_body_ang_vel)
 
         if (total_dofs > 0):
-            self._wp_dof_pos = self._wp.zeros((num_envs, total_dofs), device=self._wp_device, dtype=float)
-            self._wp_dof_vel = self._wp.zeros((num_envs, total_dofs), device=self._wp_device, dtype=float)
-            self._wp_cmd = self._wp.zeros((num_envs, total_dofs), device=self._wp_device, dtype=float)
-            self._wp_dof_force = self._wp.zeros((num_envs, total_dofs), device=self._wp_device, dtype=float)
+            self._wp_dof_pos = wp.zeros((num_envs, total_dofs), device=self._wp_device, dtype=float)
+            self._wp_dof_vel = wp.zeros((num_envs, total_dofs), device=self._wp_device, dtype=float)
+            self._wp_cmd = wp.zeros((num_envs, total_dofs), device=self._wp_device, dtype=float)
+            self._wp_dof_force = wp.zeros((num_envs, total_dofs), device=self._wp_device, dtype=float)
 
-            self._torch_dof_pos = self._wp.to_torch(self._wp_dof_pos)
-            self._torch_dof_vel = self._wp.to_torch(self._wp_dof_vel)
-            self._torch_cmd = self._wp.to_torch(self._wp_cmd)
-            self._torch_dof_force = self._wp.to_torch(self._wp_dof_force)
+            self._torch_dof_pos = wp.to_torch(self._wp_dof_pos)
+            self._torch_dof_vel = wp.to_torch(self._wp_dof_vel)
+            self._torch_cmd = wp.to_torch(self._wp_cmd)
+            self._torch_dof_force = wp.to_torch(self._wp_dof_force)
         else:
             self._wp_dof_pos = None
             self._wp_dof_vel = None
@@ -628,29 +612,29 @@ class SimState:
             body_offset += num_bodies
             dof_offset += num_dofs
 
-        self._wp_root_kind = self._wp.array(root_kind, device=self._wp_device, dtype=int)
-        self._wp_root_qpos_start = self._wp.array(root_qpos_start, device=self._wp_device, dtype=int)
-        self._wp_root_qvel_start = self._wp.array(root_qvel_start, device=self._wp_device, dtype=int)
-        self._wp_root_body_id = self._wp.array(root_body_id, device=self._wp_device, dtype=int)
-        self._wp_root_mocap_id = self._wp.array(root_mocap_id, device=self._wp_device, dtype=int)
+        self._wp_root_kind = wp.array(root_kind, device=self._wp_device, dtype=int)
+        self._wp_root_qpos_start = wp.array(root_qpos_start, device=self._wp_device, dtype=int)
+        self._wp_root_qvel_start = wp.array(root_qvel_start, device=self._wp_device, dtype=int)
+        self._wp_root_body_id = wp.array(root_body_id, device=self._wp_device, dtype=int)
+        self._wp_root_mocap_id = wp.array(root_mocap_id, device=self._wp_device, dtype=int)
 
-        self._wp_body_ids = self._wp.array(body_ids, device=self._wp_device, dtype=int)
-        self._wp_body_root_ids = self._wp.array(body_root_ids, device=self._wp_device, dtype=int)
+        self._wp_body_ids = wp.array(body_ids, device=self._wp_device, dtype=int)
+        self._wp_body_root_ids = wp.array(body_root_ids, device=self._wp_device, dtype=int)
 
-        self._wp_dof_qpos_start = self._wp.array(dof_qpos_start, device=self._wp_device, dtype=int)
-        self._wp_dof_qpos_kind = self._wp.array(dof_qpos_kind, device=self._wp_device, dtype=int)
-        self._wp_dof_qpos_comp = self._wp.array(dof_qpos_comp, device=self._wp_device, dtype=int)
-        self._wp_dof_qvel_id = self._wp.array(dof_qvel_id, device=self._wp_device, dtype=int)
-        self._wp_control_qvel_id = self._wp.array(control_qvel_id, device=self._wp_device, dtype=int)
-        self._wp_kp = self._wp.array(kp, device=self._wp_device, dtype=float)
-        self._wp_kd = self._wp.array(kd, device=self._wp_device, dtype=float)
-        self._wp_torque_lim = self._wp.array(torque_lim, device=self._wp_device, dtype=float)
+        self._wp_dof_qpos_start = wp.array(dof_qpos_start, device=self._wp_device, dtype=int)
+        self._wp_dof_qpos_kind = wp.array(dof_qpos_kind, device=self._wp_device, dtype=int)
+        self._wp_dof_qpos_comp = wp.array(dof_qpos_comp, device=self._wp_device, dtype=int)
+        self._wp_dof_qvel_id = wp.array(dof_qvel_id, device=self._wp_device, dtype=int)
+        self._wp_control_qvel_id = wp.array(control_qvel_id, device=self._wp_device, dtype=int)
+        self._wp_kp = wp.array(kp, device=self._wp_device, dtype=float)
+        self._wp_kd = wp.array(kd, device=self._wp_device, dtype=float)
+        self._wp_torque_lim = wp.array(torque_lim, device=self._wp_device, dtype=float)
         return
 
     def pre_step_update(self):
         if (self._num_objs > 0):
-            self._wp.launch(
-                kernel=self._kernels["write_root_rot"],
+            wp.launch(
+                kernel=write_root_rot_kernel,
                 dim=self._num_envs * self._num_objs,
                 inputs=[self._wp_root_rot, self._wp_data.qpos, self._wp_data.mocap_quat,
                         self._wp_root_kind, self._wp_root_qpos_start, self._wp_root_mocap_id,
@@ -659,8 +643,8 @@ class SimState:
             )
 
         if (self._num_dofs > 0):
-            self._wp.launch(
-                kernel=self._kernels["write_dof_pos"],
+            wp.launch(
+                kernel=write_dof_pos_kernel,
                 dim=self._num_envs * self._num_dofs,
                 inputs=[self._wp_dof_pos, self._wp_data.qpos, self._wp_dof_qpos_start,
                         self._wp_dof_qpos_kind, self._wp_dof_qpos_comp, self._num_dofs],
@@ -670,8 +654,8 @@ class SimState:
 
     def post_step_update(self):
         if (self._num_objs > 0):
-            self._wp.launch(
-                kernel=self._kernels["update_root_state"],
+            wp.launch(
+                kernel=update_root_state_kernel,
                 dim=self._num_envs * self._num_objs,
                 inputs=[self._wp_data.qpos, self._wp_data.qvel, self._wp_data.mocap_quat,
                         self._wp_data.xquat, self._wp_root_kind, self._wp_root_qpos_start,
@@ -682,8 +666,8 @@ class SimState:
             )
 
         if (self._num_dofs > 0):
-            self._wp.launch(
-                kernel=self._kernels["update_dof_state"],
+            wp.launch(
+                kernel=update_dof_state_kernel,
                 dim=self._num_envs * self._num_dofs,
                 inputs=[self._wp_data.qpos, self._wp_data.qvel, self._wp_dof_qpos_start,
                         self._wp_dof_qpos_kind, self._wp_dof_qpos_comp, self._wp_dof_qvel_id,
@@ -692,8 +676,8 @@ class SimState:
             )
 
         if (self._num_bodies > 0):
-            self._wp.launch(
-                kernel=self._kernels["update_body_state"],
+            wp.launch(
+                kernel=update_body_state_kernel,
                 dim=self._num_envs * self._num_bodies,
                 inputs=[self._wp_data.xpos, self._wp_data.xquat, self._wp_data.cvel,
                         self._wp_data.subtree_com, self._wp_body_ids, self._wp_body_root_ids,
@@ -708,11 +692,8 @@ class MujocoEngine(engine.Engine):
     def __init__(self, config, num_envs, device, visualize, record_video=False):
         super().__init__(visualize=visualize)
 
-        self._mujoco, self._mjwarp, self._mjwarp_support, self._wp = _load_mujoco_modules()
-        self._kernels = _build_warp_kernels()
-
         self._device = device
-        self._wp_device = self._wp.get_device(device)
+        self._wp_device = wp.get_device(device)
         self._num_envs = num_envs
         self._env_spacing = config["env_spacing"]
         self._visualize_enabled = visualize
@@ -846,7 +827,7 @@ class MujocoEngine(engine.Engine):
         self._sync_derived_state()
 
         if (self._graph):
-            self._wp.capture_launch(self._graph)
+            wp.capture_launch(self._graph)
         else:
             self._simulate()
 
@@ -881,7 +862,7 @@ class MujocoEngine(engine.Engine):
         self._viewer.user_scn.ngeom = 0
 
         self._copy_env_state_to_mjdata(self._viewer_data, 0, self._get_env_offset(0))
-        self._mujoco.mj_forward(self._mj_model, self._viewer_data)
+        mujoco.mj_forward(self._mj_model, self._viewer_data)
         self._draw_queued_lines(self._viewer.user_scn)
         self._render_extra_envs()
 
@@ -1135,7 +1116,7 @@ class MujocoEngine(engine.Engine):
         return self._wp_data
 
     def create_mj_data(self):
-        return self._mujoco.MjData(self._mj_model)
+        return mujoco.MjData(self._mj_model)
 
     def copy_env_state_to_mjdata(self, target_data, env_id, offset=None):
         self._sync_derived_state()
@@ -1177,14 +1158,14 @@ class MujocoEngine(engine.Engine):
 
         self._disable_passive_joint_gains()
 
-        self._mj_data = self._mujoco.MjData(self._mj_model)
-        self._mujoco.mj_forward(self._mj_model, self._mj_data)
+        self._mj_data = mujoco.MjData(self._mj_model)
+        mujoco.mj_forward(self._mj_model, self._mj_data)
 
-        with self._wp.ScopedDevice(self._wp_device):
-            self._wp_model = self._mjwarp.put_model(self._mj_model)
+        with wp.ScopedDevice(self._wp_device):
+            self._wp_model = mjwarp.put_model(self._mj_model)
             if (hasattr(self._wp_model.opt, "ls_parallel")):
                 self._wp_model.opt.ls_parallel = True
-            self._wp_data = self._mjwarp.put_data(
+            self._wp_data = mjwarp.put_data(
                 self._mj_model,
                 self._mj_data,
                 nworld=self.get_num_envs(),
@@ -1207,13 +1188,13 @@ class MujocoEngine(engine.Engine):
   </worldbody>
 </mujoco>
 """
-        return self._mujoco.MjSpec.from_string(scene_xml)
+        return mujoco.MjSpec.from_string(scene_xml)
 
     def _create_obj_spec(self, obj_def, color):
         _, file_ext = os.path.splitext(obj_def.asset_file)
         assert(file_ext in [".xml", ".urdf"]), "Unsupported asset format for MuJoCo: {:s}".format(file_ext)
 
-        obj_spec = self._mujoco.MjSpec.from_file(obj_def.asset_file)
+        obj_spec = mujoco.MjSpec.from_file(obj_def.asset_file)
 
         if (obj_def.fix_root):
             obj_spec = self._wrap_fixed_root_mocap(obj_spec)
@@ -1240,7 +1221,7 @@ class MujocoEngine(engine.Engine):
 
     def _wrap_fixed_root_mocap(self, obj_spec):
         for joint in list(obj_spec.joints):
-            if (int(joint.type) == int(self._mujoco.mjtJoint.mjJNT_FREE)):
+            if (int(joint.type) == int(mujoco.mjtJoint.mjJNT_FREE)):
                 obj_spec.delete(joint)
 
         if (len(obj_spec.bodies) > 1 and obj_spec.bodies[1].mocap):
@@ -1250,7 +1231,7 @@ class MujocoEngine(engine.Engine):
         for key in list(obj_spec.keys):
             obj_spec.delete(key)
 
-        wrapper_spec = self._mujoco.MjSpec()
+        wrapper_spec = mujoco.MjSpec()
         mocap_body = wrapper_spec.worldbody.add_body(name="mocap_base", mocap=True)
         frame = mocap_body.add_frame()
         wrapper_spec.attach(child=obj_spec, prefix="", frame=frame)
@@ -1268,22 +1249,22 @@ class MujocoEngine(engine.Engine):
 
     def _apply_model_options(self):
         integrator_map = {
-            "euler": self._mujoco.mjtIntegrator.mjINT_EULER,
-            "implicitfast": self._mujoco.mjtIntegrator.mjINT_IMPLICITFAST,
+            "euler": mujoco.mjtIntegrator.mjINT_EULER,
+            "implicitfast": mujoco.mjtIntegrator.mjINT_IMPLICITFAST,
         }
         solver_map = {
-            "newton": self._mujoco.mjtSolver.mjSOL_NEWTON,
-            "cg": self._mujoco.mjtSolver.mjSOL_CG,
-            "pgs": self._mujoco.mjtSolver.mjSOL_PGS,
+            "newton": mujoco.mjtSolver.mjSOL_NEWTON,
+            "cg": mujoco.mjtSolver.mjSOL_CG,
+            "pgs": mujoco.mjtSolver.mjSOL_PGS,
         }
         cone_map = {
-            "pyramidal": self._mujoco.mjtCone.mjCONE_PYRAMIDAL,
-            "elliptic": self._mujoco.mjtCone.mjCONE_ELLIPTIC,
+            "pyramidal": mujoco.mjtCone.mjCONE_PYRAMIDAL,
+            "elliptic": mujoco.mjtCone.mjCONE_ELLIPTIC,
         }
         jacobian_map = {
-            "auto": self._mujoco.mjtJacobian.mjJAC_AUTO,
-            "dense": self._mujoco.mjtJacobian.mjJAC_DENSE,
-            "sparse": self._mujoco.mjtJacobian.mjJAC_SPARSE,
+            "auto": mujoco.mjtJacobian.mjJAC_AUTO,
+            "dense": mujoco.mjtJacobian.mjJAC_DENSE,
+            "sparse": mujoco.mjtJacobian.mjJAC_SPARSE,
         }
 
         self._mj_model.opt.timestep = self._sim_timestep
@@ -1318,10 +1299,10 @@ class MujocoEngine(engine.Engine):
         geom_ids = [int(geom.id) for geom in obj_spec.geoms]
         joint_ids = [int(joint.id) for joint in obj_spec.joints]
         joint_ids = [j for j in joint_ids
-                     if int(self._mj_model.jnt_type[j]) != int(self._mujoco.mjtJoint.mjJNT_FREE)]
+                     if int(self._mj_model.jnt_type[j]) != int(mujoco.mjtJoint.mjJNT_FREE)]
 
         free_joint_ids = [int(joint.id) for joint in obj_spec.joints
-                          if int(self._mj_model.jnt_type[int(joint.id)]) == int(self._mujoco.mjtJoint.mjJNT_FREE)]
+                          if int(self._mj_model.jnt_type[int(joint.id)]) == int(mujoco.mjtJoint.mjJNT_FREE)]
         if (len(free_joint_ids) > 0):
             free_joint_id = free_joint_ids[0]
             root_qpos_start = int(self._mj_model.jnt_qposadr[free_joint_id])
@@ -1348,8 +1329,8 @@ class MujocoEngine(engine.Engine):
             joint_type = int(self._mj_model.jnt_type[joint_id])
             qpos_start = int(self._mj_model.jnt_qposadr[joint_id])
             qvel_start = int(self._mj_model.jnt_dofadr[joint_id])
-            qpos_width = _joint_qpos_width(self._mujoco, joint_type)
-            dof_width = _joint_dof_width(self._mujoco, joint_type)
+            qpos_width = _joint_qpos_width(mujoco, joint_type)
+            dof_width = _joint_dof_width(mujoco, joint_type)
 
             qpos_ids.extend(range(qpos_start, qpos_start + qpos_width))
             qvel_ids.extend(range(qvel_start, qvel_start + dof_width))
@@ -1358,7 +1339,7 @@ class MujocoEngine(engine.Engine):
             joint_kd = np.asarray(self._mj_model.dof_damping[qvel_start:qvel_start + dof_width], dtype=np.float32)
             joint_lim = self._get_joint_torque_limit(joint_id, dof_width)
 
-            if (joint_type == int(self._mujoco.mjtJoint.mjJNT_BALL)):
+            if (joint_type == int(mujoco.mjtJoint.mjJNT_BALL)):
                 ball_qpos_ids.append(qpos_start)
                 ball_dof_ids.append(qvel_start)
                 low = np.full(dof_width, -np.pi, dtype=np.float32)
@@ -1471,11 +1452,11 @@ class MujocoEngine(engine.Engine):
         num_objs = self.get_objs_per_env()
         max_bodies = max([self.get_obj_num_bodies(i) for i in range(num_objs)] + [1])
 
-        self._wp_contact_ids = self._wp.array(np.arange(self._wp_data.naconmax), device=self._wp_device, dtype=int)
-        self._wp_contact_spatial = self._wp.zeros(self._wp_data.naconmax, device=self._wp_device, dtype=self._wp.spatial_vector)
-        self._wp_total_contact_forces = self._wp.zeros((num_objs, self.get_num_envs(), max_bodies, 3),
+        self._wp_contact_ids = wp.array(np.arange(self._wp_data.naconmax), device=self._wp_device, dtype=int)
+        self._wp_contact_spatial = wp.zeros(self._wp_data.naconmax, device=self._wp_device, dtype=wp.spatial_vector)
+        self._wp_total_contact_forces = wp.zeros((num_objs, self.get_num_envs(), max_bodies, 3),
                                                        device=self._wp_device, dtype=float)
-        self._wp_ground_contact_forces = self._wp.zeros((num_objs, self.get_num_envs(), max_bodies, 3),
+        self._wp_ground_contact_forces = wp.zeros((num_objs, self.get_num_envs(), max_bodies, 3),
                                                         device=self._wp_device, dtype=float)
 
         body_obj_id = np.full(self._mj_model.nbody, -1, dtype=np.int32)
@@ -1485,11 +1466,11 @@ class MujocoEngine(engine.Engine):
                 body_obj_id[body_id] = obj_id
                 body_local_id[body_id] = local_id
 
-        self._wp_body_obj_id = self._wp.array(body_obj_id, device=self._wp_device, dtype=int)
-        self._wp_body_local_id = self._wp.array(body_local_id, device=self._wp_device, dtype=int)
+        self._wp_body_obj_id = wp.array(body_obj_id, device=self._wp_device, dtype=int)
+        self._wp_body_local_id = wp.array(body_local_id, device=self._wp_device, dtype=int)
 
-        contact_forces = self._wp.to_torch(self._wp_total_contact_forces)
-        ground_forces = self._wp.to_torch(self._wp_ground_contact_forces)
+        contact_forces = wp.to_torch(self._wp_total_contact_forces)
+        ground_forces = wp.to_torch(self._wp_ground_contact_forces)
 
         self._contact_forces = []
         self._ground_contact_forces = []
@@ -1503,8 +1484,8 @@ class MujocoEngine(engine.Engine):
 
     def _apply_cmd(self):
         if (self._mj_model.nv > 0):
-            self._wp.launch(
-                kernel=self._kernels["clear_qfrc"],
+            wp.launch(
+                kernel=clear_qfrc_kernel,
                 dim=self.get_num_envs() * self._mj_model.nv,
                 inputs=[self._wp_data.qfrc_applied, self._mj_model.nv],
                 device=self._wp_device,
@@ -1514,8 +1495,8 @@ class MujocoEngine(engine.Engine):
             return
 
         if (self._sim_state._num_dofs > 0):
-            self._wp.launch(
-                kernel=self._kernels["apply_control"],
+            wp.launch(
+                kernel=apply_control_kernel,
                 dim=self.get_num_envs() * self._sim_state._num_dofs,
                 inputs=[
                     self._wp_data.qpos,
@@ -1544,8 +1525,8 @@ class MujocoEngine(engine.Engine):
             return
 
         try:
-            with self._wp.ScopedDevice(self._wp_device):
-                with self._wp.ScopedCapture() as capture:
+            with wp.ScopedDevice(self._wp_device):
+                with wp.ScopedCapture() as capture:
                     self._simulate()
             self._graph = capture.graph
         except Exception as e:
@@ -1558,8 +1539,8 @@ class MujocoEngine(engine.Engine):
 
         for _ in range(self._sim_steps):
             self._pre_sim_step()
-            with self._wp.ScopedDevice(self._wp_device):
-                self._mjwarp.step(self._wp_model, self._wp_data)
+            with wp.ScopedDevice(self._wp_device):
+                mjwarp.step(self._wp_model, self._wp_data)
 
         self._sim_state.post_step_update()
         self._update_contact_forces()
@@ -1588,8 +1569,8 @@ class MujocoEngine(engine.Engine):
 
     def _forward(self):
         self._sim_state.pre_step_update()
-        with self._wp.ScopedDevice(self._wp_device):
-            self._mjwarp.forward(self._wp_model, self._wp_data)
+        with wp.ScopedDevice(self._wp_device):
+            mjwarp.forward(self._wp_model, self._wp_data)
         self._sim_state.post_step_update()
         self._state_dirty = False
         return
@@ -1609,7 +1590,7 @@ class MujocoEngine(engine.Engine):
         if (self._wp_data.naconmax == 0):
             return
 
-        self._mjwarp_support.contact_force(
+        mjwarp_support.contact_force(
             self._wp_model,
             self._wp_data,
             self._wp_contact_ids,
@@ -1617,8 +1598,8 @@ class MujocoEngine(engine.Engine):
             self._wp_contact_spatial,
         )
 
-        self._wp.launch(
-            kernel=self._kernels["accumulate_contact"],
+        wp.launch(
+            kernel=accumulate_contact_kernel,
             dim=self._wp_data.naconmax,
             inputs=[
                 self._wp_data.contact.worldid,
@@ -1641,13 +1622,13 @@ class MujocoEngine(engine.Engine):
     def _build_viewer(self):
         import mujoco.viewer
 
-        self._viewer_data = self._mujoco.MjData(self._mj_model)
-        self._viewer_aux_data = self._mujoco.MjData(self._mj_model)
-        self._viewer_opt = self._mujoco.MjvOption()
-        self._viewer_pert = self._mujoco.MjvPerturb()
+        self._viewer_data = mujoco.MjData(self._mj_model)
+        self._viewer_aux_data = mujoco.MjData(self._mj_model)
+        self._viewer_opt = mujoco.MjvOption()
+        self._viewer_pert = mujoco.MjvPerturb()
 
         self._copy_env_state_to_mjdata(self._viewer_data, 0, self._get_env_offset(0))
-        self._mujoco.mj_forward(self._mj_model, self._viewer_data)
+        mujoco.mj_forward(self._mj_model, self._viewer_data)
 
         self._viewer = mujoco.viewer.launch_passive(
             self._mj_model,
@@ -1663,11 +1644,11 @@ class MujocoEngine(engine.Engine):
         if (self.get_num_envs() <= 1):
             return
 
-        catmask = self._mujoco.mjtCatBit.mjCAT_DYNAMIC.value
+        catmask = mujoco.mjtCatBit.mjCAT_DYNAMIC.value
         for env_id in range(1, self.get_num_envs()):
             self._copy_env_state_to_mjdata(self._viewer_aux_data, env_id, self._get_env_offset(env_id))
-            self._mujoco.mj_forward(self._mj_model, self._viewer_aux_data)
-            self._mujoco.mjv_addGeoms(
+            mujoco.mj_forward(self._mj_model, self._viewer_aux_data)
+            mujoco.mjv_addGeoms(
                 self._mj_model,
                 self._viewer_aux_data,
                 self._viewer_opt,
@@ -1709,7 +1690,7 @@ class MujocoEngine(engine.Engine):
 
         cam_vec = self._camera_pos - self._camera_look_at
         distance = max(np.linalg.norm(cam_vec), 1e-5)
-        self._viewer.cam.type = self._mujoco.mjtCamera.mjCAMERA_FREE.value
+        self._viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FREE.value
         self._viewer.cam.fixedcamid = -1
         self._viewer.cam.trackbodyid = -1
         self._viewer.cam.lookat[:] = self._camera_look_at + self._get_env_offset(0)
@@ -1732,18 +1713,18 @@ class MujocoEngine(engine.Engine):
 
                 scene.ngeom += 1
                 geom = scene.geoms[scene.ngeom - 1]
-                geom.category = self._mujoco.mjtCatBit.mjCAT_DECOR
-                self._mujoco.mjv_initGeom(
+                geom.category = mujoco.mjtCatBit.mjCAT_DECOR
+                mujoco.mjv_initGeom(
                     geom=geom,
-                    type=self._mujoco.mjtGeom.mjGEOM_LINE.value,
+                    type=mujoco.mjtGeom.mjGEOM_LINE.value,
                     size=np.zeros(3, dtype=np.float64),
                     pos=np.zeros(3, dtype=np.float64),
                     mat=np.eye(3, dtype=np.float64).reshape(-1),
                     rgba=rgba,
                 )
-                self._mujoco.mjv_connector(
+                mujoco.mjv_connector(
                     geom=geom,
-                    type=self._mujoco.mjtGeom.mjGEOM_LINE.value,
+                    type=mujoco.mjtGeom.mjGEOM_LINE.value,
                     width=float(line_width),
                     from_=start,
                     to=end,
