@@ -74,15 +74,6 @@ def _build_warp_kernels():
         return r
 
     @wp.kernel
-    def clear_qfrc_kernel(qfrc_applied: wp.array2d(dtype=float),
-                          nv: int):
-        tid = wp.tid()
-        world_id = tid // nv
-        dof_id = tid - world_id * nv
-        qfrc_applied[world_id, dof_id] = 0.0
-        return
-
-    @wp.kernel
     def update_dof_state_kernel(qpos: wp.array2d(dtype=float),
                                 qvel: wp.array2d(dtype=float),
                                 dof_qpos_start: wp.array(dtype=int),
@@ -387,7 +378,6 @@ def _build_warp_kernels():
         return
 
     _warp_kernels = {
-        "clear_qfrc": clear_qfrc_kernel,
         "update_dof_state": update_dof_state_kernel,
         "write_dof_pos": write_dof_pos_kernel,
         "write_root_rot": write_root_rot_kernel,
@@ -400,7 +390,6 @@ def _build_warp_kernels():
 
 
 _WARP_KERNELS = _build_warp_kernels()
-clear_qfrc_kernel = _WARP_KERNELS["clear_qfrc"]
 update_dof_state_kernel = _WARP_KERNELS["update_dof_state"]
 write_dof_pos_kernel = _WARP_KERNELS["write_dof_pos"]
 write_root_rot_kernel = _WARP_KERNELS["write_root_rot"]
@@ -430,10 +419,15 @@ class ObjMeta:
     joint_ids: list[int]
     qpos_ids: list[int]
     qvel_ids: list[int]
+    qvel_col_ids: torch.Tensor
     hinge_qpos_ids: list[int]
     hinge_dof_ids: list[int]
+    hinge_local_ids: list[int]
+    hinge_qpos_col_ids: torch.Tensor
+    hinge_local_col_ids: torch.Tensor
     ball_qpos_ids: list[int]
     ball_dof_ids: list[int]
+    ball_local_starts: list[int]
     root_body_id: int
     root_qpos_ids: list[int]
     root_qvel_ids: list[int]
@@ -891,46 +885,36 @@ class MujocoEngine(engine.Engine):
         return len(self._obj_metas)
 
     def get_root_pos(self, obj_id):
-        self._sync_derived_state()
         return self._sim_state.root_pos[obj_id]
 
     def get_root_rot(self, obj_id):
-        self._sync_derived_state()
         return self._sim_state.root_rot[obj_id]
 
     def get_root_vel(self, obj_id):
-        self._sync_derived_state()
         return self._sim_state.root_vel[obj_id]
 
     def get_root_ang_vel(self, obj_id):
-        self._sync_derived_state()
         return self._sim_state.root_ang_vel[obj_id]
 
     def get_dof_pos(self, obj_id):
-        self._sync_derived_state()
         return self._sim_state.dof_pos[obj_id]
 
     def get_dof_vel(self, obj_id):
-        self._sync_derived_state()
         return self._sim_state.dof_vel[obj_id]
 
     def get_dof_forces(self, obj_id):
         return self._sim_state.dof_force[obj_id]
 
     def get_body_pos(self, obj_id):
-        self._sync_derived_state()
         return self._sim_state.body_pos[obj_id]
 
     def get_body_rot(self, obj_id):
-        self._sync_derived_state()
         return self._sim_state.body_rot[obj_id]
 
     def get_body_vel(self, obj_id):
-        self._sync_derived_state()
         return self._sim_state.body_vel[obj_id]
 
     def get_body_ang_vel(self, obj_id):
-        self._sync_derived_state()
         return self._sim_state.body_ang_vel[obj_id]
 
     def get_contact_forces(self, obj_id):
@@ -1011,7 +995,7 @@ class MujocoEngine(engine.Engine):
         dof_vel = _as_torch(dof_vel, self._device)
         _assign_env_tensor(self._sim_state.dof_vel[obj_id], env_id, dof_vel)
         if (len(meta.qvel_ids) > 0):
-            _assign_indexed_cols(self._torch_qvel, meta.qvel_ids, env_id, dof_vel)
+            _assign_indexed_cols(self._torch_qvel, meta.qvel_col_ids, env_id, dof_vel)
         self._state_dirty = True
         return
 
@@ -1355,6 +1339,12 @@ class MujocoEngine(engine.Engine):
             kd.extend(joint_kd.tolist())
             torque_lim.extend(joint_lim.tolist())
 
+        hinge_local_ids = [qvel_ids.index(i) for i in hinge_dof_ids]
+        ball_local_starts = [qvel_ids.index(i) for i in ball_dof_ids]
+        qvel_col_ids = torch.tensor(qvel_ids, device=self._device, dtype=torch.long)
+        hinge_qpos_col_ids = torch.tensor(hinge_qpos_ids, device=self._device, dtype=torch.long)
+        hinge_local_col_ids = torch.tensor(hinge_local_ids, device=self._device, dtype=torch.long)
+
         mass = float(np.sum(self._mj_model.body_mass[body_ids]))
 
         meta = ObjMeta(obj_def=obj_def,
@@ -1364,10 +1354,15 @@ class MujocoEngine(engine.Engine):
                        joint_ids=joint_ids,
                        qpos_ids=qpos_ids,
                        qvel_ids=qvel_ids,
+                       qvel_col_ids=qvel_col_ids,
                        hinge_qpos_ids=hinge_qpos_ids,
                        hinge_dof_ids=hinge_dof_ids,
+                       hinge_local_ids=hinge_local_ids,
+                       hinge_qpos_col_ids=hinge_qpos_col_ids,
+                       hinge_local_col_ids=hinge_local_col_ids,
                        ball_qpos_ids=ball_qpos_ids,
                        ball_dof_ids=ball_dof_ids,
+                       ball_local_starts=ball_local_starts,
                        root_body_id=root_body_id,
                        root_qpos_ids=root_qpos_ids,
                        root_qvel_ids=root_qvel_ids,
@@ -1483,14 +1478,6 @@ class MujocoEngine(engine.Engine):
         return
 
     def _apply_cmd(self):
-        if (self._mj_model.nv > 0):
-            wp.launch(
-                kernel=clear_qfrc_kernel,
-                dim=self.get_num_envs() * self._mj_model.nv,
-                inputs=[self._wp_data.qfrc_applied, self._mj_model.nv],
-                device=self._wp_device,
-            )
-
         if (self._control_mode == engine.ControlMode.none):
             return
 
@@ -1556,12 +1543,10 @@ class MujocoEngine(engine.Engine):
             return
 
         if (len(meta.hinge_dof_ids) > 0):
-            local_ids = [meta.qvel_ids.index(i) for i in meta.hinge_dof_ids]
-            values = dof_pos[..., local_ids]
-            _assign_indexed_cols(self._torch_qpos, meta.hinge_qpos_ids, env_id, values)
+            values = dof_pos[..., meta.hinge_local_col_ids]
+            _assign_indexed_cols(self._torch_qpos, meta.hinge_qpos_col_ids, env_id, values)
 
-        for qpos_start, dof_start in zip(meta.ball_qpos_ids, meta.ball_dof_ids):
-            local_start = meta.qvel_ids.index(dof_start)
+        for qpos_start, local_start in zip(meta.ball_qpos_ids, meta.ball_local_starts):
             quat = torch_util.exp_map_to_quat(dof_pos[..., local_start:local_start + 3])
             quat = _quat_xyzw_to_wxyz(quat)
             _assign_env_tensor(self._torch_qpos[:, qpos_start:qpos_start + 4], env_id, quat)
@@ -1805,7 +1790,12 @@ def _assign_env_tensor(target, env_id, value):
 
 
 def _assign_indexed_cols(base, col_ids, env_id, value):
-    col_ids = torch.tensor(col_ids, device=base.device, dtype=torch.long)
+    if (isinstance(col_ids, torch.Tensor)):
+        if (col_ids.device != base.device or col_ids.dtype != torch.long):
+            col_ids = col_ids.to(device=base.device, dtype=torch.long)
+    else:
+        col_ids = torch.tensor(col_ids, device=base.device, dtype=torch.long)
+
     value = value.to(device=base.device, dtype=base.dtype)
 
     if (env_id is None):
