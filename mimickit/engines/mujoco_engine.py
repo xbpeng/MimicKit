@@ -140,40 +140,27 @@ def _build_warp_kernels():
     @wp.kernel
     def write_root_rot_kernel(root_rot: wp.array3d(dtype=float),
                               qpos: wp.array2d(dtype=float),
-                              mocap_quat: wp.array2d(dtype=wp.quat),
-                              root_kind: wp.array(dtype=int),
                               root_qpos_start: wp.array(dtype=int),
-                              root_mocap_id: wp.array(dtype=int),
                               num_objs: int):
         tid = wp.tid()
         world_id = tid // num_objs
         obj_id = tid - world_id * num_objs
 
-        kind = root_kind[obj_id]
-        if (kind == 0):
-            qpos_start = root_qpos_start[obj_id]
+        qpos_start = root_qpos_start[obj_id]
+        if (qpos_start >= 0):
             qpos[world_id, qpos_start + 3] = root_rot[world_id, obj_id, 3]
             qpos[world_id, qpos_start + 4] = root_rot[world_id, obj_id, 0]
             qpos[world_id, qpos_start + 5] = root_rot[world_id, obj_id, 1]
             qpos[world_id, qpos_start + 6] = root_rot[world_id, obj_id, 2]
-        elif (kind == 1):
-            mocap_id = root_mocap_id[obj_id]
-            mocap_quat[world_id, mocap_id] = wp.quat(root_rot[world_id, obj_id, 3],
-                                                     root_rot[world_id, obj_id, 0],
-                                                     root_rot[world_id, obj_id, 1],
-                                                     root_rot[world_id, obj_id, 2])
         return
 
     @wp.kernel
     def update_root_state_kernel(qpos: wp.array2d(dtype=float),
                                  qvel: wp.array2d(dtype=float),
-                                 mocap_quat: wp.array2d(dtype=wp.quat),
                                  xquat: wp.array2d(dtype=wp.quat),
-                                 root_kind: wp.array(dtype=int),
                                  root_qpos_start: wp.array(dtype=int),
                                  root_qvel_start: wp.array(dtype=int),
                                  root_body_id: wp.array(dtype=int),
-                                 root_mocap_id: wp.array(dtype=int),
                                  root_rot: wp.array3d(dtype=float),
                                  root_vel: wp.array3d(dtype=float),
                                  root_ang_vel: wp.array3d(dtype=float),
@@ -182,9 +169,8 @@ def _build_warp_kernels():
         world_id = tid // num_objs
         obj_id = tid - world_id * num_objs
 
-        kind = root_kind[obj_id]
-        if (kind == 0):
-            qpos_start = root_qpos_start[obj_id]
+        qpos_start = root_qpos_start[obj_id]
+        if (qpos_start >= 0):
             qvel_start = root_qvel_start[obj_id]
             q = wp.quat(qpos[world_id, qpos_start + 3],
                         qpos[world_id, qpos_start + 4],
@@ -207,13 +193,6 @@ def _build_warp_kernels():
             root_ang_vel[world_id, obj_id, 0] = ang_vel_w[0]
             root_ang_vel[world_id, obj_id, 1] = ang_vel_w[1]
             root_ang_vel[world_id, obj_id, 2] = ang_vel_w[2]
-        elif (kind == 1):
-            mocap_id = root_mocap_id[obj_id]
-            q = mocap_quat[world_id, mocap_id]
-            root_rot[world_id, obj_id, 0] = q[1]
-            root_rot[world_id, obj_id, 1] = q[2]
-            root_rot[world_id, obj_id, 2] = q[3]
-            root_rot[world_id, obj_id, 3] = q[0]
         else:
             body_id = root_body_id[obj_id]
             q = xquat[world_id, body_id]
@@ -221,6 +200,14 @@ def _build_warp_kernels():
             root_rot[world_id, obj_id, 1] = q[2]
             root_rot[world_id, obj_id, 2] = q[3]
             root_rot[world_id, obj_id, 3] = q[0]
+
+            root_vel[world_id, obj_id, 0] = 0.0
+            root_vel[world_id, obj_id, 1] = 0.0
+            root_vel[world_id, obj_id, 2] = 0.0
+
+            root_ang_vel[world_id, obj_id, 0] = 0.0
+            root_ang_vel[world_id, obj_id, 1] = 0.0
+            root_ang_vel[world_id, obj_id, 2] = 0.0
         return
 
     @wp.kernel
@@ -511,7 +498,6 @@ class ObjMeta:
     root_body_id: int
     root_qpos_ids: list[int]
     root_qvel_ids: list[int]
-    mocap_id: int | None
     dof_low: np.ndarray
     dof_high: np.ndarray
     kp: np.ndarray
@@ -532,8 +518,6 @@ class SimState:
         self._torch_qfrc_applied = wp.to_torch(self._wp_data.qfrc_applied)
         self._torch_xfrc_applied = wp.to_torch(self._wp_data.xfrc_applied)
         self._torch_ctrl = wp.to_torch(self._wp_data.ctrl)
-        self._torch_mocap_pos = wp.to_torch(self._wp_data.mocap_pos)
-        self._torch_mocap_quat = wp.to_torch(self._wp_data.mocap_quat)
         self._torch_xpos = wp.to_torch(self._wp_data.xpos)
         self._torch_xquat = wp.to_torch(self._wp_data.xquat)
         self._torch_cvel = wp.to_torch(self._wp_data.cvel)
@@ -577,11 +561,9 @@ class SimState:
             self._torch_dof_pos = torch.zeros([num_envs, 0], device=device, dtype=torch.float32)
             self._torch_dof_vel = torch.zeros([num_envs, 0], device=device, dtype=torch.float32)
 
-        root_kind = []
         root_qpos_start = []
         root_qvel_start = []
         root_body_id = []
-        root_mocap_id = []
 
         body_ids = []
         body_root_ids = []
@@ -613,23 +595,13 @@ class SimState:
             num_bodies = len(meta.body_ids)
             num_dofs = len(meta.qvel_ids)
 
-            if (meta.mocap_id is not None):
-                root_kind.append(1)
-                root_qpos_start.append(-1)
-                root_qvel_start.append(-1)
-                root_mocap_id.append(meta.mocap_id)
-                obj_root_pos = self._torch_mocap_pos[:, meta.mocap_id, :]
-            elif (len(meta.root_qpos_ids) > 0):
-                root_kind.append(0)
+            if (len(meta.root_qpos_ids) > 0):
                 root_qpos_start.append(meta.root_qpos_ids[0])
                 root_qvel_start.append(meta.root_qvel_ids[0])
-                root_mocap_id.append(-1)
                 obj_root_pos = self._torch_qpos[:, meta.root_qpos_ids[0]:meta.root_qpos_ids[0] + 3]
             else:
-                root_kind.append(2)
                 root_qpos_start.append(-1)
                 root_qvel_start.append(-1)
-                root_mocap_id.append(-1)
                 obj_root_pos = self._torch_body_pos[:, body_offset, :]
 
             root_body_id.append(meta.root_body_id)
@@ -671,11 +643,9 @@ class SimState:
             body_offset += num_bodies
             dof_offset += num_dofs
 
-        self._wp_root_kind = wp.array(root_kind, device=self._wp_device, dtype=int)
         self._wp_root_qpos_start = wp.array(root_qpos_start, device=self._wp_device, dtype=int)
         self._wp_root_qvel_start = wp.array(root_qvel_start, device=self._wp_device, dtype=int)
         self._wp_root_body_id = wp.array(root_body_id, device=self._wp_device, dtype=int)
-        self._wp_root_mocap_id = wp.array(root_mocap_id, device=self._wp_device, dtype=int)
 
         self._wp_body_ids = wp.array(body_ids, device=self._wp_device, dtype=int)
         self._wp_body_root_ids = wp.array(body_root_ids, device=self._wp_device, dtype=int)
@@ -695,8 +665,7 @@ class SimState:
             wp.launch(
                 kernel=write_root_rot_kernel,
                 dim=self._num_envs * self._num_objs,
-                inputs=[self._wp_root_rot, self._wp_data.qpos, self._wp_data.mocap_quat,
-                        self._wp_root_kind, self._wp_root_qpos_start, self._wp_root_mocap_id,
+                inputs=[self._wp_root_rot, self._wp_data.qpos, self._wp_root_qpos_start,
                         self._num_objs],
                 device=self._wp_device,
             )
@@ -716,9 +685,8 @@ class SimState:
             wp.launch(
                 kernel=update_root_state_kernel,
                 dim=self._num_envs * self._num_objs,
-                inputs=[self._wp_data.qpos, self._wp_data.qvel, self._wp_data.mocap_quat,
-                        self._wp_data.xquat, self._wp_root_kind, self._wp_root_qpos_start,
-                        self._wp_root_qvel_start, self._wp_root_body_id, self._wp_root_mocap_id,
+                inputs=[self._wp_data.qpos, self._wp_data.qvel, self._wp_data.xquat,
+                        self._wp_root_qpos_start, self._wp_root_qvel_start, self._wp_root_body_id,
                         self._wp_root_rot, self._wp_root_vel, self._wp_root_ang_vel,
                         self._num_objs],
                 device=self._wp_device,
@@ -1066,9 +1034,7 @@ class MujocoEngine(engine.Engine):
         _assign_env_tensor(self._sim_state.root_rot[obj_id], env_id, root_rot)
         root_rot = _quat_xyzw_to_wxyz(root_rot)
 
-        if (meta.mocap_id is not None):
-            _assign_env_tensor(self._torch_mocap_quat[:, meta.mocap_id, :], env_id, root_rot)
-        elif (len(meta.root_qpos_ids) > 0):
+        if (len(meta.root_qpos_ids) > 0):
             target = self._torch_qpos[:, meta.root_qpos_ids[0] + 3:meta.root_qpos_ids[0] + 7]
             _assign_env_tensor(target, env_id, root_rot)
 
@@ -1313,7 +1279,9 @@ class MujocoEngine(engine.Engine):
         obj_spec = mujoco.MjSpec.from_file(obj_def.asset_file)
 
         if (obj_def.fix_root):
-            obj_spec = self._wrap_fixed_root_mocap(obj_spec)
+            for joint in list(obj_spec.joints):
+                if (int(joint.type) == int(mujoco.mjtJoint.mjJNT_FREE)):
+                    obj_spec.delete(joint)
 
         if (obj_def.disable_motors):
             for actuator in list(obj_spec.actuators):
@@ -1334,27 +1302,6 @@ class MujocoEngine(engine.Engine):
                 geom.rgba[:] = rgba
 
         return obj_spec
-
-    def _wrap_fixed_root_mocap(self, obj_spec):
-        for joint in list(obj_spec.joints):
-            if (int(joint.type) == int(mujoco.mjtJoint.mjJNT_FREE)):
-                obj_spec.delete(joint)
-
-        if (len(obj_spec.bodies) > 1 and obj_spec.bodies[1].mocap):
-            return obj_spec
-
-        keyframes = [(np.array(k.qpos), np.array(k.ctrl), k.name) for k in obj_spec.keys]
-        for key in list(obj_spec.keys):
-            obj_spec.delete(key)
-
-        wrapper_spec = mujoco.MjSpec()
-        mocap_body = wrapper_spec.worldbody.add_body(name="mocap_base", mocap=True)
-        frame = mocap_body.add_frame()
-        wrapper_spec.attach(child=obj_spec, prefix="", frame=frame)
-
-        for qpos, ctrl, name in keyframes:
-            wrapper_spec.add_key(name=name, qpos=qpos.tolist(), ctrl=ctrl.tolist())
-        return wrapper_spec
 
     def _disable_self_collisions(self, obj_spec):
         bodies = [b for b in obj_spec.bodies[1:] if b.name]
@@ -1398,8 +1345,6 @@ class MujocoEngine(engine.Engine):
         body_names = []
         for body in obj_spec.bodies[1:]:
             body_name = _strip_prefix(body.name, prefix)
-            if (body_name == "mocap_base"):
-                continue
             body_ids.append(int(body.id))
             body_names.append(body_name)
 
@@ -1408,10 +1353,6 @@ class MujocoEngine(engine.Engine):
             body_names = [obj_def.name]
 
         root_body_id = body_ids[0]
-        mocap_id = int(self._mj_model.body_mocapid[self._mj_model.body_rootid[root_body_id]])
-        if (mocap_id < 0):
-            mocap_id = None
-
         geom_ids = [int(geom.id) for geom in obj_spec.geoms]
         joint_ids = [int(joint.id) for joint in obj_spec.joints]
         joint_ids = [j for j in joint_ids
@@ -1502,7 +1443,6 @@ class MujocoEngine(engine.Engine):
                        root_body_id=root_body_id,
                        root_qpos_ids=root_qpos_ids,
                        root_qvel_ids=root_qvel_ids,
-                       mocap_id=mocap_id,
                        dof_low=np.asarray(dof_low, dtype=np.float32),
                        dof_high=np.asarray(dof_high, dtype=np.float32),
                        kp=np.asarray(kp, dtype=np.float32),
@@ -1612,8 +1552,6 @@ class MujocoEngine(engine.Engine):
         self._torch_qfrc_applied = self._sim_state._torch_qfrc_applied
         self._torch_xfrc_applied = self._sim_state._torch_xfrc_applied
         self._torch_ctrl = self._sim_state._torch_ctrl
-        self._torch_mocap_pos = self._sim_state._torch_mocap_pos
-        self._torch_mocap_quat = self._sim_state._torch_mocap_quat
         self._torch_xpos = self._sim_state._torch_xpos
         self._torch_xquat = self._sim_state._torch_xquat
         self._torch_cvel = self._sim_state._torch_cvel
@@ -1987,11 +1925,6 @@ class MujocoEngine(engine.Engine):
 
         if (self._mj_model.nu > 0):
             target_data.ctrl[:] = self._torch_ctrl[env_id].detach().cpu().numpy()
-
-        if (self._mj_model.nmocap > 0):
-            target_data.mocap_pos[:] = self._torch_mocap_pos[env_id].detach().cpu().numpy()
-            target_data.mocap_quat[:] = self._torch_mocap_quat[env_id].detach().cpu().numpy()
-            target_data.mocap_pos[:] += offset
 
         target_data.xfrc_applied[:] = self._torch_xfrc_applied[env_id].detach().cpu().numpy()
         return
