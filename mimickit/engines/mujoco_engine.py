@@ -16,7 +16,7 @@ _mujoco = None
 _mjwarp = None
 _mjwarp_support = None
 _wp = None
-_accumulate_contact_kernel = None
+_warp_kernels = None
 
 
 def _load_mujoco_modules():
@@ -46,12 +46,284 @@ def _load_mujoco_modules():
 
 
 def _build_warp_kernels():
-    global _accumulate_contact_kernel
+    global _warp_kernels
 
-    if (_accumulate_contact_kernel is not None):
-        return _accumulate_contact_kernel
+    if (_warp_kernels is not None):
+        return _warp_kernels
 
     _, _, _, wp = _load_mujoco_modules()
+
+    @wp.kernel
+    def clear_qfrc_kernel(qfrc_applied: wp.array2d(dtype=float),
+                          nv: int):
+        tid = wp.tid()
+        world_id = tid // nv
+        dof_id = tid - world_id * nv
+        qfrc_applied[world_id, dof_id] = 0.0
+        return
+
+    @wp.kernel
+    def update_dof_state_kernel(qpos: wp.array2d(dtype=float),
+                                qvel: wp.array2d(dtype=float),
+                                dof_qpos_start: wp.array(dtype=int),
+                                dof_qpos_kind: wp.array(dtype=int),
+                                dof_qpos_comp: wp.array(dtype=int),
+                                dof_qvel_id: wp.array(dtype=int),
+                                dof_pos: wp.array2d(dtype=float),
+                                dof_vel: wp.array2d(dtype=float),
+                                num_dofs: int):
+        tid = wp.tid()
+        world_id = tid // num_dofs
+        dof_id = tid - world_id * num_dofs
+
+        qvel_id = dof_qvel_id[dof_id]
+        if (qvel_id >= 0):
+            dof_vel[world_id, dof_id] = qvel[world_id, qvel_id]
+
+        qpos_start = dof_qpos_start[dof_id]
+        qpos_kind = dof_qpos_kind[dof_id]
+        if (qpos_start < 0):
+            return
+
+        if (qpos_kind == 0):
+            dof_pos[world_id, dof_id] = qpos[world_id, qpos_start]
+        else:
+            q = wp.quaternion(qpos[world_id, qpos_start + 1],
+                              qpos[world_id, qpos_start + 2],
+                              qpos[world_id, qpos_start + 3],
+                              qpos[world_id, qpos_start])
+            axis, angle = wp.quat_to_axis_angle(q)
+            exp_map = axis * angle
+            comp = dof_qpos_comp[dof_id]
+            dof_pos[world_id, dof_id] = exp_map[comp]
+        return
+
+    @wp.kernel
+    def write_dof_pos_kernel(dof_pos: wp.array2d(dtype=float),
+                             qpos: wp.array2d(dtype=float),
+                             dof_qpos_start: wp.array(dtype=int),
+                             dof_qpos_kind: wp.array(dtype=int),
+                             dof_qpos_comp: wp.array(dtype=int),
+                             num_dofs: int):
+        min_theta = 1e-5
+
+        tid = wp.tid()
+        world_id = tid // num_dofs
+        dof_id = tid - world_id * num_dofs
+
+        qpos_start = dof_qpos_start[dof_id]
+        if (qpos_start < 0):
+            return
+
+        qpos_kind = dof_qpos_kind[dof_id]
+        if (qpos_kind == 0):
+            qpos[world_id, qpos_start] = dof_pos[world_id, dof_id]
+        elif (dof_qpos_comp[dof_id] == 0):
+            exp_map = wp.vec3f(dof_pos[world_id, dof_id],
+                               dof_pos[world_id, dof_id + 1],
+                               dof_pos[world_id, dof_id + 2])
+            angle = wp.length(exp_map)
+            axis = wp.vec3f(0.0, 0.0, 1.0)
+            if (wp.abs(angle) > min_theta):
+                axis = exp_map / angle
+                angle = wp.atan2(wp.sin(angle), wp.cos(angle))
+            else:
+                angle = 0.0
+
+            q = wp.quat_from_axis_angle(axis, angle)
+            qpos[world_id, qpos_start] = q[3]
+            qpos[world_id, qpos_start + 1] = q[0]
+            qpos[world_id, qpos_start + 2] = q[1]
+            qpos[world_id, qpos_start + 3] = q[2]
+        return
+
+    @wp.kernel
+    def write_root_rot_kernel(root_rot: wp.array3d(dtype=float),
+                              qpos: wp.array2d(dtype=float),
+                              mocap_quat: wp.array3d(dtype=float),
+                              root_kind: wp.array(dtype=int),
+                              root_qpos_start: wp.array(dtype=int),
+                              root_mocap_id: wp.array(dtype=int),
+                              num_objs: int):
+        tid = wp.tid()
+        world_id = tid // num_objs
+        obj_id = tid - world_id * num_objs
+
+        kind = root_kind[obj_id]
+        if (kind == 0):
+            qpos_start = root_qpos_start[obj_id]
+            qpos[world_id, qpos_start + 3] = root_rot[world_id, obj_id, 3]
+            qpos[world_id, qpos_start + 4] = root_rot[world_id, obj_id, 0]
+            qpos[world_id, qpos_start + 5] = root_rot[world_id, obj_id, 1]
+            qpos[world_id, qpos_start + 6] = root_rot[world_id, obj_id, 2]
+        elif (kind == 1):
+            mocap_id = root_mocap_id[obj_id]
+            mocap_quat[world_id, mocap_id, 0] = root_rot[world_id, obj_id, 3]
+            mocap_quat[world_id, mocap_id, 1] = root_rot[world_id, obj_id, 0]
+            mocap_quat[world_id, mocap_id, 2] = root_rot[world_id, obj_id, 1]
+            mocap_quat[world_id, mocap_id, 3] = root_rot[world_id, obj_id, 2]
+        return
+
+    @wp.kernel
+    def update_root_state_kernel(qpos: wp.array2d(dtype=float),
+                                 qvel: wp.array2d(dtype=float),
+                                 mocap_quat: wp.array3d(dtype=float),
+                                 xquat: wp.array3d(dtype=float),
+                                 root_kind: wp.array(dtype=int),
+                                 root_qpos_start: wp.array(dtype=int),
+                                 root_qvel_start: wp.array(dtype=int),
+                                 root_body_id: wp.array(dtype=int),
+                                 root_mocap_id: wp.array(dtype=int),
+                                 root_rot: wp.array3d(dtype=float),
+                                 root_vel: wp.array3d(dtype=float),
+                                 root_ang_vel: wp.array3d(dtype=float),
+                                 num_objs: int):
+        tid = wp.tid()
+        world_id = tid // num_objs
+        obj_id = tid - world_id * num_objs
+
+        kind = root_kind[obj_id]
+        if (kind == 0):
+            qpos_start = root_qpos_start[obj_id]
+            qvel_start = root_qvel_start[obj_id]
+            q = wp.quaternion(qpos[world_id, qpos_start + 4],
+                              qpos[world_id, qpos_start + 5],
+                              qpos[world_id, qpos_start + 6],
+                              qpos[world_id, qpos_start + 3])
+
+            root_rot[world_id, obj_id, 0] = q[0]
+            root_rot[world_id, obj_id, 1] = q[1]
+            root_rot[world_id, obj_id, 2] = q[2]
+            root_rot[world_id, obj_id, 3] = q[3]
+
+            root_vel[world_id, obj_id, 0] = qvel[world_id, qvel_start]
+            root_vel[world_id, obj_id, 1] = qvel[world_id, qvel_start + 1]
+            root_vel[world_id, obj_id, 2] = qvel[world_id, qvel_start + 2]
+
+            ang_vel_b = wp.vec3f(qvel[world_id, qvel_start + 3],
+                                 qvel[world_id, qvel_start + 4],
+                                 qvel[world_id, qvel_start + 5])
+            ang_vel_w = wp.quat_rotate(q, ang_vel_b)
+            root_ang_vel[world_id, obj_id, 0] = ang_vel_w[0]
+            root_ang_vel[world_id, obj_id, 1] = ang_vel_w[1]
+            root_ang_vel[world_id, obj_id, 2] = ang_vel_w[2]
+        elif (kind == 1):
+            mocap_id = root_mocap_id[obj_id]
+            root_rot[world_id, obj_id, 0] = mocap_quat[world_id, mocap_id, 1]
+            root_rot[world_id, obj_id, 1] = mocap_quat[world_id, mocap_id, 2]
+            root_rot[world_id, obj_id, 2] = mocap_quat[world_id, mocap_id, 3]
+            root_rot[world_id, obj_id, 3] = mocap_quat[world_id, mocap_id, 0]
+        else:
+            body_id = root_body_id[obj_id]
+            root_rot[world_id, obj_id, 0] = xquat[world_id, body_id, 1]
+            root_rot[world_id, obj_id, 1] = xquat[world_id, body_id, 2]
+            root_rot[world_id, obj_id, 2] = xquat[world_id, body_id, 3]
+            root_rot[world_id, obj_id, 3] = xquat[world_id, body_id, 0]
+        return
+
+    @wp.kernel
+    def update_body_state_kernel(xpos: wp.array3d(dtype=float),
+                                 xquat: wp.array3d(dtype=float),
+                                 cvel: wp.array3d(dtype=float),
+                                 subtree_com: wp.array3d(dtype=float),
+                                 body_ids: wp.array(dtype=int),
+                                 body_root_ids: wp.array(dtype=int),
+                                 body_pos: wp.array3d(dtype=float),
+                                 body_rot: wp.array3d(dtype=float),
+                                 body_vel: wp.array3d(dtype=float),
+                                 body_ang_vel: wp.array3d(dtype=float),
+                                 num_bodies: int):
+        tid = wp.tid()
+        world_id = tid // num_bodies
+        local_body_id = tid - world_id * num_bodies
+
+        body_id = body_ids[local_body_id]
+        root_body_id = body_root_ids[local_body_id]
+
+        pos = wp.vec3f(xpos[world_id, body_id, 0],
+                       xpos[world_id, body_id, 1],
+                       xpos[world_id, body_id, 2])
+        ang_vel = wp.vec3f(cvel[world_id, body_id, 0],
+                           cvel[world_id, body_id, 1],
+                           cvel[world_id, body_id, 2])
+        lin_vel_c = wp.vec3f(cvel[world_id, body_id, 3],
+                             cvel[world_id, body_id, 4],
+                             cvel[world_id, body_id, 5])
+        com = wp.vec3f(subtree_com[world_id, root_body_id, 0],
+                       subtree_com[world_id, root_body_id, 1],
+                       subtree_com[world_id, root_body_id, 2])
+        lin_vel = lin_vel_c - wp.cross(ang_vel, com - pos)
+
+        body_pos[world_id, local_body_id, 0] = pos[0]
+        body_pos[world_id, local_body_id, 1] = pos[1]
+        body_pos[world_id, local_body_id, 2] = pos[2]
+
+        body_rot[world_id, local_body_id, 0] = xquat[world_id, body_id, 1]
+        body_rot[world_id, local_body_id, 1] = xquat[world_id, body_id, 2]
+        body_rot[world_id, local_body_id, 2] = xquat[world_id, body_id, 3]
+        body_rot[world_id, local_body_id, 3] = xquat[world_id, body_id, 0]
+
+        body_vel[world_id, local_body_id, 0] = lin_vel[0]
+        body_vel[world_id, local_body_id, 1] = lin_vel[1]
+        body_vel[world_id, local_body_id, 2] = lin_vel[2]
+
+        body_ang_vel[world_id, local_body_id, 0] = ang_vel[0]
+        body_ang_vel[world_id, local_body_id, 1] = ang_vel[1]
+        body_ang_vel[world_id, local_body_id, 2] = ang_vel[2]
+        return
+
+    @wp.kernel
+    def apply_control_kernel(qpos: wp.array2d(dtype=float),
+                             qvel: wp.array2d(dtype=float),
+                             cmd: wp.array2d(dtype=float),
+                             dof_qpos_start: wp.array(dtype=int),
+                             dof_qpos_kind: wp.array(dtype=int),
+                             dof_qpos_comp: wp.array(dtype=int),
+                             dof_qvel_id: wp.array(dtype=int),
+                             kp: wp.array(dtype=float),
+                             kd: wp.array(dtype=float),
+                             torque_lim: wp.array(dtype=float),
+                             qfrc_applied: wp.array2d(dtype=float),
+                             dof_force: wp.array2d(dtype=float),
+                             control_mode: int,
+                             num_dofs: int):
+        tid = wp.tid()
+        world_id = tid // num_dofs
+        dof_id = tid - world_id * num_dofs
+
+        qvel_id = dof_qvel_id[dof_id]
+        if (qvel_id < 0):
+            return
+
+        cmd_val = cmd[world_id, dof_id]
+        qvel_val = qvel[world_id, qvel_id]
+        torque = 0.0
+
+        if (control_mode == 1 or control_mode == 4):
+            qpos_start = dof_qpos_start[dof_id]
+            qpos_kind = dof_qpos_kind[dof_id]
+            dof_val = 0.0
+            if (qpos_kind == 0):
+                dof_val = qpos[world_id, qpos_start]
+            else:
+                q = wp.quaternion(qpos[world_id, qpos_start + 1],
+                                  qpos[world_id, qpos_start + 2],
+                                  qpos[world_id, qpos_start + 3],
+                                  qpos[world_id, qpos_start])
+                axis, angle = wp.quat_to_axis_angle(q)
+                exp_map = axis * angle
+                dof_val = exp_map[dof_qpos_comp[dof_id]]
+            torque = kp[dof_id] * (cmd_val - dof_val) - kd[dof_id] * qvel_val
+        elif (control_mode == 2):
+            torque = kd[dof_id] * (cmd_val - qvel_val)
+        elif (control_mode == 3):
+            torque = cmd_val
+
+        limit = torque_lim[dof_id]
+        torque = wp.clamp(torque, -limit, limit)
+        qfrc_applied[world_id, qvel_id] = torque
+        dof_force[world_id, dof_id] = torque
+        return
 
     @wp.kernel
     def accumulate_contact_kernel(contact_worldid: wp.array(dtype=int),
@@ -110,8 +382,17 @@ def _build_warp_kernels():
 
         return
 
-    _accumulate_contact_kernel = accumulate_contact_kernel
-    return _accumulate_contact_kernel
+    _warp_kernels = {
+        "clear_qfrc": clear_qfrc_kernel,
+        "update_dof_state": update_dof_state_kernel,
+        "write_dof_pos": write_dof_pos_kernel,
+        "write_root_rot": write_root_rot_kernel,
+        "update_root_state": update_root_state_kernel,
+        "update_body_state": update_body_state_kernel,
+        "apply_control": apply_control_kernel,
+        "accumulate_contact": accumulate_contact_kernel,
+    }
+    return _warp_kernels
 
 
 @dataclass(frozen=True)
@@ -150,11 +431,256 @@ class ObjMeta:
     mass: float
 
 
+class SimState:
+    def __init__(self, eng):
+        self._engine = eng
+        self._wp = eng._wp
+        self._wp_device = eng._wp_device
+        self._wp_data = eng._wp_data
+        self._kernels = eng._kernels
+
+        num_envs = eng.get_num_envs()
+        num_objs = len(eng._obj_metas)
+
+        self._torch_qpos = self._wp.to_torch(self._wp_data.qpos)
+        self._torch_qvel = self._wp.to_torch(self._wp_data.qvel)
+        self._torch_qfrc_applied = self._wp.to_torch(self._wp_data.qfrc_applied)
+        self._torch_xfrc_applied = self._wp.to_torch(self._wp_data.xfrc_applied)
+        self._torch_ctrl = self._wp.to_torch(self._wp_data.ctrl)
+        self._torch_mocap_pos = self._wp.to_torch(self._wp_data.mocap_pos)
+        self._torch_mocap_quat = self._wp.to_torch(self._wp_data.mocap_quat)
+        self._torch_xpos = self._wp.to_torch(self._wp_data.xpos)
+        self._torch_xquat = self._wp.to_torch(self._wp_data.xquat)
+        self._torch_cvel = self._wp.to_torch(self._wp_data.cvel)
+        self._torch_subtree_com = self._wp.to_torch(self._wp_data.subtree_com)
+
+        total_bodies = sum(len(meta.body_ids) for meta in eng._obj_metas)
+        total_dofs = sum(len(meta.qvel_ids) for meta in eng._obj_metas)
+
+        self._num_envs = num_envs
+        self._num_objs = num_objs
+        self._num_bodies = total_bodies
+        self._num_dofs = total_dofs
+
+        self._wp_root_rot = self._wp.zeros((num_envs, num_objs, 4), device=self._wp_device, dtype=float)
+        self._wp_root_vel = self._wp.zeros((num_envs, num_objs, 3), device=self._wp_device, dtype=float)
+        self._wp_root_ang_vel = self._wp.zeros((num_envs, num_objs, 3), device=self._wp_device, dtype=float)
+
+        self._torch_root_rot = self._wp.to_torch(self._wp_root_rot)
+        self._torch_root_vel = self._wp.to_torch(self._wp_root_vel)
+        self._torch_root_ang_vel = self._wp.to_torch(self._wp_root_ang_vel)
+
+        self._wp_body_pos = self._wp.zeros((num_envs, total_bodies, 3), device=self._wp_device, dtype=float)
+        self._wp_body_rot = self._wp.zeros((num_envs, total_bodies, 4), device=self._wp_device, dtype=float)
+        self._wp_body_vel = self._wp.zeros((num_envs, total_bodies, 3), device=self._wp_device, dtype=float)
+        self._wp_body_ang_vel = self._wp.zeros((num_envs, total_bodies, 3), device=self._wp_device, dtype=float)
+
+        self._torch_body_pos = self._wp.to_torch(self._wp_body_pos)
+        self._torch_body_rot = self._wp.to_torch(self._wp_body_rot)
+        self._torch_body_vel = self._wp.to_torch(self._wp_body_vel)
+        self._torch_body_ang_vel = self._wp.to_torch(self._wp_body_ang_vel)
+
+        if (total_dofs > 0):
+            self._wp_dof_pos = self._wp.zeros((num_envs, total_dofs), device=self._wp_device, dtype=float)
+            self._wp_dof_vel = self._wp.zeros((num_envs, total_dofs), device=self._wp_device, dtype=float)
+            self._wp_cmd = self._wp.zeros((num_envs, total_dofs), device=self._wp_device, dtype=float)
+            self._wp_dof_force = self._wp.zeros((num_envs, total_dofs), device=self._wp_device, dtype=float)
+
+            self._torch_dof_pos = self._wp.to_torch(self._wp_dof_pos)
+            self._torch_dof_vel = self._wp.to_torch(self._wp_dof_vel)
+            self._torch_cmd = self._wp.to_torch(self._wp_cmd)
+            self._torch_dof_force = self._wp.to_torch(self._wp_dof_force)
+        else:
+            self._wp_dof_pos = None
+            self._wp_dof_vel = None
+            self._wp_cmd = None
+            self._wp_dof_force = None
+
+            self._torch_dof_pos = torch.zeros([num_envs, 0], device=eng._device, dtype=torch.float32)
+            self._torch_dof_vel = torch.zeros([num_envs, 0], device=eng._device, dtype=torch.float32)
+            self._torch_cmd = torch.zeros([num_envs, 0], device=eng._device, dtype=torch.float32)
+            self._torch_dof_force = torch.zeros([num_envs, 0], device=eng._device, dtype=torch.float32)
+
+        root_kind = []
+        root_qpos_start = []
+        root_qvel_start = []
+        root_body_id = []
+        root_mocap_id = []
+
+        body_ids = []
+        body_root_ids = []
+
+        dof_qpos_start = []
+        dof_qpos_kind = []
+        dof_qpos_comp = []
+        dof_qvel_id = []
+        control_qvel_id = []
+        kp = []
+        kd = []
+        torque_lim = []
+
+        self.root_pos = []
+        self.root_rot = []
+        self.root_vel = []
+        self.root_ang_vel = []
+        self.dof_pos = []
+        self.dof_vel = []
+        self.body_pos = []
+        self.body_rot = []
+        self.body_vel = []
+        self.body_ang_vel = []
+        self.cmd = []
+        self.dof_force = []
+
+        body_offset = 0
+        dof_offset = 0
+
+        for obj_id, meta in enumerate(eng._obj_metas):
+            num_bodies = len(meta.body_ids)
+            num_dofs = len(meta.qvel_ids)
+
+            if (meta.mocap_id is not None):
+                root_kind.append(1)
+                root_qpos_start.append(-1)
+                root_qvel_start.append(-1)
+                root_mocap_id.append(meta.mocap_id)
+                obj_root_pos = self._torch_mocap_pos[:, meta.mocap_id, :]
+            elif (len(meta.root_qpos_ids) > 0):
+                root_kind.append(0)
+                root_qpos_start.append(meta.root_qpos_ids[0])
+                root_qvel_start.append(meta.root_qvel_ids[0])
+                root_mocap_id.append(-1)
+                obj_root_pos = self._torch_qpos[:, meta.root_qpos_ids[0]:meta.root_qpos_ids[0] + 3]
+            else:
+                root_kind.append(2)
+                root_qpos_start.append(-1)
+                root_qvel_start.append(-1)
+                root_mocap_id.append(-1)
+                obj_root_pos = self._torch_body_pos[:, body_offset, :]
+
+            root_body_id.append(meta.root_body_id)
+
+            for body_id in meta.body_ids:
+                body_ids.append(body_id)
+                body_root_ids.append(meta.root_body_id)
+
+            qpos_by_qvel = {}
+            for qpos_id, qvel_id in zip(meta.hinge_qpos_ids, meta.hinge_dof_ids):
+                qpos_by_qvel[qvel_id] = (qpos_id, 0, 0)
+
+            for qpos_start, qvel_start in zip(meta.ball_qpos_ids, meta.ball_dof_ids):
+                for comp in range(3):
+                    qpos_by_qvel[qvel_start + comp] = (qpos_start, 1, comp)
+
+            for local_id, qvel_id in enumerate(meta.qvel_ids):
+                qpos_start, qpos_kind, qpos_comp = qpos_by_qvel[qvel_id]
+                dof_qpos_start.append(qpos_start)
+                dof_qpos_kind.append(qpos_kind)
+                dof_qpos_comp.append(qpos_comp)
+                dof_qvel_id.append(qvel_id)
+                control_qvel_id.append(-1 if meta.obj_def.disable_motors else qvel_id)
+                kp.append(float(meta.kp[local_id]))
+                kd.append(float(meta.kd[local_id]))
+                torque_lim.append(float(meta.torque_lim[local_id]))
+
+            self.root_pos.append(obj_root_pos)
+            self.root_rot.append(self._torch_root_rot[:, obj_id, :])
+            self.root_vel.append(self._torch_root_vel[:, obj_id, :])
+            self.root_ang_vel.append(self._torch_root_ang_vel[:, obj_id, :])
+            self.body_pos.append(self._torch_body_pos[:, body_offset:body_offset + num_bodies, :])
+            self.body_rot.append(self._torch_body_rot[:, body_offset:body_offset + num_bodies, :])
+            self.body_vel.append(self._torch_body_vel[:, body_offset:body_offset + num_bodies, :])
+            self.body_ang_vel.append(self._torch_body_ang_vel[:, body_offset:body_offset + num_bodies, :])
+            self.dof_pos.append(self._torch_dof_pos[:, dof_offset:dof_offset + num_dofs])
+            self.dof_vel.append(self._torch_dof_vel[:, dof_offset:dof_offset + num_dofs])
+            self.cmd.append(self._torch_cmd[:, dof_offset:dof_offset + num_dofs])
+            self.dof_force.append(self._torch_dof_force[:, dof_offset:dof_offset + num_dofs])
+
+            body_offset += num_bodies
+            dof_offset += num_dofs
+
+        self._wp_root_kind = self._wp.array(root_kind, device=self._wp_device, dtype=int)
+        self._wp_root_qpos_start = self._wp.array(root_qpos_start, device=self._wp_device, dtype=int)
+        self._wp_root_qvel_start = self._wp.array(root_qvel_start, device=self._wp_device, dtype=int)
+        self._wp_root_body_id = self._wp.array(root_body_id, device=self._wp_device, dtype=int)
+        self._wp_root_mocap_id = self._wp.array(root_mocap_id, device=self._wp_device, dtype=int)
+
+        self._wp_body_ids = self._wp.array(body_ids, device=self._wp_device, dtype=int)
+        self._wp_body_root_ids = self._wp.array(body_root_ids, device=self._wp_device, dtype=int)
+
+        self._wp_dof_qpos_start = self._wp.array(dof_qpos_start, device=self._wp_device, dtype=int)
+        self._wp_dof_qpos_kind = self._wp.array(dof_qpos_kind, device=self._wp_device, dtype=int)
+        self._wp_dof_qpos_comp = self._wp.array(dof_qpos_comp, device=self._wp_device, dtype=int)
+        self._wp_dof_qvel_id = self._wp.array(dof_qvel_id, device=self._wp_device, dtype=int)
+        self._wp_control_qvel_id = self._wp.array(control_qvel_id, device=self._wp_device, dtype=int)
+        self._wp_kp = self._wp.array(kp, device=self._wp_device, dtype=float)
+        self._wp_kd = self._wp.array(kd, device=self._wp_device, dtype=float)
+        self._wp_torque_lim = self._wp.array(torque_lim, device=self._wp_device, dtype=float)
+        return
+
+    def pre_step_update(self):
+        if (self._num_objs > 0):
+            self._wp.launch(
+                kernel=self._kernels["write_root_rot"],
+                dim=self._num_envs * self._num_objs,
+                inputs=[self._wp_root_rot, self._wp_data.qpos, self._wp_data.mocap_quat,
+                        self._wp_root_kind, self._wp_root_qpos_start, self._wp_root_mocap_id,
+                        self._num_objs],
+                device=self._wp_device,
+            )
+
+        if (self._num_dofs > 0):
+            self._wp.launch(
+                kernel=self._kernels["write_dof_pos"],
+                dim=self._num_envs * self._num_dofs,
+                inputs=[self._wp_dof_pos, self._wp_data.qpos, self._wp_dof_qpos_start,
+                        self._wp_dof_qpos_kind, self._wp_dof_qpos_comp, self._num_dofs],
+                device=self._wp_device,
+            )
+        return
+
+    def post_step_update(self):
+        if (self._num_objs > 0):
+            self._wp.launch(
+                kernel=self._kernels["update_root_state"],
+                dim=self._num_envs * self._num_objs,
+                inputs=[self._wp_data.qpos, self._wp_data.qvel, self._wp_data.mocap_quat,
+                        self._wp_data.xquat, self._wp_root_kind, self._wp_root_qpos_start,
+                        self._wp_root_qvel_start, self._wp_root_body_id, self._wp_root_mocap_id,
+                        self._wp_root_rot, self._wp_root_vel, self._wp_root_ang_vel,
+                        self._num_objs],
+                device=self._wp_device,
+            )
+
+        if (self._num_dofs > 0):
+            self._wp.launch(
+                kernel=self._kernels["update_dof_state"],
+                dim=self._num_envs * self._num_dofs,
+                inputs=[self._wp_data.qpos, self._wp_data.qvel, self._wp_dof_qpos_start,
+                        self._wp_dof_qpos_kind, self._wp_dof_qpos_comp, self._wp_dof_qvel_id,
+                        self._wp_dof_pos, self._wp_dof_vel, self._num_dofs],
+                device=self._wp_device,
+            )
+
+        if (self._num_bodies > 0):
+            self._wp.launch(
+                kernel=self._kernels["update_body_state"],
+                dim=self._num_envs * self._num_bodies,
+                inputs=[self._wp_data.xpos, self._wp_data.xquat, self._wp_data.cvel,
+                        self._wp_data.subtree_com, self._wp_body_ids, self._wp_body_root_ids,
+                        self._wp_body_pos, self._wp_body_rot, self._wp_body_vel,
+                        self._wp_body_ang_vel, self._num_bodies],
+                device=self._wp_device,
+            )
+        return
+
+
 class MujocoEngine(engine.Engine):
     def __init__(self, config, num_envs, device, visualize, record_video=False):
         super().__init__(visualize=visualize)
 
         self._mujoco, self._mjwarp, self._mjwarp_support, self._wp = _load_mujoco_modules()
+        self._kernels = _build_warp_kernels()
 
         self._device = device
         self._wp_device = self._wp.get_device(device)
@@ -194,7 +720,6 @@ class MujocoEngine(engine.Engine):
 
         self._obj_metas = []
         self._cmds = []
-        self._dof_forces = []
 
         self._camera_pos = np.array([0.0, -5.0, 3.0], dtype=np.float64)
         self._camera_look_at = np.array([0.0, 0.0, 1.0], dtype=np.float64)
@@ -215,6 +740,7 @@ class MujocoEngine(engine.Engine):
         self._video_recorder = None
         self._state_dirty = False
         self._has_body_forces = False
+        self._graph = None
         return
 
     def get_name(self):
@@ -266,7 +792,7 @@ class MujocoEngine(engine.Engine):
         self._validate_envs()
         self._build_model()
         self._build_sim_tensors()
-        self._apply_start_states()
+        self._apply_start_xform()
         self._forward()
         self._build_contact_tensors()
 
@@ -276,6 +802,7 @@ class MujocoEngine(engine.Engine):
         if (self.enabled_record_video()):
             self._video_recorder = self._build_video_recorder()
 
+        self._build_graphs()
         return
 
     def set_cmd(self, obj_id, cmd):
@@ -289,14 +816,10 @@ class MujocoEngine(engine.Engine):
 
         self._sync_derived_state()
 
-        for _ in range(self._sim_steps):
-            self._apply_cmd()
-            with self._wp.ScopedDevice(self._wp_device):
-                self._mjwarp.step(self._wp_model, self._wp_data)
-
-        self._state_dirty = True
-        self._sync_derived_state()
-        self._update_contact_forces()
+        if (self._graph):
+            self._wp.capture_launch(self._graph)
+        else:
+            self._simulate()
 
         if (self._has_body_forces):
             self._torch_xfrc_applied.zero_()
@@ -358,76 +881,47 @@ class MujocoEngine(engine.Engine):
         return len(self._obj_metas)
 
     def get_root_pos(self, obj_id):
-        meta = self._obj_metas[obj_id]
-        if (meta.mocap_id is not None):
-            return self._torch_mocap_pos[:, meta.mocap_id, :]
-        elif (len(meta.root_qpos_ids) > 0):
-            return self._torch_qpos[:, meta.root_qpos_ids[0]:meta.root_qpos_ids[0] + 3]
-        else:
-            return self._torch_xpos[:, meta.root_body_id, :]
+        self._sync_derived_state()
+        return self._sim_state.root_pos[obj_id]
 
     def get_root_rot(self, obj_id):
-        meta = self._obj_metas[obj_id]
-        if (meta.mocap_id is not None):
-            quat = self._torch_mocap_quat[:, meta.mocap_id, :]
-        elif (len(meta.root_qpos_ids) > 0):
-            quat = self._torch_qpos[:, meta.root_qpos_ids[0] + 3:meta.root_qpos_ids[0] + 7]
-        else:
-            self._sync_derived_state()
-            quat = self._torch_xquat[:, meta.root_body_id, :]
-        return _quat_wxyz_to_xyzw(quat)
+        self._sync_derived_state()
+        return self._sim_state.root_rot[obj_id]
 
     def get_root_vel(self, obj_id):
-        meta = self._obj_metas[obj_id]
-        if (len(meta.root_qvel_ids) > 0):
-            return self._torch_qvel[:, meta.root_qvel_ids[0]:meta.root_qvel_ids[0] + 3]
-        else:
-            return self._root_vel_cache[obj_id]
+        self._sync_derived_state()
+        return self._sim_state.root_vel[obj_id]
 
     def get_root_ang_vel(self, obj_id):
-        meta = self._obj_metas[obj_id]
-        if (len(meta.root_qvel_ids) > 0):
-            quat = self.get_root_rot(obj_id)
-            ang_vel_b = self._torch_qvel[:, meta.root_qvel_ids[0] + 3:meta.root_qvel_ids[0] + 6]
-            return torch_util.quat_rotate(quat, ang_vel_b)
-        else:
-            return self._root_ang_vel_cache[obj_id]
+        self._sync_derived_state()
+        return self._sim_state.root_ang_vel[obj_id]
 
     def get_dof_pos(self, obj_id):
-        return self._read_dof_pos(self._obj_metas[obj_id])
+        self._sync_derived_state()
+        return self._sim_state.dof_pos[obj_id]
 
     def get_dof_vel(self, obj_id):
-        meta = self._obj_metas[obj_id]
-        if (len(meta.qvel_ids) == 0):
-            return self._empty_dof_tensor
-        return self._torch_qvel[:, meta.qvel_ids]
+        self._sync_derived_state()
+        return self._sim_state.dof_vel[obj_id]
 
     def get_dof_forces(self, obj_id):
-        return self._dof_forces[obj_id]
+        return self._sim_state.dof_force[obj_id]
 
     def get_body_pos(self, obj_id):
         self._sync_derived_state()
-        meta = self._obj_metas[obj_id]
-        return self._torch_xpos[:, meta.body_ids, :]
+        return self._sim_state.body_pos[obj_id]
 
     def get_body_rot(self, obj_id):
         self._sync_derived_state()
-        meta = self._obj_metas[obj_id]
-        return _quat_wxyz_to_xyzw(self._torch_xquat[:, meta.body_ids, :])
+        return self._sim_state.body_rot[obj_id]
 
     def get_body_vel(self, obj_id):
         self._sync_derived_state()
-        meta = self._obj_metas[obj_id]
-        pos = self._torch_xpos[:, meta.body_ids, :]
-        cvel = self._torch_cvel[:, meta.body_ids, :]
-        subtree_com = self._torch_subtree_com[:, meta.root_body_id, :].unsqueeze(1)
-        vel = _compute_velocity_from_cvel(pos, subtree_com, cvel)
-        return vel[..., 0:3]
+        return self._sim_state.body_vel[obj_id]
 
     def get_body_ang_vel(self, obj_id):
         self._sync_derived_state()
-        meta = self._obj_metas[obj_id]
-        return self._torch_cvel[:, meta.body_ids, 0:3]
+        return self._sim_state.body_ang_vel[obj_id]
 
     def get_contact_forces(self, obj_id):
         return self._contact_forces[obj_id]
@@ -436,21 +930,16 @@ class MujocoEngine(engine.Engine):
         return self._ground_contact_forces[obj_id]
 
     def set_root_pos(self, env_id, obj_id, root_pos):
-        meta = self._obj_metas[obj_id]
         root_pos = _as_torch(root_pos, self._device)
-
-        if (meta.mocap_id is not None):
-            _assign_env_tensor(self._torch_mocap_pos[:, meta.mocap_id, :], env_id, root_pos)
-        elif (len(meta.root_qpos_ids) > 0):
-            target = self._torch_qpos[:, meta.root_qpos_ids[0]:meta.root_qpos_ids[0] + 3]
-            _assign_env_tensor(target, env_id, root_pos)
-
+        _assign_env_tensor(self._sim_state.root_pos[obj_id], env_id, root_pos)
         self._state_dirty = True
         return
 
     def set_root_rot(self, env_id, obj_id, root_rot):
         meta = self._obj_metas[obj_id]
-        root_rot = _quat_xyzw_to_wxyz(_as_torch(root_rot, self._device))
+        root_rot = _as_torch(root_rot, self._device)
+        _assign_env_tensor(self._sim_state.root_rot[obj_id], env_id, root_rot)
+        root_rot = _quat_xyzw_to_wxyz(root_rot)
 
         if (meta.mocap_id is not None):
             _assign_env_tensor(self._torch_mocap_quat[:, meta.mocap_id, :], env_id, root_rot)
@@ -464,12 +953,11 @@ class MujocoEngine(engine.Engine):
     def set_root_vel(self, env_id, obj_id, root_vel):
         meta = self._obj_metas[obj_id]
         root_vel = _as_torch(root_vel, self._device)
+        _assign_env_tensor(self._sim_state.root_vel[obj_id], env_id, root_vel)
 
         if (len(meta.root_qvel_ids) > 0):
             target = self._torch_qvel[:, meta.root_qvel_ids[0]:meta.root_qvel_ids[0] + 3]
             _assign_env_tensor(target, env_id, root_vel)
-        else:
-            _assign_env_tensor(self._root_vel_cache[obj_id], env_id, root_vel)
 
         self._state_dirty = True
         return
@@ -477,6 +965,7 @@ class MujocoEngine(engine.Engine):
     def set_root_ang_vel(self, env_id, obj_id, root_ang_vel):
         meta = self._obj_metas[obj_id]
         root_ang_vel = _as_torch(root_ang_vel, self._device)
+        _assign_env_tensor(self._sim_state.root_ang_vel[obj_id], env_id, root_ang_vel)
 
         if (len(meta.root_qvel_ids) > 0):
             root_rot = self.get_root_rot(obj_id)
@@ -496,35 +985,44 @@ class MujocoEngine(engine.Engine):
                 env_rot = root_rot[env_id]
                 ang_vel_b = torch_util.quat_rotate(torch_util.quat_conjugate(env_rot), root_ang_vel)
                 self._torch_qvel[env_id, meta.root_qvel_ids[0] + 3:meta.root_qvel_ids[0] + 6] = ang_vel_b
-        else:
-            _assign_env_tensor(self._root_ang_vel_cache[obj_id], env_id, root_ang_vel)
 
         self._state_dirty = True
         return
 
     def set_dof_pos(self, env_id, obj_id, dof_pos):
-        self._write_dof_pos(self._obj_metas[obj_id], env_id, _as_torch(dof_pos, self._device))
+        dof_pos = _as_torch(dof_pos, self._device)
+        _assign_env_tensor(self._sim_state.dof_pos[obj_id], env_id, dof_pos)
+        self._write_dof_pos(self._obj_metas[obj_id], env_id, dof_pos)
         self._state_dirty = True
         return
 
     def set_dof_vel(self, env_id, obj_id, dof_vel):
         meta = self._obj_metas[obj_id]
         dof_vel = _as_torch(dof_vel, self._device)
+        _assign_env_tensor(self._sim_state.dof_vel[obj_id], env_id, dof_vel)
         if (len(meta.qvel_ids) > 0):
             _assign_indexed_cols(self._torch_qvel, meta.qvel_ids, env_id, dof_vel)
         self._state_dirty = True
         return
 
     def set_body_pos(self, env_id, obj_id, body_pos):
+        body_pos = _as_torch(body_pos, self._device)
+        _assign_env_tensor(self._sim_state.body_pos[obj_id], env_id, body_pos)
         return
 
     def set_body_rot(self, env_id, obj_id, body_rot):
+        body_rot = _as_torch(body_rot, self._device)
+        _assign_env_tensor(self._sim_state.body_rot[obj_id], env_id, body_rot)
         return
 
     def set_body_vel(self, env_id, obj_id, body_vel):
+        body_vel = _as_torch(body_vel, self._device)
+        _assign_env_tensor(self._sim_state.body_vel[obj_id], env_id, body_vel)
         return
 
     def set_body_ang_vel(self, env_id, obj_id, body_ang_vel):
+        body_ang_vel = _as_torch(body_ang_vel, self._device)
+        _assign_env_tensor(self._sim_state.body_ang_vel[obj_id], env_id, body_ang_vel)
         return
 
     def set_body_forces(self, env_id, obj_id, body_id, forces):
@@ -909,41 +1407,28 @@ class MujocoEngine(engine.Engine):
         return
 
     def _build_sim_tensors(self):
-        self._torch_qpos = self._to_torch(self._wp_data.qpos)
-        self._torch_qvel = self._to_torch(self._wp_data.qvel)
-        self._torch_qfrc_applied = self._to_torch(self._wp_data.qfrc_applied)
-        self._torch_xfrc_applied = self._to_torch(self._wp_data.xfrc_applied)
-        self._torch_ctrl = self._to_torch(self._wp_data.ctrl)
-        self._torch_mocap_pos = self._to_torch(self._wp_data.mocap_pos)
-        self._torch_mocap_quat = self._to_torch(self._wp_data.mocap_quat)
-        self._torch_xpos = self._to_torch(self._wp_data.xpos)
-        self._torch_xquat = self._to_torch(self._wp_data.xquat)
-        self._torch_cvel = self._to_torch(self._wp_data.cvel)
-        self._torch_subtree_com = self._to_torch(self._wp_data.subtree_com)
-
-        self._empty_dof_tensor = torch.zeros([self.get_num_envs(), 0], device=self._device, dtype=torch.float32)
-        self._root_vel_cache = []
-        self._root_ang_vel_cache = []
-        self._cmds = []
-        self._dof_forces = []
-
-        for meta in self._obj_metas:
-            num_dofs = len(meta.qvel_ids)
-            self._root_vel_cache.append(torch.zeros([self.get_num_envs(), 3], device=self._device, dtype=torch.float32))
-            self._root_ang_vel_cache.append(torch.zeros([self.get_num_envs(), 3], device=self._device, dtype=torch.float32))
-            self._cmds.append(torch.zeros([self.get_num_envs(), num_dofs], device=self._device, dtype=torch.float32))
-            self._dof_forces.append(torch.zeros([self.get_num_envs(), num_dofs], device=self._device, dtype=torch.float32))
+        self._sim_state = SimState(self)
+        self._torch_qpos = self._sim_state._torch_qpos
+        self._torch_qvel = self._sim_state._torch_qvel
+        self._torch_qfrc_applied = self._sim_state._torch_qfrc_applied
+        self._torch_xfrc_applied = self._sim_state._torch_xfrc_applied
+        self._torch_ctrl = self._sim_state._torch_ctrl
+        self._torch_mocap_pos = self._sim_state._torch_mocap_pos
+        self._torch_mocap_quat = self._sim_state._torch_mocap_quat
+        self._torch_xpos = self._sim_state._torch_xpos
+        self._torch_xquat = self._sim_state._torch_xquat
+        self._torch_cvel = self._sim_state._torch_cvel
+        self._torch_subtree_com = self._sim_state._torch_subtree_com
+        self._cmds = self._sim_state.cmd
 
         self._torch_qfrc_applied.zero_()
         self._torch_xfrc_applied.zero_()
         if (self._torch_ctrl.numel() > 0):
             self._torch_ctrl.zero_()
+        self._sim_state.post_step_update()
         return
 
-    def _to_torch(self, wp_array):
-        return self._wp.to_torch(wp_array)
-
-    def _apply_start_states(self):
+    def _apply_start_xform(self):
         num_envs = self.get_num_envs()
         for env_id in range(num_envs):
             for obj_id in range(self.get_objs_per_env()):
@@ -988,55 +1473,73 @@ class MujocoEngine(engine.Engine):
         return
 
     def _apply_cmd(self):
-        self._torch_qfrc_applied.zero_()
+        if (self._mj_model.nv > 0):
+            self._wp.launch(
+                kernel=self._kernels["clear_qfrc"],
+                dim=self.get_num_envs() * self._mj_model.nv,
+                inputs=[self._wp_data.qfrc_applied, self._mj_model.nv],
+                device=self._wp_device,
+            )
 
         if (self._control_mode == engine.ControlMode.none):
             return
 
-        for obj_id, meta in enumerate(self._obj_metas):
-            if (meta.obj_def.disable_motors or len(meta.qvel_ids) == 0):
-                continue
-
-            cmd = self._cmds[obj_id]
-            dof_vel = self._torch_qvel[:, meta.qvel_ids]
-            kp = torch.tensor(meta.kp, device=self._device, dtype=torch.float32)
-            kd = torch.tensor(meta.kd, device=self._device, dtype=torch.float32)
-            torque_lim = torch.tensor(meta.torque_lim, device=self._device, dtype=torch.float32)
-
-            if (self._control_mode == engine.ControlMode.pos):
-                dof_pos = self._read_dof_pos(meta)
-                torque = kp * (cmd - dof_pos) - kd * dof_vel
-            elif (self._control_mode == engine.ControlMode.vel):
-                torque = kd * (cmd - dof_vel)
-            elif (self._control_mode == engine.ControlMode.torque):
-                torque = cmd
-            elif (self._control_mode == engine.ControlMode.pd_explicit):
-                dof_pos = self._read_dof_pos(meta)
-                torque = kp * (cmd - dof_pos) - kd * dof_vel
-            else:
-                assert(False), "Unsupported control mode: {}".format(self._control_mode)
-
-            torque = torch.clip(torque, -torque_lim, torque_lim)
-            self._torch_qfrc_applied[:, meta.qvel_ids] = torque
-            self._dof_forces[obj_id][:] = torque
+        if (self._sim_state._num_dofs > 0):
+            self._wp.launch(
+                kernel=self._kernels["apply_control"],
+                dim=self.get_num_envs() * self._sim_state._num_dofs,
+                inputs=[
+                    self._wp_data.qpos,
+                    self._wp_data.qvel,
+                    self._sim_state._wp_cmd,
+                    self._sim_state._wp_dof_qpos_start,
+                    self._sim_state._wp_dof_qpos_kind,
+                    self._sim_state._wp_dof_qpos_comp,
+                    self._sim_state._wp_control_qvel_id,
+                    self._sim_state._wp_kp,
+                    self._sim_state._wp_kd,
+                    self._sim_state._wp_torque_lim,
+                    self._wp_data.qfrc_applied,
+                    self._sim_state._wp_dof_force,
+                    self._control_mode.value,
+                    self._sim_state._num_dofs,
+                ],
+                device=self._wp_device,
+            )
         return
 
-    def _read_dof_pos(self, meta):
-        if (len(meta.qvel_ids) == 0):
-            return self._empty_dof_tensor
+    def _build_graphs(self):
+        self._graph = None
 
-        out = torch.zeros([self.get_num_envs(), len(meta.qvel_ids)], device=self._device, dtype=torch.float32)
+        if (not self._wp_device.is_cuda):
+            return
 
-        if (len(meta.hinge_dof_ids) > 0):
-            local_ids = [meta.qvel_ids.index(i) for i in meta.hinge_dof_ids]
-            out[:, local_ids] = self._torch_qpos[:, meta.hinge_qpos_ids]
+        try:
+            with self._wp.ScopedDevice(self._wp_device):
+                with self._wp.ScopedCapture() as capture:
+                    self._simulate()
+            self._graph = capture.graph
+        except Exception as e:
+            Logger.print("MuJoCo Warp graph capture disabled: {}".format(e))
+            self._graph = None
+        return
 
-        for qpos_start, dof_start in zip(meta.ball_qpos_ids, meta.ball_dof_ids):
-            local_start = meta.qvel_ids.index(dof_start)
-            quat_xyzw = _quat_wxyz_to_xyzw(self._torch_qpos[:, qpos_start:qpos_start + 4])
-            out[:, local_start:local_start + 3] = torch_util.quat_to_exp_map(quat_xyzw)
+    def _simulate(self):
+        self._sim_state.pre_step_update()
 
-        return out
+        for _ in range(self._sim_steps):
+            self._pre_sim_step()
+            with self._wp.ScopedDevice(self._wp_device):
+                self._mjwarp.step(self._wp_model, self._wp_data)
+
+        self._sim_state.post_step_update()
+        self._update_contact_forces()
+        self._state_dirty = False
+        return
+
+    def _pre_sim_step(self):
+        self._apply_cmd()
+        return
 
     def _write_dof_pos(self, meta, env_id, dof_pos):
         if (len(meta.qvel_ids) == 0):
@@ -1055,8 +1558,10 @@ class MujocoEngine(engine.Engine):
         return
 
     def _forward(self):
+        self._sim_state.pre_step_update()
         with self._wp.ScopedDevice(self._wp_device):
             self._mjwarp.forward(self._wp_model, self._wp_data)
+        self._sim_state.post_step_update()
         self._state_dirty = False
         return
 
@@ -1083,9 +1588,8 @@ class MujocoEngine(engine.Engine):
             self._wp_contact_spatial,
         )
 
-        kernel = _build_warp_kernels()
         self._wp.launch(
-            kernel=kernel,
+            kernel=self._kernels["accumulate_contact"],
             dim=self._wp_data.naconmax,
             inputs=[
                 self._wp_data.contact.worldid,
@@ -1272,20 +1776,8 @@ def _joint_qpos_width(mujoco, joint_type):
     assert(False), "Unsupported MuJoCo joint type: {}".format(joint_type)
 
 
-def _quat_wxyz_to_xyzw(q):
-    return torch.cat([q[..., 1:4], q[..., 0:1]], dim=-1)
-
-
 def _quat_xyzw_to_wxyz(q):
     return torch.cat([q[..., 3:4], q[..., 0:3]], dim=-1)
-
-
-def _compute_velocity_from_cvel(pos, subtree_com, cvel):
-    lin_vel_c = cvel[..., 3:6]
-    ang_vel_c = cvel[..., 0:3]
-    offset = subtree_com - pos
-    lin_vel_w = lin_vel_c - torch.cross(ang_vel_c, offset, dim=-1)
-    return torch.cat([lin_vel_w, ang_vel_c], dim=-1)
 
 
 def _as_torch(x, device):
