@@ -16,453 +16,417 @@ from util.logger import Logger
 import util.torch_util as torch_util
 
 
-_warp_kernels = None
-
-
 wp.config.enable_backward = False
 
 
-def _build_warp_kernels():
-    global _warp_kernels
+@wp.func
+def quat_wxyz_to_exp_map(q: wp.quat):
+    min_theta = 1e-5
 
-    if (_warp_kernels is not None):
-        return _warp_kernels
+    w = q[0]
+    axis = wp.vec3f(q[1], q[2], q[3])
+    if (w < 0.0):
+        w = -w
+        axis = -axis
 
-    @wp.func
-    def quat_wxyz_to_exp_map(q: wp.quat):
-        min_theta = 1e-5
+    sin_angle = wp.length(axis)
+    angle = 2.0 * wp.atan2(sin_angle, w)
 
-        w = q[0]
-        axis = wp.vec3f(q[1], q[2], q[3])
-        if (w < 0.0):
-            w = -w
-            axis = -axis
-
-        sin_angle = wp.length(axis)
-        angle = 2.0 * wp.atan2(sin_angle, w)
-
-        if (sin_angle > min_theta):
-            axis = axis / sin_angle
-        else:
-            axis = wp.vec3f(0.0, 0.0, 1.0)
-            angle = 0.0
-
-        return axis * angle
-
-    @wp.func
-    def exp_map_to_quat_wxyz(exp_map: wp.vec3f):
-        min_theta = 1e-5
-
-        angle = wp.length(exp_map)
+    if (sin_angle > min_theta):
+        axis = axis / sin_angle
+    else:
         axis = wp.vec3f(0.0, 0.0, 1.0)
-        if (wp.abs(angle) > min_theta):
-            axis = exp_map / angle
-            angle = wp.atan2(wp.sin(angle), wp.cos(angle))
-        else:
-            angle = 0.0
+        angle = 0.0
 
-        s = wp.sin(0.5 * angle)
-        c = wp.cos(0.5 * angle)
-        return wp.quat(c, axis[0] * s, axis[1] * s, axis[2] * s)
+    return axis * angle
 
-    @wp.func
-    def rot_vec_quat_wxyz(vec: wp.vec3f, quat: wp.quat):
-        s = quat[0]
-        u = wp.vec3f(quat[1], quat[2], quat[3])
-        r = 2.0 * (wp.dot(u, vec) * u) + (s * s - wp.dot(u, u)) * vec
-        r = r + 2.0 * s * wp.cross(u, vec)
-        return r
+@wp.func
+def exp_map_to_quat_wxyz(exp_map: wp.vec3f):
+    min_theta = 1e-5
 
-    @wp.kernel
-    def update_dof_state_kernel(qpos: wp.array2d(dtype=float),
-                                qvel: wp.array2d(dtype=float),
-                                dof_qpos_start: wp.array(dtype=int),
-                                dof_qpos_kind: wp.array(dtype=int),
-                                dof_qpos_comp: wp.array(dtype=int),
-                                dof_qvel_id: wp.array(dtype=int),
-                                dof_pos: wp.array2d(dtype=float),
-                                dof_vel: wp.array2d(dtype=float),
-                                num_dofs: int):
-        tid = wp.tid()
-        world_id = tid // num_dofs
-        dof_id = tid - world_id * num_dofs
+    angle = wp.length(exp_map)
+    axis = wp.vec3f(0.0, 0.0, 1.0)
+    if (wp.abs(angle) > min_theta):
+        axis = exp_map / angle
+        angle = wp.atan2(wp.sin(angle), wp.cos(angle))
+    else:
+        angle = 0.0
 
-        qvel_id = dof_qvel_id[dof_id]
-        if (qvel_id >= 0):
-            dof_vel[world_id, dof_id] = qvel[world_id, qvel_id]
+    s = wp.sin(0.5 * angle)
+    c = wp.cos(0.5 * angle)
+    return wp.quat(c, axis[0] * s, axis[1] * s, axis[2] * s)
 
+@wp.func
+def rot_vec_quat_wxyz(vec: wp.vec3f, quat: wp.quat):
+    s = quat[0]
+    u = wp.vec3f(quat[1], quat[2], quat[3])
+    r = 2.0 * (wp.dot(u, vec) * u) + (s * s - wp.dot(u, u)) * vec
+    r = r + 2.0 * s * wp.cross(u, vec)
+    return r
+
+@wp.kernel
+def update_dof_state_kernel(qpos: wp.array2d(dtype=float),
+                            qvel: wp.array2d(dtype=float),
+                            dof_qpos_start: wp.array(dtype=int),
+                            dof_qpos_kind: wp.array(dtype=int),
+                            dof_qpos_comp: wp.array(dtype=int),
+                            dof_qvel_id: wp.array(dtype=int),
+                            dof_pos: wp.array2d(dtype=float),
+                            dof_vel: wp.array2d(dtype=float),
+                            num_dofs: int):
+    tid = wp.tid()
+    world_id = tid // num_dofs
+    dof_id = tid - world_id * num_dofs
+
+    qvel_id = dof_qvel_id[dof_id]
+    if (qvel_id >= 0):
+        dof_vel[world_id, dof_id] = qvel[world_id, qvel_id]
+
+    qpos_start = dof_qpos_start[dof_id]
+    qpos_kind = dof_qpos_kind[dof_id]
+    if (qpos_start < 0):
+        return
+
+    if (qpos_kind == 0):
+        dof_pos[world_id, dof_id] = qpos[world_id, qpos_start]
+    else:
+        q = wp.quat(qpos[world_id, qpos_start],
+                    qpos[world_id, qpos_start + 1],
+                    qpos[world_id, qpos_start + 2],
+                    qpos[world_id, qpos_start + 3])
+        exp_map = quat_wxyz_to_exp_map(q)
+        comp = dof_qpos_comp[dof_id]
+        dof_pos[world_id, dof_id] = exp_map[comp]
+    return
+
+@wp.kernel
+def write_dof_pos_kernel(dof_pos: wp.array2d(dtype=float),
+                         qpos: wp.array2d(dtype=float),
+                         dof_qpos_start: wp.array(dtype=int),
+                         dof_qpos_kind: wp.array(dtype=int),
+                         dof_qpos_comp: wp.array(dtype=int),
+                         num_dofs: int):
+    tid = wp.tid()
+    world_id = tid // num_dofs
+    dof_id = tid - world_id * num_dofs
+
+    qpos_start = dof_qpos_start[dof_id]
+    if (qpos_start < 0):
+        return
+
+    qpos_kind = dof_qpos_kind[dof_id]
+    if (qpos_kind == 0):
+        qpos[world_id, qpos_start] = dof_pos[world_id, dof_id]
+    elif (dof_qpos_comp[dof_id] == 0):
+        exp_map = wp.vec3f(dof_pos[world_id, dof_id],
+                           dof_pos[world_id, dof_id + 1],
+                           dof_pos[world_id, dof_id + 2])
+        q = exp_map_to_quat_wxyz(exp_map)
+        qpos[world_id, qpos_start] = q[0]
+        qpos[world_id, qpos_start + 1] = q[1]
+        qpos[world_id, qpos_start + 2] = q[2]
+        qpos[world_id, qpos_start + 3] = q[3]
+    return
+
+@wp.kernel
+def write_root_rot_kernel(root_rot: wp.array3d(dtype=float),
+                          qpos: wp.array2d(dtype=float),
+                          root_qpos_start: wp.array(dtype=int),
+                          num_objs: int):
+    tid = wp.tid()
+    world_id = tid // num_objs
+    obj_id = tid - world_id * num_objs
+
+    qpos_start = root_qpos_start[obj_id]
+    if (qpos_start >= 0):
+        qpos[world_id, qpos_start + 3] = root_rot[world_id, obj_id, 3]
+        qpos[world_id, qpos_start + 4] = root_rot[world_id, obj_id, 0]
+        qpos[world_id, qpos_start + 5] = root_rot[world_id, obj_id, 1]
+        qpos[world_id, qpos_start + 6] = root_rot[world_id, obj_id, 2]
+    return
+
+@wp.kernel
+def update_root_state_kernel(qpos: wp.array2d(dtype=float),
+                             qvel: wp.array2d(dtype=float),
+                             xquat: wp.array2d(dtype=wp.quat),
+                             root_qpos_start: wp.array(dtype=int),
+                             root_qvel_start: wp.array(dtype=int),
+                             root_body_id: wp.array(dtype=int),
+                             root_rot: wp.array3d(dtype=float),
+                             root_vel: wp.array3d(dtype=float),
+                             root_ang_vel: wp.array3d(dtype=float),
+                             num_objs: int):
+    tid = wp.tid()
+    world_id = tid // num_objs
+    obj_id = tid - world_id * num_objs
+
+    qpos_start = root_qpos_start[obj_id]
+    if (qpos_start >= 0):
+        qvel_start = root_qvel_start[obj_id]
+        q = wp.quat(qpos[world_id, qpos_start + 3],
+                    qpos[world_id, qpos_start + 4],
+                    qpos[world_id, qpos_start + 5],
+                    qpos[world_id, qpos_start + 6])
+
+        root_rot[world_id, obj_id, 0] = q[1]
+        root_rot[world_id, obj_id, 1] = q[2]
+        root_rot[world_id, obj_id, 2] = q[3]
+        root_rot[world_id, obj_id, 3] = q[0]
+
+        root_vel[world_id, obj_id, 0] = qvel[world_id, qvel_start]
+        root_vel[world_id, obj_id, 1] = qvel[world_id, qvel_start + 1]
+        root_vel[world_id, obj_id, 2] = qvel[world_id, qvel_start + 2]
+
+        ang_vel_b = wp.vec3f(qvel[world_id, qvel_start + 3],
+                             qvel[world_id, qvel_start + 4],
+                             qvel[world_id, qvel_start + 5])
+        ang_vel_w = rot_vec_quat_wxyz(ang_vel_b, q)
+        root_ang_vel[world_id, obj_id, 0] = ang_vel_w[0]
+        root_ang_vel[world_id, obj_id, 1] = ang_vel_w[1]
+        root_ang_vel[world_id, obj_id, 2] = ang_vel_w[2]
+    else:
+        body_id = root_body_id[obj_id]
+        q = xquat[world_id, body_id]
+        root_rot[world_id, obj_id, 0] = q[1]
+        root_rot[world_id, obj_id, 1] = q[2]
+        root_rot[world_id, obj_id, 2] = q[3]
+        root_rot[world_id, obj_id, 3] = q[0]
+
+        root_vel[world_id, obj_id, 0] = 0.0
+        root_vel[world_id, obj_id, 1] = 0.0
+        root_vel[world_id, obj_id, 2] = 0.0
+
+        root_ang_vel[world_id, obj_id, 0] = 0.0
+        root_ang_vel[world_id, obj_id, 1] = 0.0
+        root_ang_vel[world_id, obj_id, 2] = 0.0
+    return
+
+@wp.kernel
+def update_body_state_kernel(xpos: wp.array2d(dtype=wp.vec3),
+                             xquat: wp.array2d(dtype=wp.quat),
+                             cvel: wp.array2d(dtype=wp.spatial_vector),
+                             subtree_com: wp.array2d(dtype=wp.vec3),
+                             body_ids: wp.array(dtype=int),
+                             body_root_ids: wp.array(dtype=int),
+                             body_pos: wp.array3d(dtype=float),
+                             body_rot: wp.array3d(dtype=float),
+                             body_vel: wp.array3d(dtype=float),
+                             body_ang_vel: wp.array3d(dtype=float),
+                             num_bodies: int):
+    tid = wp.tid()
+    world_id = tid // num_bodies
+    local_body_id = tid - world_id * num_bodies
+
+    body_id = body_ids[local_body_id]
+    root_body_id = body_root_ids[local_body_id]
+
+    pos = xpos[world_id, body_id]
+    cvel_body = cvel[world_id, body_id]
+    ang_vel = wp.vec3f(cvel_body[0], cvel_body[1], cvel_body[2])
+    lin_vel_c = wp.vec3f(cvel_body[3], cvel_body[4], cvel_body[5])
+    com = subtree_com[world_id, root_body_id]
+    lin_vel = lin_vel_c - wp.cross(ang_vel, com - pos)
+    q = xquat[world_id, body_id]
+
+    body_pos[world_id, local_body_id, 0] = pos[0]
+    body_pos[world_id, local_body_id, 1] = pos[1]
+    body_pos[world_id, local_body_id, 2] = pos[2]
+
+    body_rot[world_id, local_body_id, 0] = q[1]
+    body_rot[world_id, local_body_id, 1] = q[2]
+    body_rot[world_id, local_body_id, 2] = q[3]
+    body_rot[world_id, local_body_id, 3] = q[0]
+
+    body_vel[world_id, local_body_id, 0] = lin_vel[0]
+    body_vel[world_id, local_body_id, 1] = lin_vel[1]
+    body_vel[world_id, local_body_id, 2] = lin_vel[2]
+
+    body_ang_vel[world_id, local_body_id, 0] = ang_vel[0]
+    body_ang_vel[world_id, local_body_id, 1] = ang_vel[1]
+    body_ang_vel[world_id, local_body_id, 2] = ang_vel[2]
+    return
+
+@wp.kernel
+def apply_control_kernel(qpos: wp.array2d(dtype=float),
+                         qvel: wp.array2d(dtype=float),
+                         cmd: wp.array2d(dtype=float),
+                         dof_qpos_start: wp.array(dtype=int),
+                         dof_qpos_kind: wp.array(dtype=int),
+                         dof_qpos_comp: wp.array(dtype=int),
+                         dof_qvel_id: wp.array(dtype=int),
+                         kp: wp.array(dtype=float),
+                         kd: wp.array(dtype=float),
+                         torque_lim: wp.array(dtype=float),
+                         qfrc_applied: wp.array2d(dtype=float),
+                         dof_force: wp.array2d(dtype=float),
+                         control_mode: int,
+                         num_dofs: int):
+    tid = wp.tid()
+    world_id = tid // num_dofs
+    dof_id = tid - world_id * num_dofs
+
+    qvel_id = dof_qvel_id[dof_id]
+    if (qvel_id < 0):
+        return
+
+    cmd_val = cmd[world_id, dof_id]
+    qvel_val = qvel[world_id, qvel_id]
+    torque = 0.0
+
+    if (control_mode == 1 or control_mode == 4):
         qpos_start = dof_qpos_start[dof_id]
         qpos_kind = dof_qpos_kind[dof_id]
-        if (qpos_start < 0):
-            return
-
+        dof_val = 0.0
         if (qpos_kind == 0):
-            dof_pos[world_id, dof_id] = qpos[world_id, qpos_start]
+            dof_val = qpos[world_id, qpos_start]
         else:
             q = wp.quat(qpos[world_id, qpos_start],
                         qpos[world_id, qpos_start + 1],
                         qpos[world_id, qpos_start + 2],
                         qpos[world_id, qpos_start + 3])
             exp_map = quat_wxyz_to_exp_map(q)
-            comp = dof_qpos_comp[dof_id]
-            dof_pos[world_id, dof_id] = exp_map[comp]
+            dof_val = exp_map[dof_qpos_comp[dof_id]]
+        torque = kp[dof_id] * (cmd_val - dof_val) - kd[dof_id] * qvel_val
+    elif (control_mode == 2):
+        torque = kd[dof_id] * (cmd_val - qvel_val)
+    elif (control_mode == 3):
+        torque = cmd_val
+
+    limit = torque_lim[dof_id]
+    torque = wp.clamp(torque, -limit, limit)
+    qfrc_applied[world_id, qvel_id] = torque
+    dof_force[world_id, dof_id] = torque
+    return
+
+@wp.kernel
+def write_ctrl_kernel(cmd: wp.array2d(dtype=float),
+                      dof_actuator_id: wp.array(dtype=int),
+                      ctrl: wp.array2d(dtype=float),
+                      num_dofs: int):
+    tid = wp.tid()
+    world_id = tid // num_dofs
+    dof_id = tid - world_id * num_dofs
+
+    actuator_id = dof_actuator_id[dof_id]
+    if (actuator_id >= 0):
+        ctrl[world_id, actuator_id] = cmd[world_id, dof_id]
+    return
+
+@wp.kernel
+def update_actuator_force_kernel(actuator_force: wp.array2d(dtype=float),
+                                 dof_actuator_id: wp.array(dtype=int),
+                                 dof_force: wp.array2d(dtype=float),
+                                 num_dofs: int):
+    tid = wp.tid()
+    world_id = tid // num_dofs
+    dof_id = tid - world_id * num_dofs
+
+    actuator_id = dof_actuator_id[dof_id]
+    if (actuator_id >= 0):
+        dof_force[world_id, dof_id] = actuator_force[world_id, actuator_id]
+    return
+
+@wp.kernel
+def accumulate_contact_kernel(contact_worldid: wp.array(dtype=int),
+                              contact_geom: wp.array(dtype=wp.vec2i),
+                              contact_type: wp.array(dtype=int),
+                              contact_force: wp.array(dtype=wp.spatial_vector),
+                              nacon: wp.array(dtype=int),
+                              geom_bodyid: wp.array(dtype=int),
+                              body_obj_id: wp.array(dtype=int),
+                              body_local_id: wp.array(dtype=int),
+                              total_forces: wp.array4d(dtype=float),
+                              ground_forces: wp.array4d(dtype=float)):
+    contact_id = wp.tid()
+
+    if (contact_id >= nacon[0]):
         return
 
-    @wp.kernel
-    def write_dof_pos_kernel(dof_pos: wp.array2d(dtype=float),
-                             qpos: wp.array2d(dtype=float),
-                             dof_qpos_start: wp.array(dtype=int),
-                             dof_qpos_kind: wp.array(dtype=int),
-                             dof_qpos_comp: wp.array(dtype=int),
-                             num_dofs: int):
-        tid = wp.tid()
-        world_id = tid // num_dofs
-        dof_id = tid - world_id * num_dofs
-
-        qpos_start = dof_qpos_start[dof_id]
-        if (qpos_start < 0):
-            return
-
-        qpos_kind = dof_qpos_kind[dof_id]
-        if (qpos_kind == 0):
-            qpos[world_id, qpos_start] = dof_pos[world_id, dof_id]
-        elif (dof_qpos_comp[dof_id] == 0):
-            exp_map = wp.vec3f(dof_pos[world_id, dof_id],
-                               dof_pos[world_id, dof_id + 1],
-                               dof_pos[world_id, dof_id + 2])
-            q = exp_map_to_quat_wxyz(exp_map)
-            qpos[world_id, qpos_start] = q[0]
-            qpos[world_id, qpos_start + 1] = q[1]
-            qpos[world_id, qpos_start + 2] = q[2]
-            qpos[world_id, qpos_start + 3] = q[3]
+    # ContactType.CONSTRAINT == 1 in mujoco_warp.
+    if ((contact_type[contact_id] & 1) == 0):
         return
 
-    @wp.kernel
-    def write_root_rot_kernel(root_rot: wp.array3d(dtype=float),
-                              qpos: wp.array2d(dtype=float),
-                              root_qpos_start: wp.array(dtype=int),
-                              num_objs: int):
-        tid = wp.tid()
-        world_id = tid // num_objs
-        obj_id = tid - world_id * num_objs
-
-        qpos_start = root_qpos_start[obj_id]
-        if (qpos_start >= 0):
-            qpos[world_id, qpos_start + 3] = root_rot[world_id, obj_id, 3]
-            qpos[world_id, qpos_start + 4] = root_rot[world_id, obj_id, 0]
-            qpos[world_id, qpos_start + 5] = root_rot[world_id, obj_id, 1]
-            qpos[world_id, qpos_start + 6] = root_rot[world_id, obj_id, 2]
+    geom_pair = contact_geom[contact_id]
+    geom0 = geom_pair[0]
+    geom1 = geom_pair[1]
+    if (geom0 < 0 or geom1 < 0):
         return
 
-    @wp.kernel
-    def update_root_state_kernel(qpos: wp.array2d(dtype=float),
-                                 qvel: wp.array2d(dtype=float),
-                                 xquat: wp.array2d(dtype=wp.quat),
-                                 root_qpos_start: wp.array(dtype=int),
-                                 root_qvel_start: wp.array(dtype=int),
-                                 root_body_id: wp.array(dtype=int),
-                                 root_rot: wp.array3d(dtype=float),
-                                 root_vel: wp.array3d(dtype=float),
-                                 root_ang_vel: wp.array3d(dtype=float),
-                                 num_objs: int):
-        tid = wp.tid()
-        world_id = tid // num_objs
-        obj_id = tid - world_id * num_objs
+    world_id = contact_worldid[contact_id]
+    body0 = geom_bodyid[geom0]
+    body1 = geom_bodyid[geom1]
+    obj0 = body_obj_id[body0]
+    obj1 = body_obj_id[body1]
+    local0 = body_local_id[body0]
+    local1 = body_local_id[body1]
 
-        qpos_start = root_qpos_start[obj_id]
-        if (qpos_start >= 0):
-            qvel_start = root_qvel_start[obj_id]
-            q = wp.quat(qpos[world_id, qpos_start + 3],
-                        qpos[world_id, qpos_start + 4],
-                        qpos[world_id, qpos_start + 5],
-                        qpos[world_id, qpos_start + 6])
+    frc = wp.spatial_top(contact_force[contact_id])
 
-            root_rot[world_id, obj_id, 0] = q[1]
-            root_rot[world_id, obj_id, 1] = q[2]
-            root_rot[world_id, obj_id, 2] = q[3]
-            root_rot[world_id, obj_id, 3] = q[0]
+    if (obj0 >= 0 and local0 >= 0):
+        wp.atomic_add(total_forces, obj0, world_id, local0, 0, frc[0])
+        wp.atomic_add(total_forces, obj0, world_id, local0, 1, frc[1])
+        wp.atomic_add(total_forces, obj0, world_id, local0, 2, frc[2])
 
-            root_vel[world_id, obj_id, 0] = qvel[world_id, qvel_start]
-            root_vel[world_id, obj_id, 1] = qvel[world_id, qvel_start + 1]
-            root_vel[world_id, obj_id, 2] = qvel[world_id, qvel_start + 2]
+    if (obj1 >= 0 and local1 >= 0):
+        wp.atomic_add(total_forces, obj1, world_id, local1, 0, -frc[0])
+        wp.atomic_add(total_forces, obj1, world_id, local1, 1, -frc[1])
+        wp.atomic_add(total_forces, obj1, world_id, local1, 2, -frc[2])
 
-            ang_vel_b = wp.vec3f(qvel[world_id, qvel_start + 3],
-                                 qvel[world_id, qvel_start + 4],
-                                 qvel[world_id, qvel_start + 5])
-            ang_vel_w = rot_vec_quat_wxyz(ang_vel_b, q)
-            root_ang_vel[world_id, obj_id, 0] = ang_vel_w[0]
-            root_ang_vel[world_id, obj_id, 1] = ang_vel_w[1]
-            root_ang_vel[world_id, obj_id, 2] = ang_vel_w[2]
-        else:
-            body_id = root_body_id[obj_id]
-            q = xquat[world_id, body_id]
-            root_rot[world_id, obj_id, 0] = q[1]
-            root_rot[world_id, obj_id, 1] = q[2]
-            root_rot[world_id, obj_id, 2] = q[3]
-            root_rot[world_id, obj_id, 3] = q[0]
+    if (body0 == 0 and obj1 >= 0 and local1 >= 0):
+        wp.atomic_add(ground_forces, obj1, world_id, local1, 0, -frc[0])
+        wp.atomic_add(ground_forces, obj1, world_id, local1, 1, -frc[1])
+        wp.atomic_add(ground_forces, obj1, world_id, local1, 2, -frc[2])
+    elif (body1 == 0 and obj0 >= 0 and local0 >= 0):
+        wp.atomic_add(ground_forces, obj0, world_id, local0, 0, frc[0])
+        wp.atomic_add(ground_forces, obj0, world_id, local0, 1, frc[1])
+        wp.atomic_add(ground_forces, obj0, world_id, local0, 2, frc[2])
 
-            root_vel[world_id, obj_id, 0] = 0.0
-            root_vel[world_id, obj_id, 1] = 0.0
-            root_vel[world_id, obj_id, 2] = 0.0
+    return
 
-            root_ang_vel[world_id, obj_id, 0] = 0.0
-            root_ang_vel[world_id, obj_id, 1] = 0.0
-            root_ang_vel[world_id, obj_id, 2] = 0.0
+@wp.kernel
+def accumulate_ground_contact_kernel(contact_worldid: wp.array(dtype=int),
+                                     contact_geom: wp.array(dtype=wp.vec2i),
+                                     contact_type: wp.array(dtype=int),
+                                     contact_force: wp.array(dtype=wp.spatial_vector),
+                                     nacon: wp.array(dtype=int),
+                                     geom_bodyid: wp.array(dtype=int),
+                                     body_obj_id: wp.array(dtype=int),
+                                     body_local_id: wp.array(dtype=int),
+                                     ground_forces: wp.array4d(dtype=float)):
+    contact_id = wp.tid()
+
+    if (contact_id >= nacon[0]):
         return
 
-    @wp.kernel
-    def update_body_state_kernel(xpos: wp.array2d(dtype=wp.vec3),
-                                 xquat: wp.array2d(dtype=wp.quat),
-                                 cvel: wp.array2d(dtype=wp.spatial_vector),
-                                 subtree_com: wp.array2d(dtype=wp.vec3),
-                                 body_ids: wp.array(dtype=int),
-                                 body_root_ids: wp.array(dtype=int),
-                                 body_pos: wp.array3d(dtype=float),
-                                 body_rot: wp.array3d(dtype=float),
-                                 body_vel: wp.array3d(dtype=float),
-                                 body_ang_vel: wp.array3d(dtype=float),
-                                 num_bodies: int):
-        tid = wp.tid()
-        world_id = tid // num_bodies
-        local_body_id = tid - world_id * num_bodies
-
-        body_id = body_ids[local_body_id]
-        root_body_id = body_root_ids[local_body_id]
-
-        pos = xpos[world_id, body_id]
-        cvel_body = cvel[world_id, body_id]
-        ang_vel = wp.vec3f(cvel_body[0], cvel_body[1], cvel_body[2])
-        lin_vel_c = wp.vec3f(cvel_body[3], cvel_body[4], cvel_body[5])
-        com = subtree_com[world_id, root_body_id]
-        lin_vel = lin_vel_c - wp.cross(ang_vel, com - pos)
-        q = xquat[world_id, body_id]
-
-        body_pos[world_id, local_body_id, 0] = pos[0]
-        body_pos[world_id, local_body_id, 1] = pos[1]
-        body_pos[world_id, local_body_id, 2] = pos[2]
-
-        body_rot[world_id, local_body_id, 0] = q[1]
-        body_rot[world_id, local_body_id, 1] = q[2]
-        body_rot[world_id, local_body_id, 2] = q[3]
-        body_rot[world_id, local_body_id, 3] = q[0]
-
-        body_vel[world_id, local_body_id, 0] = lin_vel[0]
-        body_vel[world_id, local_body_id, 1] = lin_vel[1]
-        body_vel[world_id, local_body_id, 2] = lin_vel[2]
-
-        body_ang_vel[world_id, local_body_id, 0] = ang_vel[0]
-        body_ang_vel[world_id, local_body_id, 1] = ang_vel[1]
-        body_ang_vel[world_id, local_body_id, 2] = ang_vel[2]
+    if ((contact_type[contact_id] & 1) == 0):
         return
 
-    @wp.kernel
-    def apply_control_kernel(qpos: wp.array2d(dtype=float),
-                             qvel: wp.array2d(dtype=float),
-                             cmd: wp.array2d(dtype=float),
-                             dof_qpos_start: wp.array(dtype=int),
-                             dof_qpos_kind: wp.array(dtype=int),
-                             dof_qpos_comp: wp.array(dtype=int),
-                             dof_qvel_id: wp.array(dtype=int),
-                             kp: wp.array(dtype=float),
-                             kd: wp.array(dtype=float),
-                             torque_lim: wp.array(dtype=float),
-                             qfrc_applied: wp.array2d(dtype=float),
-                             dof_force: wp.array2d(dtype=float),
-                             control_mode: int,
-                             num_dofs: int):
-        tid = wp.tid()
-        world_id = tid // num_dofs
-        dof_id = tid - world_id * num_dofs
-
-        qvel_id = dof_qvel_id[dof_id]
-        if (qvel_id < 0):
-            return
-
-        cmd_val = cmd[world_id, dof_id]
-        qvel_val = qvel[world_id, qvel_id]
-        torque = 0.0
-
-        if (control_mode == 1 or control_mode == 4):
-            qpos_start = dof_qpos_start[dof_id]
-            qpos_kind = dof_qpos_kind[dof_id]
-            dof_val = 0.0
-            if (qpos_kind == 0):
-                dof_val = qpos[world_id, qpos_start]
-            else:
-                q = wp.quat(qpos[world_id, qpos_start],
-                            qpos[world_id, qpos_start + 1],
-                            qpos[world_id, qpos_start + 2],
-                            qpos[world_id, qpos_start + 3])
-                exp_map = quat_wxyz_to_exp_map(q)
-                dof_val = exp_map[dof_qpos_comp[dof_id]]
-            torque = kp[dof_id] * (cmd_val - dof_val) - kd[dof_id] * qvel_val
-        elif (control_mode == 2):
-            torque = kd[dof_id] * (cmd_val - qvel_val)
-        elif (control_mode == 3):
-            torque = cmd_val
-
-        limit = torque_lim[dof_id]
-        torque = wp.clamp(torque, -limit, limit)
-        qfrc_applied[world_id, qvel_id] = torque
-        dof_force[world_id, dof_id] = torque
+    geom_pair = contact_geom[contact_id]
+    geom0 = geom_pair[0]
+    geom1 = geom_pair[1]
+    if (geom0 < 0 or geom1 < 0):
         return
 
-    @wp.kernel
-    def write_ctrl_kernel(cmd: wp.array2d(dtype=float),
-                          dof_actuator_id: wp.array(dtype=int),
-                          ctrl: wp.array2d(dtype=float),
-                          num_dofs: int):
-        tid = wp.tid()
-        world_id = tid // num_dofs
-        dof_id = tid - world_id * num_dofs
+    world_id = contact_worldid[contact_id]
+    body0 = geom_bodyid[geom0]
+    body1 = geom_bodyid[geom1]
+    obj0 = body_obj_id[body0]
+    obj1 = body_obj_id[body1]
+    local0 = body_local_id[body0]
+    local1 = body_local_id[body1]
 
-        actuator_id = dof_actuator_id[dof_id]
-        if (actuator_id >= 0):
-            ctrl[world_id, actuator_id] = cmd[world_id, dof_id]
-        return
+    frc = wp.spatial_top(contact_force[contact_id])
 
-    @wp.kernel
-    def update_actuator_force_kernel(actuator_force: wp.array2d(dtype=float),
-                                     dof_actuator_id: wp.array(dtype=int),
-                                     dof_force: wp.array2d(dtype=float),
-                                     num_dofs: int):
-        tid = wp.tid()
-        world_id = tid // num_dofs
-        dof_id = tid - world_id * num_dofs
+    if (body0 == 0 and obj1 >= 0 and local1 >= 0):
+        wp.atomic_add(ground_forces, obj1, world_id, local1, 0, -frc[0])
+        wp.atomic_add(ground_forces, obj1, world_id, local1, 1, -frc[1])
+        wp.atomic_add(ground_forces, obj1, world_id, local1, 2, -frc[2])
+    elif (body1 == 0 and obj0 >= 0 and local0 >= 0):
+        wp.atomic_add(ground_forces, obj0, world_id, local0, 0, frc[0])
+        wp.atomic_add(ground_forces, obj0, world_id, local0, 1, frc[1])
+        wp.atomic_add(ground_forces, obj0, world_id, local0, 2, frc[2])
 
-        actuator_id = dof_actuator_id[dof_id]
-        if (actuator_id >= 0):
-            dof_force[world_id, dof_id] = actuator_force[world_id, actuator_id]
-        return
-
-    @wp.kernel
-    def accumulate_contact_kernel(contact_worldid: wp.array(dtype=int),
-                                  contact_geom: wp.array(dtype=wp.vec2i),
-                                  contact_type: wp.array(dtype=int),
-                                  contact_force: wp.array(dtype=wp.spatial_vector),
-                                  nacon: wp.array(dtype=int),
-                                  geom_bodyid: wp.array(dtype=int),
-                                  body_obj_id: wp.array(dtype=int),
-                                  body_local_id: wp.array(dtype=int),
-                                  total_forces: wp.array4d(dtype=float),
-                                  ground_forces: wp.array4d(dtype=float)):
-        contact_id = wp.tid()
-
-        if (contact_id >= nacon[0]):
-            return
-
-        # ContactType.CONSTRAINT == 1 in mujoco_warp.
-        if ((contact_type[contact_id] & 1) == 0):
-            return
-
-        geom_pair = contact_geom[contact_id]
-        geom0 = geom_pair[0]
-        geom1 = geom_pair[1]
-        if (geom0 < 0 or geom1 < 0):
-            return
-
-        world_id = contact_worldid[contact_id]
-        body0 = geom_bodyid[geom0]
-        body1 = geom_bodyid[geom1]
-        obj0 = body_obj_id[body0]
-        obj1 = body_obj_id[body1]
-        local0 = body_local_id[body0]
-        local1 = body_local_id[body1]
-
-        frc = wp.spatial_top(contact_force[contact_id])
-
-        if (obj0 >= 0 and local0 >= 0):
-            wp.atomic_add(total_forces, obj0, world_id, local0, 0, frc[0])
-            wp.atomic_add(total_forces, obj0, world_id, local0, 1, frc[1])
-            wp.atomic_add(total_forces, obj0, world_id, local0, 2, frc[2])
-
-        if (obj1 >= 0 and local1 >= 0):
-            wp.atomic_add(total_forces, obj1, world_id, local1, 0, -frc[0])
-            wp.atomic_add(total_forces, obj1, world_id, local1, 1, -frc[1])
-            wp.atomic_add(total_forces, obj1, world_id, local1, 2, -frc[2])
-
-        if (body0 == 0 and obj1 >= 0 and local1 >= 0):
-            wp.atomic_add(ground_forces, obj1, world_id, local1, 0, -frc[0])
-            wp.atomic_add(ground_forces, obj1, world_id, local1, 1, -frc[1])
-            wp.atomic_add(ground_forces, obj1, world_id, local1, 2, -frc[2])
-        elif (body1 == 0 and obj0 >= 0 and local0 >= 0):
-            wp.atomic_add(ground_forces, obj0, world_id, local0, 0, frc[0])
-            wp.atomic_add(ground_forces, obj0, world_id, local0, 1, frc[1])
-            wp.atomic_add(ground_forces, obj0, world_id, local0, 2, frc[2])
-
-        return
-
-    @wp.kernel
-    def accumulate_ground_contact_kernel(contact_worldid: wp.array(dtype=int),
-                                         contact_geom: wp.array(dtype=wp.vec2i),
-                                         contact_type: wp.array(dtype=int),
-                                         contact_force: wp.array(dtype=wp.spatial_vector),
-                                         nacon: wp.array(dtype=int),
-                                         geom_bodyid: wp.array(dtype=int),
-                                         body_obj_id: wp.array(dtype=int),
-                                         body_local_id: wp.array(dtype=int),
-                                         ground_forces: wp.array4d(dtype=float)):
-        contact_id = wp.tid()
-
-        if (contact_id >= nacon[0]):
-            return
-
-        if ((contact_type[contact_id] & 1) == 0):
-            return
-
-        geom_pair = contact_geom[contact_id]
-        geom0 = geom_pair[0]
-        geom1 = geom_pair[1]
-        if (geom0 < 0 or geom1 < 0):
-            return
-
-        world_id = contact_worldid[contact_id]
-        body0 = geom_bodyid[geom0]
-        body1 = geom_bodyid[geom1]
-        obj0 = body_obj_id[body0]
-        obj1 = body_obj_id[body1]
-        local0 = body_local_id[body0]
-        local1 = body_local_id[body1]
-
-        frc = wp.spatial_top(contact_force[contact_id])
-
-        if (body0 == 0 and obj1 >= 0 and local1 >= 0):
-            wp.atomic_add(ground_forces, obj1, world_id, local1, 0, -frc[0])
-            wp.atomic_add(ground_forces, obj1, world_id, local1, 1, -frc[1])
-            wp.atomic_add(ground_forces, obj1, world_id, local1, 2, -frc[2])
-        elif (body1 == 0 and obj0 >= 0 and local0 >= 0):
-            wp.atomic_add(ground_forces, obj0, world_id, local0, 0, frc[0])
-            wp.atomic_add(ground_forces, obj0, world_id, local0, 1, frc[1])
-            wp.atomic_add(ground_forces, obj0, world_id, local0, 2, frc[2])
-
-        return
-
-    _warp_kernels = {
-        "update_dof_state": update_dof_state_kernel,
-        "write_dof_pos": write_dof_pos_kernel,
-        "write_root_rot": write_root_rot_kernel,
-        "update_root_state": update_root_state_kernel,
-        "update_body_state": update_body_state_kernel,
-        "apply_control": apply_control_kernel,
-        "write_ctrl": write_ctrl_kernel,
-        "update_actuator_force": update_actuator_force_kernel,
-        "accumulate_contact": accumulate_contact_kernel,
-        "accumulate_ground_contact": accumulate_ground_contact_kernel,
-    }
-    return _warp_kernels
-
-
-_WARP_KERNELS = _build_warp_kernels()
-update_dof_state_kernel = _WARP_KERNELS["update_dof_state"]
-write_dof_pos_kernel = _WARP_KERNELS["write_dof_pos"]
-write_root_rot_kernel = _WARP_KERNELS["write_root_rot"]
-update_root_state_kernel = _WARP_KERNELS["update_root_state"]
-update_body_state_kernel = _WARP_KERNELS["update_body_state"]
-apply_control_kernel = _WARP_KERNELS["apply_control"]
-write_ctrl_kernel = _WARP_KERNELS["write_ctrl"]
-update_actuator_force_kernel = _WARP_KERNELS["update_actuator_force"]
-accumulate_contact_kernel = _WARP_KERNELS["accumulate_contact"]
-accumulate_ground_contact_kernel = _WARP_KERNELS["accumulate_ground_contact"]
+    return
 
 
 @dataclass(frozen=True)
@@ -481,15 +445,11 @@ class ObjMeta:
     obj_def: ObjDef
     body_ids: list[int]
     body_names: list[str]
-    geom_ids: list[int]
-    joint_ids: list[int]
-    qpos_ids: list[int]
     qvel_ids: list[int]
     qvel_col_ids: torch.Tensor
     actuator_ids: list[int]
     hinge_qpos_ids: list[int]
     hinge_dof_ids: list[int]
-    hinge_local_ids: list[int]
     hinge_qpos_col_ids: torch.Tensor
     hinge_local_col_ids: torch.Tensor
     ball_qpos_ids: list[int]
@@ -513,15 +473,12 @@ class SimState:
 
         num_objs = len(obj_metas)
 
+        # MuJoCo stores each world in flat qpos/qvel/body arrays; expose
+        # Newton-style per-object tensor views for the rest of MimicKit.
         self._torch_qpos = wp.to_torch(self._wp_data.qpos)
         self._torch_qvel = wp.to_torch(self._wp_data.qvel)
-        self._torch_qfrc_applied = wp.to_torch(self._wp_data.qfrc_applied)
         self._torch_xfrc_applied = wp.to_torch(self._wp_data.xfrc_applied)
         self._torch_ctrl = wp.to_torch(self._wp_data.ctrl)
-        self._torch_xpos = wp.to_torch(self._wp_data.xpos)
-        self._torch_xquat = wp.to_torch(self._wp_data.xquat)
-        self._torch_cvel = wp.to_torch(self._wp_data.cvel)
-        self._torch_subtree_com = wp.to_torch(self._wp_data.subtree_com)
 
         total_bodies = sum(len(meta.body_ids) for meta in obj_metas)
         total_dofs = sum(len(meta.qvel_ids) for meta in obj_metas)
@@ -661,6 +618,7 @@ class SimState:
         return
 
     def pre_step_update(self):
+        # Push public root/DOF tensors back into MuJoCo qpos before stepping.
         if (self._num_objs > 0):
             wp.launch(
                 kernel=write_root_rot_kernel,
@@ -681,6 +639,8 @@ class SimState:
         return
 
     def post_step_update(self):
+        # Refresh the public tensors from MuJoCo-Warp after FK has updated
+        # body transforms, velocities, and quaternion-backed DOFs.
         if (self._num_objs > 0):
             wp.launch(
                 kernel=update_root_state_kernel,
@@ -716,10 +676,9 @@ class SimState:
 
 
 class Controls:
-    def __init__(self, wp_data, obj_metas, num_envs, device, wp_device, native_pos_control):
+    def __init__(self, obj_metas, num_envs, device, wp_device, native_pos_control):
         total_dofs = sum(len(meta.qvel_ids) for meta in obj_metas)
 
-        self._native_pos_control = native_pos_control
         self.target_pos = []
         self.target_vel = []
         self.joint_force = []
@@ -1218,6 +1177,8 @@ class MujocoEngine(engine.Engine):
         return
 
     def _build_model(self):
+        # Build one MuJoCo model for a single env layout. MuJoCo-Warp owns the
+        # replicated per-env data arrays, matching Newton's single model/many worlds flow.
         scene_spec = self._create_scene_spec()
         attached_specs = []
 
@@ -1279,6 +1240,7 @@ class MujocoEngine(engine.Engine):
         obj_spec = mujoco.MjSpec.from_file(obj_def.asset_file)
 
         if (obj_def.fix_root):
+            # Match the other engines: a fixed-root object simply has no free joint.
             for joint in list(obj_spec.joints):
                 if (int(joint.type) == int(mujoco.mjtJoint.mjJNT_FREE)):
                     obj_spec.delete(joint)
@@ -1341,6 +1303,7 @@ class MujocoEngine(engine.Engine):
         return
 
     def _build_obj_meta(self, obj_def, obj_spec, prefix):
+        # Translate MuJoCo ids/ranges into the per-object indexing used by the Engine API.
         body_ids = []
         body_names = []
         for body in obj_spec.bodies[1:]:
@@ -1353,7 +1316,6 @@ class MujocoEngine(engine.Engine):
             body_names = [obj_def.name]
 
         root_body_id = body_ids[0]
-        geom_ids = [int(geom.id) for geom in obj_spec.geoms]
         joint_ids = [int(joint.id) for joint in obj_spec.joints]
         joint_ids = [j for j in joint_ids
                      if int(self._mj_model.jnt_type[j]) != int(mujoco.mjtJoint.mjJNT_FREE)]
@@ -1370,7 +1332,6 @@ class MujocoEngine(engine.Engine):
             root_qpos_ids = []
             root_qvel_ids = []
 
-        qpos_ids = []
         qvel_ids = []
         actuator_ids = []
         hinge_qpos_ids = []
@@ -1387,10 +1348,9 @@ class MujocoEngine(engine.Engine):
             joint_type = int(self._mj_model.jnt_type[joint_id])
             qpos_start = int(self._mj_model.jnt_qposadr[joint_id])
             qvel_start = int(self._mj_model.jnt_dofadr[joint_id])
-            qpos_width = _joint_qpos_width(mujoco, joint_type)
-            dof_width = _joint_dof_width(mujoco, joint_type)
+            qpos_width = _joint_qpos_width(joint_type)
+            dof_width = _joint_dof_width(joint_type)
 
-            qpos_ids.extend(range(qpos_start, qpos_start + qpos_width))
             qvel_ids.extend(range(qvel_start, qvel_start + dof_width))
             joint_actuator_id = self._get_joint_actuator_id(joint_id) if dof_width == 1 else -1
             actuator_ids.extend([joint_actuator_id] * dof_width)
@@ -1415,26 +1375,22 @@ class MujocoEngine(engine.Engine):
             kd.extend(joint_kd.tolist())
             torque_lim.extend(joint_lim.tolist())
 
-        hinge_local_ids = [qvel_ids.index(i) for i in hinge_dof_ids]
         ball_local_starts = [qvel_ids.index(i) for i in ball_dof_ids]
         qvel_col_ids = torch.tensor(qvel_ids, device=self._device, dtype=torch.long)
         hinge_qpos_col_ids = torch.tensor(hinge_qpos_ids, device=self._device, dtype=torch.long)
-        hinge_local_col_ids = torch.tensor(hinge_local_ids, device=self._device, dtype=torch.long)
+        hinge_local_col_ids = torch.tensor([qvel_ids.index(i) for i in hinge_dof_ids],
+                                           device=self._device, dtype=torch.long)
 
         mass = float(np.sum(self._mj_model.body_mass[body_ids]))
 
         meta = ObjMeta(obj_def=obj_def,
                        body_ids=body_ids,
                        body_names=body_names,
-                       geom_ids=geom_ids,
-                       joint_ids=joint_ids,
-                       qpos_ids=qpos_ids,
                        qvel_ids=qvel_ids,
                        qvel_col_ids=qvel_col_ids,
                        actuator_ids=actuator_ids,
                        hinge_qpos_ids=hinge_qpos_ids,
                        hinge_dof_ids=hinge_dof_ids,
-                       hinge_local_ids=hinge_local_ids,
                        hinge_qpos_col_ids=hinge_qpos_col_ids,
                        hinge_local_col_ids=hinge_local_col_ids,
                        ball_qpos_ids=ball_qpos_ids,
@@ -1505,6 +1461,8 @@ class MujocoEngine(engine.Engine):
         if (not self._use_native_pos_control):
             return
 
+        # For the DeepMimic position-control path, let MuJoCo compute the PD
+        # actuator forces natively instead of launching an explicit torque kernel.
         for meta in self._obj_metas:
             for local_id, actuator_id in enumerate(meta.actuator_ids):
                 self._mj_model.actuator_gaintype[actuator_id] = int(mujoco.mjtGain.mjGAIN_FIXED)
@@ -1549,15 +1507,10 @@ class MujocoEngine(engine.Engine):
         self._sim_state = SimState(self._wp_data, self._obj_metas, self.get_num_envs(), self._device, self._wp_device)
         self._torch_qpos = self._sim_state._torch_qpos
         self._torch_qvel = self._sim_state._torch_qvel
-        self._torch_qfrc_applied = self._sim_state._torch_qfrc_applied
         self._torch_xfrc_applied = self._sim_state._torch_xfrc_applied
         self._torch_ctrl = self._sim_state._torch_ctrl
-        self._torch_xpos = self._sim_state._torch_xpos
-        self._torch_xquat = self._sim_state._torch_xquat
-        self._torch_cvel = self._sim_state._torch_cvel
-        self._torch_subtree_com = self._sim_state._torch_subtree_com
 
-        self._torch_qfrc_applied.zero_()
+        self._wp_data.qfrc_applied.zero_()
         self._torch_xfrc_applied.zero_()
         if (self._torch_ctrl.numel() > 0):
             self._torch_ctrl.zero_()
@@ -1566,7 +1519,7 @@ class MujocoEngine(engine.Engine):
 
     def _build_controls(self):
         num_envs = self.get_num_envs()
-        self._controls = Controls(self._wp_data, self._obj_metas, num_envs, self._device, self._wp_device,
+        self._controls = Controls(self._obj_metas, num_envs, self._device, self._wp_device,
                                   self._use_native_pos_control)
         return
 
@@ -1690,12 +1643,14 @@ class MujocoEngine(engine.Engine):
         return
 
     def _simulate(self):
+        # Keep the same high-level cadence as Newton: sync API tensors, apply
+        # controls each substep, step the solver, then refresh derived tensors.
         self._sim_state.pre_step_update()
         if (self._use_native_pos_control):
             self._write_native_ctrl()
 
         for _ in range(self._sim_steps):
-            self._pre_sim_step()
+            self._apply_cmd()
             with wp.ScopedDevice(self._wp_device):
                 mjwarp.step(self._wp_model, self._wp_data)
 
@@ -1705,10 +1660,6 @@ class MujocoEngine(engine.Engine):
         self._contact_forces_dirty = True
         self._ground_contact_forces_dirty = True
         self._state_dirty = False
-        return
-
-    def _pre_sim_step(self):
-        self._apply_cmd()
         return
 
     def _write_native_ctrl(self):
@@ -1791,6 +1742,8 @@ class MujocoEngine(engine.Engine):
         if (not hasattr(self, "_wp_total_contact_forces")):
             return
 
+        # MuJoCo-Warp reports contacts as one global contact stream. Reduce it
+        # lazily into MimicKit's per-object body-force tensors only when queried.
         self._wp_total_contact_forces.zero_()
         self._wp_ground_contact_forces.zero_()
 
@@ -1986,9 +1939,6 @@ class MujocoEngine(engine.Engine):
         offset = np.array([col * self._env_spacing, row * self._env_spacing, 0.0], dtype=np.float64)
         return offset
 
-    def _visualize(self):
-        return self._viewer is not None
-
     def _on_keyboard_event(self, key):
         if (key in self._keyboard_callbacks):
             self._keyboard_callbacks[key]()
@@ -2007,7 +1957,7 @@ def _strip_prefix(name, prefix):
     return os.path.basename(name)
 
 
-def _joint_dof_width(mujoco, joint_type):
+def _joint_dof_width(joint_type):
     if (joint_type == int(mujoco.mjtJoint.mjJNT_FREE)):
         return 6
     elif (joint_type == int(mujoco.mjtJoint.mjJNT_BALL)):
@@ -2019,7 +1969,7 @@ def _joint_dof_width(mujoco, joint_type):
     assert(False), "Unsupported MuJoCo joint type: {}".format(joint_type)
 
 
-def _joint_qpos_width(mujoco, joint_type):
+def _joint_qpos_width(joint_type):
     if (joint_type == int(mujoco.mjtJoint.mjJNT_FREE)):
         return 7
     elif (joint_type == int(mujoco.mjtJoint.mjJNT_BALL)):
