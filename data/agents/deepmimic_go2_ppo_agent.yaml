@@ -11,10 +11,14 @@ model:
 actor_optimizer:
     type: "SGD"
     learning_rate: 2e-4
-    
+    use_amp: false
+    amp_type: "bf16"
+
 critic_optimizer:
     type: "SGD"
     learning_rate: 1e-4
+    use_amp: false
+    amp_type: "bf16"
 
 discount: 0.99
 steps_per_iter: 32
