@@ -377,6 +377,51 @@ def _build_warp_kernels():
 
         return
 
+    @wp.kernel
+    def accumulate_ground_contact_kernel(contact_worldid: wp.array(dtype=int),
+                                         contact_geom: wp.array(dtype=wp.vec2i),
+                                         contact_type: wp.array(dtype=int),
+                                         contact_force: wp.array(dtype=wp.spatial_vector),
+                                         nacon: wp.array(dtype=int),
+                                         geom_bodyid: wp.array(dtype=int),
+                                         body_obj_id: wp.array(dtype=int),
+                                         body_local_id: wp.array(dtype=int),
+                                         ground_forces: wp.array4d(dtype=float)):
+        contact_id = wp.tid()
+
+        if (contact_id >= nacon[0]):
+            return
+
+        if ((contact_type[contact_id] & 1) == 0):
+            return
+
+        geom_pair = contact_geom[contact_id]
+        geom0 = geom_pair[0]
+        geom1 = geom_pair[1]
+        if (geom0 < 0 or geom1 < 0):
+            return
+
+        world_id = contact_worldid[contact_id]
+        body0 = geom_bodyid[geom0]
+        body1 = geom_bodyid[geom1]
+        obj0 = body_obj_id[body0]
+        obj1 = body_obj_id[body1]
+        local0 = body_local_id[body0]
+        local1 = body_local_id[body1]
+
+        frc = wp.spatial_top(contact_force[contact_id])
+
+        if (body0 == 0 and obj1 >= 0 and local1 >= 0):
+            wp.atomic_add(ground_forces, obj1, world_id, local1, 0, -frc[0])
+            wp.atomic_add(ground_forces, obj1, world_id, local1, 1, -frc[1])
+            wp.atomic_add(ground_forces, obj1, world_id, local1, 2, -frc[2])
+        elif (body1 == 0 and obj0 >= 0 and local0 >= 0):
+            wp.atomic_add(ground_forces, obj0, world_id, local0, 0, frc[0])
+            wp.atomic_add(ground_forces, obj0, world_id, local0, 1, frc[1])
+            wp.atomic_add(ground_forces, obj0, world_id, local0, 2, frc[2])
+
+        return
+
     _warp_kernels = {
         "update_dof_state": update_dof_state_kernel,
         "write_dof_pos": write_dof_pos_kernel,
@@ -385,6 +430,7 @@ def _build_warp_kernels():
         "update_body_state": update_body_state_kernel,
         "apply_control": apply_control_kernel,
         "accumulate_contact": accumulate_contact_kernel,
+        "accumulate_ground_contact": accumulate_ground_contact_kernel,
     }
     return _warp_kernels
 
@@ -397,6 +443,7 @@ update_root_state_kernel = _WARP_KERNELS["update_root_state"]
 update_body_state_kernel = _WARP_KERNELS["update_body_state"]
 apply_control_kernel = _WARP_KERNELS["apply_control"]
 accumulate_contact_kernel = _WARP_KERNELS["accumulate_contact"]
+accumulate_ground_contact_kernel = _WARP_KERNELS["accumulate_ground_contact"]
 
 
 @dataclass(frozen=True)
@@ -825,6 +872,10 @@ class MujocoEngine(engine.Engine):
         else:
             self._simulate()
 
+        if (hasattr(self, "_wp_total_contact_forces")):
+            self._contact_forces_dirty = True
+            self._ground_contact_forces_dirty = True
+
         if (self._has_body_forces):
             self._torch_xfrc_applied.zero_()
             self._has_body_forces = False
@@ -918,9 +969,11 @@ class MujocoEngine(engine.Engine):
         return self._sim_state.body_ang_vel[obj_id]
 
     def get_contact_forces(self, obj_id):
+        self._sync_contact_forces()
         return self._contact_forces[obj_id]
 
     def get_ground_contact_forces(self, obj_id):
+        self._sync_ground_contact_forces()
         return self._ground_contact_forces[obj_id]
 
     def set_root_pos(self, env_id, obj_id, root_pos):
@@ -1474,6 +1527,8 @@ class MujocoEngine(engine.Engine):
             self._contact_forces.append(contact_forces[obj_id, :, :num_bodies, :])
             self._ground_contact_forces.append(ground_forces[obj_id, :, :num_bodies, :])
 
+        self._contact_forces_dirty = True
+        self._ground_contact_forces_dirty = True
         self._update_contact_forces()
         return
 
@@ -1507,6 +1562,8 @@ class MujocoEngine(engine.Engine):
 
     def _build_graphs(self):
         self._graph = None
+        self._contact_graph = None
+        self._ground_contact_graph = None
 
         if (not self._wp_device.is_cuda):
             return
@@ -1519,6 +1576,22 @@ class MujocoEngine(engine.Engine):
         except Exception as e:
             Logger.print("MuJoCo Warp graph capture disabled: {}".format(e))
             self._graph = None
+
+        try:
+            with wp.ScopedDevice(self._wp_device):
+                with wp.ScopedCapture() as capture:
+                    self._update_contact_forces()
+                self._contact_graph = capture.graph
+
+                with wp.ScopedCapture() as capture:
+                    self._update_ground_contact_forces()
+                self._ground_contact_graph = capture.graph
+            self._contact_forces_dirty = True
+            self._ground_contact_forces_dirty = True
+        except Exception as e:
+            Logger.print("MuJoCo Warp contact graph capture disabled: {}".format(e))
+            self._contact_graph = None
+            self._ground_contact_graph = None
         return
 
     def _simulate(self):
@@ -1530,7 +1603,8 @@ class MujocoEngine(engine.Engine):
                 mjwarp.step(self._wp_model, self._wp_data)
 
         self._sim_state.post_step_update()
-        self._update_contact_forces()
+        self._contact_forces_dirty = True
+        self._ground_contact_forces_dirty = True
         self._state_dirty = False
         return
 
@@ -1565,6 +1639,25 @@ class MujocoEngine(engine.Engine):
             self._forward()
         return
 
+    def _sync_contact_forces(self):
+        if (getattr(self, "_contact_forces_dirty", False)):
+            if (self._contact_graph is not None):
+                wp.capture_launch(self._contact_graph)
+                self._contact_forces_dirty = False
+                self._ground_contact_forces_dirty = False
+            else:
+                self._update_contact_forces()
+        return
+
+    def _sync_ground_contact_forces(self):
+        if (getattr(self, "_ground_contact_forces_dirty", False)):
+            if (self._ground_contact_graph is not None):
+                wp.capture_launch(self._ground_contact_graph)
+                self._ground_contact_forces_dirty = False
+            else:
+                self._update_ground_contact_forces()
+        return
+
     def _update_contact_forces(self):
         if (not hasattr(self, "_wp_total_contact_forces")):
             return
@@ -1573,6 +1666,8 @@ class MujocoEngine(engine.Engine):
         self._wp_ground_contact_forces.zero_()
 
         if (self._wp_data.naconmax == 0):
+            self._contact_forces_dirty = False
+            self._ground_contact_forces_dirty = False
             return
 
         mjwarp_support.contact_force(
@@ -1602,6 +1697,47 @@ class MujocoEngine(engine.Engine):
             ],
             device=self._wp_device,
         )
+        self._contact_forces_dirty = False
+        self._ground_contact_forces_dirty = False
+        return
+
+    def _update_ground_contact_forces(self):
+        if (not hasattr(self, "_wp_ground_contact_forces")):
+            return
+
+        self._wp_ground_contact_forces.zero_()
+
+        if (self._wp_data.naconmax == 0):
+            self._ground_contact_forces_dirty = False
+            return
+
+        mjwarp_support.contact_force(
+            self._wp_model,
+            self._wp_data,
+            self._wp_contact_ids,
+            True,
+            self._wp_contact_spatial,
+        )
+
+        wp.launch(
+            kernel=accumulate_ground_contact_kernel,
+            dim=self._wp_data.naconmax,
+            inputs=[
+                self._wp_data.contact.worldid,
+                self._wp_data.contact.geom,
+                self._wp_data.contact.type,
+                self._wp_contact_spatial,
+                self._wp_data.nacon,
+                self._wp_model.geom_bodyid,
+                self._wp_body_obj_id,
+                self._wp_body_local_id,
+            ],
+            outputs=[
+                self._wp_ground_contact_forces,
+            ],
+            device=self._wp_device,
+        )
+        self._ground_contact_forces_dirty = False
         return
 
     def _build_viewer(self):
