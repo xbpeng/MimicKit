@@ -321,6 +321,34 @@ def _build_warp_kernels():
         return
 
     @wp.kernel
+    def write_ctrl_kernel(cmd: wp.array2d(dtype=float),
+                          dof_actuator_id: wp.array(dtype=int),
+                          ctrl: wp.array2d(dtype=float),
+                          num_dofs: int):
+        tid = wp.tid()
+        world_id = tid // num_dofs
+        dof_id = tid - world_id * num_dofs
+
+        actuator_id = dof_actuator_id[dof_id]
+        if (actuator_id >= 0):
+            ctrl[world_id, actuator_id] = cmd[world_id, dof_id]
+        return
+
+    @wp.kernel
+    def update_actuator_force_kernel(actuator_force: wp.array2d(dtype=float),
+                                     dof_actuator_id: wp.array(dtype=int),
+                                     dof_force: wp.array2d(dtype=float),
+                                     num_dofs: int):
+        tid = wp.tid()
+        world_id = tid // num_dofs
+        dof_id = tid - world_id * num_dofs
+
+        actuator_id = dof_actuator_id[dof_id]
+        if (actuator_id >= 0):
+            dof_force[world_id, dof_id] = actuator_force[world_id, actuator_id]
+        return
+
+    @wp.kernel
     def accumulate_contact_kernel(contact_worldid: wp.array(dtype=int),
                                   contact_geom: wp.array(dtype=wp.vec2i),
                                   contact_type: wp.array(dtype=int),
@@ -429,6 +457,8 @@ def _build_warp_kernels():
         "update_root_state": update_root_state_kernel,
         "update_body_state": update_body_state_kernel,
         "apply_control": apply_control_kernel,
+        "write_ctrl": write_ctrl_kernel,
+        "update_actuator_force": update_actuator_force_kernel,
         "accumulate_contact": accumulate_contact_kernel,
         "accumulate_ground_contact": accumulate_ground_contact_kernel,
     }
@@ -442,6 +472,8 @@ write_root_rot_kernel = _WARP_KERNELS["write_root_rot"]
 update_root_state_kernel = _WARP_KERNELS["update_root_state"]
 update_body_state_kernel = _WARP_KERNELS["update_body_state"]
 apply_control_kernel = _WARP_KERNELS["apply_control"]
+write_ctrl_kernel = _WARP_KERNELS["write_ctrl"]
+update_actuator_force_kernel = _WARP_KERNELS["update_actuator_force"]
 accumulate_contact_kernel = _WARP_KERNELS["accumulate_contact"]
 accumulate_ground_contact_kernel = _WARP_KERNELS["accumulate_ground_contact"]
 
@@ -467,6 +499,7 @@ class ObjMeta:
     qpos_ids: list[int]
     qvel_ids: list[int]
     qvel_col_ids: torch.Tensor
+    actuator_ids: list[int]
     hinge_qpos_ids: list[int]
     hinge_dof_ids: list[int]
     hinge_local_ids: list[int]
@@ -488,13 +521,11 @@ class ObjMeta:
 
 
 class SimState:
-    def __init__(self, eng):
-        self._engine = eng
-        self._wp_device = eng._wp_device
-        self._wp_data = eng._wp_data
+    def __init__(self, wp_data, obj_metas, num_envs, device, wp_device):
+        self._wp_device = wp_device
+        self._wp_data = wp_data
 
-        num_envs = eng.get_num_envs()
-        num_objs = len(eng._obj_metas)
+        num_objs = len(obj_metas)
 
         self._torch_qpos = wp.to_torch(self._wp_data.qpos)
         self._torch_qvel = wp.to_torch(self._wp_data.qvel)
@@ -508,8 +539,8 @@ class SimState:
         self._torch_cvel = wp.to_torch(self._wp_data.cvel)
         self._torch_subtree_com = wp.to_torch(self._wp_data.subtree_com)
 
-        total_bodies = sum(len(meta.body_ids) for meta in eng._obj_metas)
-        total_dofs = sum(len(meta.qvel_ids) for meta in eng._obj_metas)
+        total_bodies = sum(len(meta.body_ids) for meta in obj_metas)
+        total_dofs = sum(len(meta.qvel_ids) for meta in obj_metas)
 
         self._num_envs = num_envs
         self._num_objs = num_objs
@@ -537,23 +568,14 @@ class SimState:
         if (total_dofs > 0):
             self._wp_dof_pos = wp.zeros((num_envs, total_dofs), device=self._wp_device, dtype=float)
             self._wp_dof_vel = wp.zeros((num_envs, total_dofs), device=self._wp_device, dtype=float)
-            self._wp_cmd = wp.zeros((num_envs, total_dofs), device=self._wp_device, dtype=float)
-            self._wp_dof_force = wp.zeros((num_envs, total_dofs), device=self._wp_device, dtype=float)
-
             self._torch_dof_pos = wp.to_torch(self._wp_dof_pos)
             self._torch_dof_vel = wp.to_torch(self._wp_dof_vel)
-            self._torch_cmd = wp.to_torch(self._wp_cmd)
-            self._torch_dof_force = wp.to_torch(self._wp_dof_force)
         else:
             self._wp_dof_pos = None
             self._wp_dof_vel = None
-            self._wp_cmd = None
-            self._wp_dof_force = None
 
-            self._torch_dof_pos = torch.zeros([num_envs, 0], device=eng._device, dtype=torch.float32)
-            self._torch_dof_vel = torch.zeros([num_envs, 0], device=eng._device, dtype=torch.float32)
-            self._torch_cmd = torch.zeros([num_envs, 0], device=eng._device, dtype=torch.float32)
-            self._torch_dof_force = torch.zeros([num_envs, 0], device=eng._device, dtype=torch.float32)
+            self._torch_dof_pos = torch.zeros([num_envs, 0], device=device, dtype=torch.float32)
+            self._torch_dof_vel = torch.zeros([num_envs, 0], device=device, dtype=torch.float32)
 
         root_kind = []
         root_qpos_start = []
@@ -583,13 +605,11 @@ class SimState:
         self.body_rot = []
         self.body_vel = []
         self.body_ang_vel = []
-        self.cmd = []
-        self.dof_force = []
 
         body_offset = 0
         dof_offset = 0
 
-        for obj_id, meta in enumerate(eng._obj_metas):
+        for obj_id, meta in enumerate(obj_metas):
             num_bodies = len(meta.body_ids)
             num_dofs = len(meta.qvel_ids)
 
@@ -647,8 +667,6 @@ class SimState:
             self.body_ang_vel.append(self._torch_body_ang_vel[:, body_offset:body_offset + num_bodies, :])
             self.dof_pos.append(self._torch_dof_pos[:, dof_offset:dof_offset + num_dofs])
             self.dof_vel.append(self._torch_dof_vel[:, dof_offset:dof_offset + num_dofs])
-            self.cmd.append(self._torch_cmd[:, dof_offset:dof_offset + num_dofs])
-            self.dof_force.append(self._torch_dof_force[:, dof_offset:dof_offset + num_dofs])
 
             body_offset += num_bodies
             dof_offset += num_dofs
@@ -729,6 +747,57 @@ class SimState:
         return
 
 
+class Controls:
+    def __init__(self, wp_data, obj_metas, num_envs, device, wp_device, native_pos_control):
+        total_dofs = sum(len(meta.qvel_ids) for meta in obj_metas)
+
+        self._native_pos_control = native_pos_control
+        self.target_pos = []
+        self.target_vel = []
+        self.joint_force = []
+
+        if (total_dofs > 0 and native_pos_control):
+            self._wp_target_pos = wp.zeros((num_envs, total_dofs), device=wp_device, dtype=float)
+            self._wp_target_vel = None
+            self._wp_joint_force = wp.zeros((num_envs, total_dofs), device=wp_device, dtype=float)
+            dof_actuator_ids = []
+            for meta in obj_metas:
+                dof_actuator_ids += meta.actuator_ids
+            self._wp_dof_actuator_id = wp.array(dof_actuator_ids, device=wp_device, dtype=int)
+
+            torch_target_pos = wp.to_torch(self._wp_target_pos)
+            torch_joint_force = wp.to_torch(self._wp_joint_force)
+            torch_target_vel = torch.zeros([num_envs, total_dofs], device=device, dtype=torch.float32)
+        elif (total_dofs > 0):
+            self._wp_target_pos = wp.zeros((num_envs, total_dofs), device=wp_device, dtype=float)
+            self._wp_target_vel = wp.zeros((num_envs, total_dofs), device=wp_device, dtype=float)
+            self._wp_joint_force = wp.zeros((num_envs, total_dofs), device=wp_device, dtype=float)
+            self._wp_dof_actuator_id = None
+
+            torch_target_pos = wp.to_torch(self._wp_target_pos)
+            torch_target_vel = wp.to_torch(self._wp_target_vel)
+            torch_joint_force = wp.to_torch(self._wp_joint_force)
+        else:
+            self._wp_target_pos = None
+            self._wp_target_vel = None
+            self._wp_joint_force = None
+            self._wp_dof_actuator_id = None
+
+            torch_target_pos = torch.zeros([num_envs, 0], device=device, dtype=torch.float32)
+            torch_target_vel = torch.zeros([num_envs, 0], device=device, dtype=torch.float32)
+            torch_joint_force = torch.zeros([num_envs, 0], device=device, dtype=torch.float32)
+
+        dof_offset = 0
+        for meta in obj_metas:
+            num_dofs = len(meta.qvel_ids)
+
+            self.target_pos.append(torch_target_pos[:, dof_offset:dof_offset + num_dofs])
+            self.joint_force.append(torch_joint_force[:, dof_offset:dof_offset + num_dofs])
+            self.target_vel.append(torch_target_vel[:, dof_offset:dof_offset + num_dofs])
+            dof_offset += num_dofs
+        return
+
+
 class MujocoEngine(engine.Engine):
     def __init__(self, config, num_envs, device, visualize, record_video=False):
         super().__init__(visualize=visualize)
@@ -770,7 +839,6 @@ class MujocoEngine(engine.Engine):
         self._env_colors = []
 
         self._obj_metas = []
-        self._cmds = []
 
         self._camera_pos = np.array([0.0, -5.0, 3.0], dtype=np.float64)
         self._camera_look_at = np.array([0.0, 0.0, 1.0], dtype=np.float64)
@@ -843,6 +911,8 @@ class MujocoEngine(engine.Engine):
         self._validate_envs()
         self._build_model()
         self._build_sim_tensors()
+        self._build_controls()
+        self._build_dof_force_tensors()
         self._apply_start_xform()
         self._forward()
         self._build_contact_tensors()
@@ -857,15 +927,23 @@ class MujocoEngine(engine.Engine):
         return
 
     def set_cmd(self, obj_id, cmd):
-        if (self._control_mode != engine.ControlMode.none and len(self._cmds) > 0):
-            self._cmds[obj_id][:] = cmd
+        if (self._control_mode == engine.ControlMode.none):
+            pass
+        elif (self._control_mode == engine.ControlMode.pos):
+            self._controls.target_pos[obj_id][:] = cmd
+        elif (self._control_mode == engine.ControlMode.vel):
+            self._controls.target_vel[obj_id][:] = cmd
+        elif (self._control_mode == engine.ControlMode.torque):
+            self._controls.joint_force[obj_id][:] = cmd
+        elif (self._control_mode == engine.ControlMode.pd_explicit):
+            self._controls.target_pos[obj_id][:] = cmd
+        else:
+            assert(False), "Unsupported control mode: {}".format(self._control_mode)
         return
 
     def step(self):
         if (self.enabled_record_video() and self._recording):
             self._video_recorder.capture_frame()
-
-        self._sync_derived_state()
 
         if (self._graph):
             wp.capture_launch(self._graph)
@@ -954,7 +1032,7 @@ class MujocoEngine(engine.Engine):
         return self._sim_state.dof_vel[obj_id]
 
     def get_dof_forces(self, obj_id):
-        return self._sim_state.dof_force[obj_id]
+        return self._dof_forces[obj_id]
 
     def get_body_pos(self, obj_id):
         return self._sim_state.body_pos[obj_id]
@@ -1194,6 +1272,7 @@ class MujocoEngine(engine.Engine):
             self._obj_metas.append(meta)
 
         self._disable_passive_joint_gains()
+        self._configure_native_actuators()
 
         self._mj_data = mujoco.MjData(self._mj_model)
         mujoco.mj_forward(self._mj_model, self._mj_data)
@@ -1352,6 +1431,7 @@ class MujocoEngine(engine.Engine):
 
         qpos_ids = []
         qvel_ids = []
+        actuator_ids = []
         hinge_qpos_ids = []
         hinge_dof_ids = []
         ball_qpos_ids = []
@@ -1371,6 +1451,8 @@ class MujocoEngine(engine.Engine):
 
             qpos_ids.extend(range(qpos_start, qpos_start + qpos_width))
             qvel_ids.extend(range(qvel_start, qvel_start + dof_width))
+            joint_actuator_id = self._get_joint_actuator_id(joint_id) if dof_width == 1 else -1
+            actuator_ids.extend([joint_actuator_id] * dof_width)
 
             joint_kp = float(self._mj_model.jnt_stiffness[joint_id])
             joint_kd = np.asarray(self._mj_model.dof_damping[qvel_start:qvel_start + dof_width], dtype=np.float32)
@@ -1408,6 +1490,7 @@ class MujocoEngine(engine.Engine):
                        qpos_ids=qpos_ids,
                        qvel_ids=qvel_ids,
                        qvel_col_ids=qvel_col_ids,
+                       actuator_ids=actuator_ids,
                        hinge_qpos_ids=hinge_qpos_ids,
                        hinge_dof_ids=hinge_dof_ids,
                        hinge_local_ids=hinge_local_ids,
@@ -1427,6 +1510,19 @@ class MujocoEngine(engine.Engine):
                        torque_lim=np.asarray(torque_lim, dtype=np.float32),
                        mass=mass)
         return meta
+
+    def _get_joint_actuator_id(self, joint_id):
+        if (self._mj_model.nu == 0):
+            return -1
+
+        joint_actuator = np.logical_and(
+            self._mj_model.actuator_trntype == int(mujoco.mjtTrn.mjTRN_JOINT),
+            self._mj_model.actuator_trnid[:, 0] == joint_id,
+        )
+        actuator_ids = np.nonzero(joint_actuator)[0]
+        if (len(actuator_ids) != 1):
+            return -1
+        return int(actuator_ids[0])
 
     def _get_joint_pos_limit(self, joint_id, dof_width):
         limited = bool(self._mj_model.jnt_limited[joint_id])
@@ -1464,8 +1560,53 @@ class MujocoEngine(engine.Engine):
         self._mj_model.dof_damping[:] = 0.0
         return
 
+    def _configure_native_actuators(self):
+        self._use_native_pos_control = self._can_use_native_pos_control()
+        if (not self._use_native_pos_control):
+            return
+
+        for meta in self._obj_metas:
+            for local_id, actuator_id in enumerate(meta.actuator_ids):
+                self._mj_model.actuator_gaintype[actuator_id] = int(mujoco.mjtGain.mjGAIN_FIXED)
+                self._mj_model.actuator_biastype[actuator_id] = int(mujoco.mjtBias.mjBIAS_AFFINE)
+
+                self._mj_model.actuator_gainprm[actuator_id, :] = 0.0
+                self._mj_model.actuator_gainprm[actuator_id, 0] = meta.kp[local_id]
+
+                self._mj_model.actuator_biasprm[actuator_id, :] = 0.0
+                self._mj_model.actuator_biasprm[actuator_id, 1] = -meta.kp[local_id]
+                self._mj_model.actuator_biasprm[actuator_id, 2] = -meta.kd[local_id]
+
+                self._mj_model.actuator_gear[actuator_id, :] = 0.0
+                self._mj_model.actuator_gear[actuator_id, 0] = 1.0
+
+                self._mj_model.actuator_ctrlrange[actuator_id, 0] = meta.dof_low[local_id]
+                self._mj_model.actuator_ctrlrange[actuator_id, 1] = meta.dof_high[local_id]
+                self._mj_model.actuator_ctrllimited[actuator_id] = 1
+
+                limit = meta.torque_lim[local_id]
+                self._mj_model.actuator_forcerange[actuator_id, 0] = -limit
+                self._mj_model.actuator_forcerange[actuator_id, 1] = limit
+                self._mj_model.actuator_forcelimited[actuator_id] = 1
+        return
+
+    def _can_use_native_pos_control(self):
+        if (self._control_mode != engine.ControlMode.pos):
+            return False
+
+        for meta in self._obj_metas:
+            if (meta.obj_def.disable_motors and len(meta.qvel_ids) > 0):
+                return False
+            if (len(meta.ball_dof_ids) > 0):
+                return False
+            if (len(meta.actuator_ids) != len(meta.qvel_ids)):
+                return False
+            if (any(actuator_id < 0 for actuator_id in meta.actuator_ids)):
+                return False
+        return True
+
     def _build_sim_tensors(self):
-        self._sim_state = SimState(self)
+        self._sim_state = SimState(self._wp_data, self._obj_metas, self.get_num_envs(), self._device, self._wp_device)
         self._torch_qpos = self._sim_state._torch_qpos
         self._torch_qvel = self._sim_state._torch_qvel
         self._torch_qfrc_applied = self._sim_state._torch_qfrc_applied
@@ -1477,13 +1618,22 @@ class MujocoEngine(engine.Engine):
         self._torch_xquat = self._sim_state._torch_xquat
         self._torch_cvel = self._sim_state._torch_cvel
         self._torch_subtree_com = self._sim_state._torch_subtree_com
-        self._cmds = self._sim_state.cmd
 
         self._torch_qfrc_applied.zero_()
         self._torch_xfrc_applied.zero_()
         if (self._torch_ctrl.numel() > 0):
             self._torch_ctrl.zero_()
         self._sim_state.post_step_update()
+        return
+
+    def _build_controls(self):
+        num_envs = self.get_num_envs()
+        self._controls = Controls(self._wp_data, self._obj_metas, num_envs, self._device, self._wp_device,
+                                  self._use_native_pos_control)
+        return
+
+    def _build_dof_force_tensors(self):
+        self._dof_forces = self._controls.joint_force
         return
 
     def _apply_start_xform(self):
@@ -1533,17 +1683,24 @@ class MujocoEngine(engine.Engine):
         return
 
     def _apply_cmd(self):
-        if (self._control_mode == engine.ControlMode.none):
+        if (self._control_mode == engine.ControlMode.none or self._use_native_pos_control):
             return
 
         if (self._sim_state._num_dofs > 0):
+            if (self._control_mode == engine.ControlMode.vel):
+                cmd = self._controls._wp_target_vel
+            elif (self._control_mode == engine.ControlMode.torque):
+                cmd = self._controls._wp_joint_force
+            else:
+                cmd = self._controls._wp_target_pos
+
             wp.launch(
                 kernel=apply_control_kernel,
                 dim=self.get_num_envs() * self._sim_state._num_dofs,
                 inputs=[
                     self._wp_data.qpos,
                     self._wp_data.qvel,
-                    self._sim_state._wp_cmd,
+                    cmd,
                     self._sim_state._wp_dof_qpos_start,
                     self._sim_state._wp_dof_qpos_kind,
                     self._sim_state._wp_dof_qpos_comp,
@@ -1552,7 +1709,7 @@ class MujocoEngine(engine.Engine):
                     self._sim_state._wp_kd,
                     self._sim_state._wp_torque_lim,
                     self._wp_data.qfrc_applied,
-                    self._sim_state._wp_dof_force,
+                    self._controls._wp_joint_force,
                     self._control_mode.value,
                     self._sim_state._num_dofs,
                 ],
@@ -1596,6 +1753,8 @@ class MujocoEngine(engine.Engine):
 
     def _simulate(self):
         self._sim_state.pre_step_update()
+        if (self._use_native_pos_control):
+            self._write_native_ctrl()
 
         for _ in range(self._sim_steps):
             self._pre_sim_step()
@@ -1603,6 +1762,8 @@ class MujocoEngine(engine.Engine):
                 mjwarp.step(self._wp_model, self._wp_data)
 
         self._sim_state.post_step_update()
+        if (self._use_native_pos_control):
+            self._update_native_dof_forces()
         self._contact_forces_dirty = True
         self._ground_contact_forces_dirty = True
         self._state_dirty = False
@@ -1610,6 +1771,36 @@ class MujocoEngine(engine.Engine):
 
     def _pre_sim_step(self):
         self._apply_cmd()
+        return
+
+    def _write_native_ctrl(self):
+        if (self._sim_state._num_dofs > 0):
+            wp.launch(
+                kernel=write_ctrl_kernel,
+                dim=self.get_num_envs() * self._sim_state._num_dofs,
+                inputs=[
+                    self._controls._wp_target_pos,
+                    self._controls._wp_dof_actuator_id,
+                    self._wp_data.ctrl,
+                    self._sim_state._num_dofs,
+                ],
+                device=self._wp_device,
+            )
+        return
+
+    def _update_native_dof_forces(self):
+        if (self._sim_state._num_dofs > 0):
+            wp.launch(
+                kernel=update_actuator_force_kernel,
+                dim=self.get_num_envs() * self._sim_state._num_dofs,
+                inputs=[
+                    self._wp_data.actuator_force,
+                    self._controls._wp_dof_actuator_id,
+                    self._controls._wp_joint_force,
+                    self._sim_state._num_dofs,
+                ],
+                device=self._wp_device,
+            )
         return
 
     def _write_dof_pos(self, meta, env_id, dof_pos):
