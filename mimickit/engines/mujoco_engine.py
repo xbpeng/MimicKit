@@ -53,6 +53,51 @@ def _build_warp_kernels():
 
     _, _, _, wp = _load_mujoco_modules()
 
+    @wp.func
+    def quat_wxyz_to_exp_map(q: wp.quat):
+        min_theta = 1e-5
+
+        w = q[0]
+        axis = wp.vec3f(q[1], q[2], q[3])
+        if (w < 0.0):
+            w = -w
+            axis = -axis
+
+        sin_angle = wp.length(axis)
+        angle = 2.0 * wp.atan2(sin_angle, w)
+
+        if (sin_angle > min_theta):
+            axis = axis / sin_angle
+        else:
+            axis = wp.vec3f(0.0, 0.0, 1.0)
+            angle = 0.0
+
+        return axis * angle
+
+    @wp.func
+    def exp_map_to_quat_wxyz(exp_map: wp.vec3f):
+        min_theta = 1e-5
+
+        angle = wp.length(exp_map)
+        axis = wp.vec3f(0.0, 0.0, 1.0)
+        if (wp.abs(angle) > min_theta):
+            axis = exp_map / angle
+            angle = wp.atan2(wp.sin(angle), wp.cos(angle))
+        else:
+            angle = 0.0
+
+        s = wp.sin(0.5 * angle)
+        c = wp.cos(0.5 * angle)
+        return wp.quat(c, axis[0] * s, axis[1] * s, axis[2] * s)
+
+    @wp.func
+    def rot_vec_quat_wxyz(vec: wp.vec3f, quat: wp.quat):
+        s = quat[0]
+        u = wp.vec3f(quat[1], quat[2], quat[3])
+        r = 2.0 * (wp.dot(u, vec) * u) + (s * s - wp.dot(u, u)) * vec
+        r = r + 2.0 * s * wp.cross(u, vec)
+        return r
+
     @wp.kernel
     def clear_qfrc_kernel(qfrc_applied: wp.array2d(dtype=float),
                           nv: int):
@@ -88,12 +133,11 @@ def _build_warp_kernels():
         if (qpos_kind == 0):
             dof_pos[world_id, dof_id] = qpos[world_id, qpos_start]
         else:
-            q = wp.quaternion(qpos[world_id, qpos_start + 1],
-                              qpos[world_id, qpos_start + 2],
-                              qpos[world_id, qpos_start + 3],
-                              qpos[world_id, qpos_start])
-            axis, angle = wp.quat_to_axis_angle(q)
-            exp_map = axis * angle
+            q = wp.quat(qpos[world_id, qpos_start],
+                        qpos[world_id, qpos_start + 1],
+                        qpos[world_id, qpos_start + 2],
+                        qpos[world_id, qpos_start + 3])
+            exp_map = quat_wxyz_to_exp_map(q)
             comp = dof_qpos_comp[dof_id]
             dof_pos[world_id, dof_id] = exp_map[comp]
         return
@@ -105,8 +149,6 @@ def _build_warp_kernels():
                              dof_qpos_kind: wp.array(dtype=int),
                              dof_qpos_comp: wp.array(dtype=int),
                              num_dofs: int):
-        min_theta = 1e-5
-
         tid = wp.tid()
         world_id = tid // num_dofs
         dof_id = tid - world_id * num_dofs
@@ -122,25 +164,17 @@ def _build_warp_kernels():
             exp_map = wp.vec3f(dof_pos[world_id, dof_id],
                                dof_pos[world_id, dof_id + 1],
                                dof_pos[world_id, dof_id + 2])
-            angle = wp.length(exp_map)
-            axis = wp.vec3f(0.0, 0.0, 1.0)
-            if (wp.abs(angle) > min_theta):
-                axis = exp_map / angle
-                angle = wp.atan2(wp.sin(angle), wp.cos(angle))
-            else:
-                angle = 0.0
-
-            q = wp.quat_from_axis_angle(axis, angle)
-            qpos[world_id, qpos_start] = q[3]
-            qpos[world_id, qpos_start + 1] = q[0]
-            qpos[world_id, qpos_start + 2] = q[1]
-            qpos[world_id, qpos_start + 3] = q[2]
+            q = exp_map_to_quat_wxyz(exp_map)
+            qpos[world_id, qpos_start] = q[0]
+            qpos[world_id, qpos_start + 1] = q[1]
+            qpos[world_id, qpos_start + 2] = q[2]
+            qpos[world_id, qpos_start + 3] = q[3]
         return
 
     @wp.kernel
     def write_root_rot_kernel(root_rot: wp.array3d(dtype=float),
                               qpos: wp.array2d(dtype=float),
-                              mocap_quat: wp.array3d(dtype=float),
+                              mocap_quat: wp.array2d(dtype=wp.quat),
                               root_kind: wp.array(dtype=int),
                               root_qpos_start: wp.array(dtype=int),
                               root_mocap_id: wp.array(dtype=int),
@@ -158,17 +192,17 @@ def _build_warp_kernels():
             qpos[world_id, qpos_start + 6] = root_rot[world_id, obj_id, 2]
         elif (kind == 1):
             mocap_id = root_mocap_id[obj_id]
-            mocap_quat[world_id, mocap_id, 0] = root_rot[world_id, obj_id, 3]
-            mocap_quat[world_id, mocap_id, 1] = root_rot[world_id, obj_id, 0]
-            mocap_quat[world_id, mocap_id, 2] = root_rot[world_id, obj_id, 1]
-            mocap_quat[world_id, mocap_id, 3] = root_rot[world_id, obj_id, 2]
+            mocap_quat[world_id, mocap_id] = wp.quat(root_rot[world_id, obj_id, 3],
+                                                     root_rot[world_id, obj_id, 0],
+                                                     root_rot[world_id, obj_id, 1],
+                                                     root_rot[world_id, obj_id, 2])
         return
 
     @wp.kernel
     def update_root_state_kernel(qpos: wp.array2d(dtype=float),
                                  qvel: wp.array2d(dtype=float),
-                                 mocap_quat: wp.array3d(dtype=float),
-                                 xquat: wp.array3d(dtype=float),
+                                 mocap_quat: wp.array2d(dtype=wp.quat),
+                                 xquat: wp.array2d(dtype=wp.quat),
                                  root_kind: wp.array(dtype=int),
                                  root_qpos_start: wp.array(dtype=int),
                                  root_qvel_start: wp.array(dtype=int),
@@ -186,15 +220,15 @@ def _build_warp_kernels():
         if (kind == 0):
             qpos_start = root_qpos_start[obj_id]
             qvel_start = root_qvel_start[obj_id]
-            q = wp.quaternion(qpos[world_id, qpos_start + 4],
-                              qpos[world_id, qpos_start + 5],
-                              qpos[world_id, qpos_start + 6],
-                              qpos[world_id, qpos_start + 3])
+            q = wp.quat(qpos[world_id, qpos_start + 3],
+                        qpos[world_id, qpos_start + 4],
+                        qpos[world_id, qpos_start + 5],
+                        qpos[world_id, qpos_start + 6])
 
-            root_rot[world_id, obj_id, 0] = q[0]
-            root_rot[world_id, obj_id, 1] = q[1]
-            root_rot[world_id, obj_id, 2] = q[2]
-            root_rot[world_id, obj_id, 3] = q[3]
+            root_rot[world_id, obj_id, 0] = q[1]
+            root_rot[world_id, obj_id, 1] = q[2]
+            root_rot[world_id, obj_id, 2] = q[3]
+            root_rot[world_id, obj_id, 3] = q[0]
 
             root_vel[world_id, obj_id, 0] = qvel[world_id, qvel_start]
             root_vel[world_id, obj_id, 1] = qvel[world_id, qvel_start + 1]
@@ -203,29 +237,31 @@ def _build_warp_kernels():
             ang_vel_b = wp.vec3f(qvel[world_id, qvel_start + 3],
                                  qvel[world_id, qvel_start + 4],
                                  qvel[world_id, qvel_start + 5])
-            ang_vel_w = wp.quat_rotate(q, ang_vel_b)
+            ang_vel_w = rot_vec_quat_wxyz(ang_vel_b, q)
             root_ang_vel[world_id, obj_id, 0] = ang_vel_w[0]
             root_ang_vel[world_id, obj_id, 1] = ang_vel_w[1]
             root_ang_vel[world_id, obj_id, 2] = ang_vel_w[2]
         elif (kind == 1):
             mocap_id = root_mocap_id[obj_id]
-            root_rot[world_id, obj_id, 0] = mocap_quat[world_id, mocap_id, 1]
-            root_rot[world_id, obj_id, 1] = mocap_quat[world_id, mocap_id, 2]
-            root_rot[world_id, obj_id, 2] = mocap_quat[world_id, mocap_id, 3]
-            root_rot[world_id, obj_id, 3] = mocap_quat[world_id, mocap_id, 0]
+            q = mocap_quat[world_id, mocap_id]
+            root_rot[world_id, obj_id, 0] = q[1]
+            root_rot[world_id, obj_id, 1] = q[2]
+            root_rot[world_id, obj_id, 2] = q[3]
+            root_rot[world_id, obj_id, 3] = q[0]
         else:
             body_id = root_body_id[obj_id]
-            root_rot[world_id, obj_id, 0] = xquat[world_id, body_id, 1]
-            root_rot[world_id, obj_id, 1] = xquat[world_id, body_id, 2]
-            root_rot[world_id, obj_id, 2] = xquat[world_id, body_id, 3]
-            root_rot[world_id, obj_id, 3] = xquat[world_id, body_id, 0]
+            q = xquat[world_id, body_id]
+            root_rot[world_id, obj_id, 0] = q[1]
+            root_rot[world_id, obj_id, 1] = q[2]
+            root_rot[world_id, obj_id, 2] = q[3]
+            root_rot[world_id, obj_id, 3] = q[0]
         return
 
     @wp.kernel
-    def update_body_state_kernel(xpos: wp.array3d(dtype=float),
-                                 xquat: wp.array3d(dtype=float),
-                                 cvel: wp.array3d(dtype=float),
-                                 subtree_com: wp.array3d(dtype=float),
+    def update_body_state_kernel(xpos: wp.array2d(dtype=wp.vec3),
+                                 xquat: wp.array2d(dtype=wp.quat),
+                                 cvel: wp.array2d(dtype=wp.spatial_vector),
+                                 subtree_com: wp.array2d(dtype=wp.vec3),
                                  body_ids: wp.array(dtype=int),
                                  body_root_ids: wp.array(dtype=int),
                                  body_pos: wp.array3d(dtype=float),
@@ -240,28 +276,22 @@ def _build_warp_kernels():
         body_id = body_ids[local_body_id]
         root_body_id = body_root_ids[local_body_id]
 
-        pos = wp.vec3f(xpos[world_id, body_id, 0],
-                       xpos[world_id, body_id, 1],
-                       xpos[world_id, body_id, 2])
-        ang_vel = wp.vec3f(cvel[world_id, body_id, 0],
-                           cvel[world_id, body_id, 1],
-                           cvel[world_id, body_id, 2])
-        lin_vel_c = wp.vec3f(cvel[world_id, body_id, 3],
-                             cvel[world_id, body_id, 4],
-                             cvel[world_id, body_id, 5])
-        com = wp.vec3f(subtree_com[world_id, root_body_id, 0],
-                       subtree_com[world_id, root_body_id, 1],
-                       subtree_com[world_id, root_body_id, 2])
+        pos = xpos[world_id, body_id]
+        cvel_body = cvel[world_id, body_id]
+        ang_vel = wp.vec3f(cvel_body[0], cvel_body[1], cvel_body[2])
+        lin_vel_c = wp.vec3f(cvel_body[3], cvel_body[4], cvel_body[5])
+        com = subtree_com[world_id, root_body_id]
         lin_vel = lin_vel_c - wp.cross(ang_vel, com - pos)
+        q = xquat[world_id, body_id]
 
         body_pos[world_id, local_body_id, 0] = pos[0]
         body_pos[world_id, local_body_id, 1] = pos[1]
         body_pos[world_id, local_body_id, 2] = pos[2]
 
-        body_rot[world_id, local_body_id, 0] = xquat[world_id, body_id, 1]
-        body_rot[world_id, local_body_id, 1] = xquat[world_id, body_id, 2]
-        body_rot[world_id, local_body_id, 2] = xquat[world_id, body_id, 3]
-        body_rot[world_id, local_body_id, 3] = xquat[world_id, body_id, 0]
+        body_rot[world_id, local_body_id, 0] = q[1]
+        body_rot[world_id, local_body_id, 1] = q[2]
+        body_rot[world_id, local_body_id, 2] = q[3]
+        body_rot[world_id, local_body_id, 3] = q[0]
 
         body_vel[world_id, local_body_id, 0] = lin_vel[0]
         body_vel[world_id, local_body_id, 1] = lin_vel[1]
@@ -306,12 +336,11 @@ def _build_warp_kernels():
             if (qpos_kind == 0):
                 dof_val = qpos[world_id, qpos_start]
             else:
-                q = wp.quaternion(qpos[world_id, qpos_start + 1],
-                                  qpos[world_id, qpos_start + 2],
-                                  qpos[world_id, qpos_start + 3],
-                                  qpos[world_id, qpos_start])
-                axis, angle = wp.quat_to_axis_angle(q)
-                exp_map = axis * angle
+                q = wp.quat(qpos[world_id, qpos_start],
+                            qpos[world_id, qpos_start + 1],
+                            qpos[world_id, qpos_start + 2],
+                            qpos[world_id, qpos_start + 3])
+                exp_map = quat_wxyz_to_exp_map(q)
                 dof_val = exp_map[dof_qpos_comp[dof_id]]
             torque = kp[dof_id] * (cmd_val - dof_val) - kd[dof_id] * qvel_val
         elif (control_mode == 2):
