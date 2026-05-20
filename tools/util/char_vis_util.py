@@ -1,5 +1,3 @@
-import tools.retargeter.retargeter as retagreter
-
 from matplotlib.colors import ListedColormap
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
