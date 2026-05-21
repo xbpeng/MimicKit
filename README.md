@@ -83,7 +83,7 @@ python mimickit/run.py --mode train --num_envs 4096 --engine_config data/engines
 - `--visualize` enables visualization. Rendering should be disabled for faster training.
 - `--out_dir` the output directory where the models and logs will be saved.
 - `--logger` the logger used to record training stats. The options are text `txt`, TensorBoard `tb`, or `wandb`.
-- `--video` either `true` or `false` to enable headless video recording, which are then recorded by the logger. Only Isaac and Mujoco currently support video logging.
+- `--video` either `true` or `false` to enable headless video recording, which are then recorded by the logger.
 
 Instead of specifying all arguments through the command line, arguments can also be loaded from an `arg_file`:
 ```
