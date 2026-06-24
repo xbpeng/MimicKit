@@ -48,6 +48,17 @@ Install [Newton](https://newton-physics.github.io/newton/guide/installation.html
 To use Newton, specify the argument `--engine_config data/engines/newton_engine.yaml` when running the code.
 </details>
 
+<details>
+<summary>MuJoCo MJWarp</summary>
+
+Install MuJoCo, MuJoCo Warp, and Warp:
+```
+pip install "mujoco>=3.8.0" "mujoco-warp>=3.8.0" "warp-lang>=1.12.0"
+```
+
+To use MuJoCo MJWarp, specify the argument `--engine_config data/engines/mujoco_engine.yaml` when running the code.
+</details>
+
 2. Install the requirements.
 ```
 pip install -r requirements.txt
