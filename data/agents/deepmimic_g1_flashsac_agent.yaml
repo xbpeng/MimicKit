@@ -1,0 +1,55 @@
+agent_name: "FlashSAC"
+
+# This is a memory-reduced DeepMimic preset. The network building blocks and
+# update rules match FlashSAC; simulator throughput settings remain explicit.
+discount: 0.99
+steps_per_iter: 32
+iters_per_output: 40
+test_episodes: 32
+use_mixed_precision: true
+
+buffer_max_length: 1000000
+buffer_min_length: 100000
+buffer_device: "auto"
+sample_batch_size: 2048
+updates_per_env_step: 0.001953125  # 2 critic update steps / 1024 transitions
+n_step: 1
+
+normalize_reward: true
+normalized_G_max: 5.0
+# Conservative G1 simulator bound for rejecting physically runaway rows before
+# replay insertion. Tune or omit this setting for other observation scales.
+observation_max_abs: 1000.0
+
+learning_rate_init: 0.0003
+learning_rate_peak: 0.0003
+learning_rate_end: 0.00015
+learning_rate_warmup_step: 0
+learning_rate_decay_step: 97658
+
+actor_num_blocks: 2
+actor_hidden_dim: 128
+actor_bc_alpha: 0.0
+actor_noise_zeta_mu: 2.0
+actor_noise_zeta_max: 16
+actor_update_period: 2
+
+critic_num_blocks: 2
+critic_hidden_dim: 256
+critic_num_bins: 101
+critic_min_v: -5.0
+critic_max_v: 5.0
+critic_target_update_tau: 0.01
+
+temp_initial_value: 0.01
+temp_target_sigma: 0.15
+
+# Eager is the validated CUDA path; compile is version-sensitive and opt-in.
+use_compile: false
+compile_mode: "auto"
+use_tf32: true
+
+load_optimizer: true
+load_reward_normalizer: true
+save_replay_buffer: false
+load_replay_buffer: ""

@@ -1,0 +1,9 @@
+--num_envs 4096
+
+--engine_config data/engines/isaac_lab_engine.yaml
+--env_config data/envs/deepmimic_g1_env.yaml
+--agent_config data/agents/deepmimic_g1_flashsac_agent.yaml
+
+--max_samples 50069504
+
+--out_dir output/

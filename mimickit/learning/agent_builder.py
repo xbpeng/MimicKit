@@ -35,6 +35,9 @@ def build_agent(agent_file, env, device):
     elif (agent_name == "LCP"):
         import learning.lcp_agent as lcp_agent
         agent = lcp_agent.LCPAgent(config=agent_config, env=env, device=device)
+    elif (agent_name == "FlashSAC"):
+        import learning.flashsac_agent as flashsac_agent
+        agent = flashsac_agent.FlashSACAgent(config=agent_config, env=env, device=device)
     else:
         assert(False), "Unsupported agent: {}".format(agent_name)
 
